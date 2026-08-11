@@ -15,7 +15,7 @@ from pathlib import Path
 
 from mailarchive.db import (
     account_id,
-    canonical_message_by_sha256,
+    canonical_message_by_account_and_sha256,
     connect,
     initialize,
     register_canonical_message,
@@ -68,7 +68,13 @@ def _metadata(raw_bytes: bytes) -> tuple[str | None, str | None]:
 
 
 def _maildir_path(archive_root: Path, account_name: str, sha256: str) -> Path:
-    return archive_root / "mail" / account_name / "cur" / f"{sha256}.eml"
+    mail_root = (archive_root / "mail").resolve()
+    destination = mail_root / account_name / "cur" / f"{sha256}.eml"
+    try:
+        destination.resolve().relative_to(mail_root)
+    except ValueError as error:
+        raise IngestError("canonical path escapes the archive mail root") from error
+    return destination
 
 
 def create_canonical_file(destination: Path, raw_bytes: bytes, sha256: str) -> None:
@@ -127,7 +133,7 @@ def ingest_file(config: AppConfig, source_path: Path, account_name: str) -> Inge
         local_account_id = account_id(connection, account_name)
         if local_account_id is None:
             raise IngestError(f"account is not active in local state: {account_name}")
-        existing = canonical_message_by_sha256(connection, sha256)
+        existing = canonical_message_by_account_and_sha256(connection, local_account_id, sha256)
     if existing is not None:
         if not verify_canonical_message(existing):
             raise IngestError("existing canonical record is missing or fails its SHA-256 check")
@@ -143,7 +149,7 @@ def ingest_file(config: AppConfig, source_path: Path, account_name: str) -> Inge
     create_canonical_file(destination, raw_bytes, sha256)
     now = utc_now()
     candidate = CanonicalMessage(
-        id=sha256,
+        id=f"{local_account_id}:{sha256}",
         account_id=local_account_id,
         sha256=sha256,
         local_path=destination,

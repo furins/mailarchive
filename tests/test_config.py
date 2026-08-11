@@ -53,3 +53,13 @@ def test_secret_reference_is_redacted(config_file: Path) -> None:
     displayed = display_config(load_config(config_file))
     assert "MAILARCHIVE_TEST_SECRET" not in str(displayed)
     assert displayed["accounts"][0]["config_ref"] == "<redacted>"  # type: ignore[index]
+
+
+@pytest.mark.parametrize("account_name", [42, "", ".", "..", "../outside", "a/b", r"a\b", "/tmp/a"])
+def test_path_like_account_names_are_rejected(config_file: Path, account_name: object) -> None:
+    values = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    account = values["accounts"].pop("test")
+    values["accounts"][account_name] = account
+    config_file.write_text(yaml.safe_dump(values), encoding="utf-8")
+    with pytest.raises(ConfigError, match="account names"):
+        load_config(config_file)

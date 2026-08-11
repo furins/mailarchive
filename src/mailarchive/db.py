@@ -74,7 +74,80 @@ def _migration_2(connection: sqlite3.Connection) -> None:
     )
 
 
-MIGRATIONS: tuple[tuple[int, Migration], ...] = ((1, _migration_1), (2, _migration_2))
+def _migration_3(connection: sqlite3.Connection) -> None:
+    """Scope canonical byte objects to accounts without losing M1 audit history."""
+    connection.execute(
+        """
+        CREATE TABLE canonical_messages_m1_replacement (
+            id TEXT PRIMARY KEY,
+            account_id INTEGER NOT NULL REFERENCES accounts(id),
+            sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
+            local_path TEXT NOT NULL UNIQUE,
+            size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+            message_id_header TEXT,
+            message_date TEXT,
+            downloaded_at TEXT NOT NULL,
+            archived_at TEXT NOT NULL,
+            integrity_status TEXT NOT NULL CHECK (integrity_status IN ('verified', 'failed')),
+            integrity_verified_at TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(account_id, sha256)
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO canonical_messages_m1_replacement(
+            id, account_id, sha256, local_path, size_bytes, message_id_header, message_date,
+            downloaded_at, archived_at, integrity_status, integrity_verified_at, created_at
+        )
+        SELECT CAST(account_id AS TEXT) || ':' || sha256, account_id, sha256, local_path,
+               size_bytes, message_id_header, message_date, downloaded_at, archived_at,
+               integrity_status, integrity_verified_at, created_at
+        FROM canonical_messages
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE audit_events_m1_replacement (
+            id INTEGER PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            account_id INTEGER REFERENCES accounts(id),
+            canonical_message_id TEXT REFERENCES canonical_messages_m1_replacement(id),
+            result TEXT NOT NULL,
+            details_json TEXT NOT NULL DEFAULT '{}'
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO audit_events_m1_replacement(
+            id, timestamp, actor, event_type, account_id, canonical_message_id, result, details_json
+        )
+        SELECT audit_events.id, audit_events.timestamp, audit_events.actor, audit_events.event_type,
+               audit_events.account_id,
+               CASE WHEN audit_events.canonical_message_id IS NULL THEN NULL
+                    ELSE CAST(canonical_messages.account_id AS TEXT) || ':' ||
+                         canonical_messages.sha256
+               END,
+               audit_events.result, audit_events.details_json
+        FROM audit_events
+        LEFT JOIN canonical_messages ON canonical_messages.id = audit_events.canonical_message_id
+        """
+    )
+    connection.execute("DROP TABLE audit_events")
+    connection.execute("DROP TABLE canonical_messages")
+    connection.execute("ALTER TABLE canonical_messages_m1_replacement RENAME TO canonical_messages")
+    connection.execute("ALTER TABLE audit_events_m1_replacement RENAME TO audit_events")
+
+
+MIGRATIONS: tuple[tuple[int, Migration], ...] = (
+    (1, _migration_1),
+    (2, _migration_2),
+    (3, _migration_3),
+)
 
 
 def utc_now() -> str:
@@ -175,17 +248,17 @@ def account_id(connection: sqlite3.Connection, account_name: str) -> int | None:
     return None if row is None else int(row[0])
 
 
-def canonical_message_by_sha256(
-    connection: sqlite3.Connection, sha256: str
+def canonical_message_by_account_and_sha256(
+    connection: sqlite3.Connection, account_id: int, sha256: str
 ) -> CanonicalMessage | None:
-    """Find a canonical byte object without relying on Message-ID."""
+    """Find an account-scoped canonical byte object without relying on Message-ID."""
     row = connection.execute(
         """
         SELECT id, account_id, sha256, local_path, size_bytes, message_id_header, message_date,
                downloaded_at, archived_at, integrity_status, integrity_verified_at, created_at
-        FROM canonical_messages WHERE sha256 = ?
+        FROM canonical_messages WHERE account_id = ? AND sha256 = ?
         """,
-        (sha256,),
+        (account_id, sha256),
     ).fetchone()
     if row is None:
         return None
@@ -221,7 +294,9 @@ def register_canonical_message(
     with connect(database_path) as connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
-            existing = canonical_message_by_sha256(connection, message.sha256)
+            existing = canonical_message_by_account_and_sha256(
+                connection, message.account_id, message.sha256
+            )
             if existing is None:
                 connection.execute(
                     """

@@ -25,16 +25,15 @@ uv run mailarchive status --config ./your-config.yaml --json
 provider implementation. `remote_retention_days: never` is the explicit never-delete
 configuration. Configuration summaries redact `config_ref` values.
 
-M1 stores each byte-unique message at
-`<archive.root>/mail/<first-ingested-account>/cur/<sha256>.eml`. The source is read in
-binary mode and the canonical file has precisely the same bytes. Reingesting identical
-bytes returns the existing canonical object (including if the source filename or
-Message-ID metadata is encountered); the initial optional Message-ID and Date metadata
-remain associated with that byte object, and every ingest attempt is audited. A
-byte-identical file necessarily has the same embedded headers, so there is no distinct
-Message-ID case for genuinely identical bytes; Message-ID is intentionally not unique in
-the database. A file left after a database registration failure is safely registered by a
-retry after its hash is verified. During database initialization, account rows absent from
+M1 stores each account's byte-unique message at
+`<archive.root>/mail/<account>/cur/<sha256>.eml`. The source is read in binary mode and
+the canonical file has precisely the same bytes. Reingesting identical bytes within an
+account returns the existing canonical object; identical bytes from another configured
+account retain a separate account-scoped file and database record. Message-ID is
+intentionally not unique in the database. A file left after a database registration
+failure is safely registered by a retry after its hash is verified. Account names are
+validated as safe single filesystem components, and canonical paths are checked to remain
+beneath `<archive.root>/mail`. During database initialization, account rows absent from
 the current configuration are disabled (not deleted) to fail closed while preserving
 history.
 

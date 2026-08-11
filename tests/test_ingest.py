@@ -5,10 +5,11 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+import yaml
 
 import mailarchive.ingest as ingest_module
 from mailarchive.config import load_config
-from mailarchive.db import canonical_message_by_sha256, connect
+from mailarchive.db import canonical_message_by_account_and_sha256, connect
 from mailarchive.ingest import IngestError, ingest_file, verify_canonical_message
 
 
@@ -62,6 +63,45 @@ def test_identical_bytes_are_idempotent_across_source_names(
     with connect(config.database.path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM canonical_messages").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == 2
+
+
+def test_identical_bytes_are_preserved_per_account(config_file: Path, tmp_path: Path) -> None:
+    values = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    values["accounts"]["other"] = {
+        "kind": "imap",
+        "enabled": True,
+        "remote_retention_days": 365,
+        "required_verified_backups": 2,
+        "config_ref": "env:OTHER_ACCOUNT",
+    }
+    config_file.write_text(yaml.safe_dump(values), encoding="utf-8")
+    source = tmp_path / "message.eml"
+    raw_bytes = _write_message(source, _message_headers())
+    config = load_config(config_file)
+    first = ingest_file(config, source, "test")
+    second = ingest_file(config, source, "other")
+    expected_mail_root = (config.archive.root / "mail").resolve()
+    assert first.created is True
+    assert second.created is True
+    assert first.canonical_message.id != second.canonical_message.id
+    assert first.canonical_message.sha256 == second.canonical_message.sha256
+    assert first.canonical_message.local_path.read_bytes() == raw_bytes
+    assert second.canonical_message.local_path.read_bytes() == raw_bytes
+    assert first.canonical_message.local_path.parent.parent.name == "test"
+    assert second.canonical_message.local_path.parent.parent.name == "other"
+    assert first.canonical_message.local_path.is_relative_to(expected_mail_root)
+    assert second.canonical_message.local_path.is_relative_to(expected_mail_root)
+    with connect(config.database.path) as connection:
+        account_rows = connection.execute("SELECT id, name FROM accounts").fetchall()
+        account_ids = {str(row["name"]): int(row["id"]) for row in account_rows}
+        canonical_rows = connection.execute(
+            "SELECT account_id, sha256 FROM canonical_messages ORDER BY account_id"
+        ).fetchall()
+    assert {int(row["account_id"]) for row in canonical_rows} == {
+        account_ids["test"],
+        account_ids["other"],
+    }
+    assert {str(row["sha256"]) for row in canonical_rows} == {first.canonical_message.sha256}
 
 
 def test_same_message_id_with_different_bytes_stays_distinct(
@@ -180,7 +220,12 @@ def test_database_failure_file_is_retryable(
     result = ingest_file(config, source, "test")
     assert result.created is True
     with connect(config.database.path) as connection:
-        assert canonical_message_by_sha256(connection, result.canonical_message.sha256) is not None
+        assert (
+            canonical_message_by_account_and_sha256(
+                connection, result.canonical_message.account_id, result.canonical_message.sha256
+            )
+            is not None
+        )
 
 
 def test_integrity_verification_detects_modification(config_file: Path, tmp_path: Path) -> None:

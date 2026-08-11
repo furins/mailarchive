@@ -7,7 +7,7 @@ import pytest
 
 import mailarchive.db as database
 from mailarchive.config import load_config
-from mailarchive.db import connect, initialize, insert_audit_event
+from mailarchive.db import connect, initialize, insert_audit_event, utc_now
 
 
 def test_database_initializes_idempotently(config_file: Path) -> None:
@@ -15,7 +15,7 @@ def test_database_initializes_idempotently(config_file: Path) -> None:
     initialize(config.database.path, config.accounts)
     initialize(config.database.path, config.accounts)
     with connect(config.database.path) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 2
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 3
         assert connection.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 1
 
 
@@ -95,3 +95,55 @@ def test_removed_account_is_disabled(config_file: Path) -> None:
             "SELECT enabled FROM accounts WHERE name = 'removed'"
         ).fetchone()
         assert removed_row[0] == 0
+
+
+def test_account_scoped_migration_preserves_existing_message_and_audit(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(config_file)
+    original_migrations = database.MIGRATIONS
+    monkeypatch.setattr(database, "MIGRATIONS", original_migrations[:2])
+    initialize(config.database.path, config.accounts)
+    sha256 = "a" * 64
+    now = utc_now()
+    with connect(config.database.path) as connection:
+        account_row = connection.execute("SELECT id FROM accounts WHERE name = 'test'").fetchone()
+        account_id = int(account_row[0])
+        connection.execute(
+            """
+            INSERT INTO canonical_messages(
+                id, account_id, sha256, local_path, size_bytes, message_id_header, message_date,
+                downloaded_at, archived_at, integrity_status, integrity_verified_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                sha256,
+                account_id,
+                sha256,
+                "/tmp/legacy.eml",
+                1,
+                None,
+                None,
+                now,
+                now,
+                "verified",
+                now,
+                now,
+            ),
+        )
+        insert_audit_event(
+            connection,
+            actor="pytest",
+            event_type="ingest.succeeded",
+            result="success",
+            account_id=account_id,
+            canonical_message_id=sha256,
+        )
+    monkeypatch.setattr(database, "MIGRATIONS", original_migrations)
+    initialize(config.database.path, config.accounts)
+    with connect(config.database.path) as connection:
+        message_row = connection.execute("SELECT id FROM canonical_messages").fetchone()
+        audit_row = connection.execute("SELECT canonical_message_id FROM audit_events").fetchone()
+    expected_id = f"{account_id}:{sha256}"
+    assert message_row[0] == expected_id
+    assert audit_row[0] == expected_id
