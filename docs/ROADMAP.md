@@ -58,6 +58,12 @@ Acceptance:
 - imported fixture mail is searchable;
 - notmuch index can be deleted and rebuilt.
 
+Implementation notes: notmuch is a rebuildable index under `state/notmuch`, separate from
+the canonical Maildir. Its managed configuration disables Maildir flag synchronization and
+automatic decryption; refresh runs without hooks. Initial indexing assigns `archive`, not
+the normal `inbox`/`unread` defaults. File-level search maps paths back to SQLite because
+notmuch can group multiple canonical files sharing a Message-ID.
+
 ## M3 — IMAP read-only acquisition
 
 Deliver:
