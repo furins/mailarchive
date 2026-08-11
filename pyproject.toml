@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mailarchive"
+version = "0.0.0"
+description = "Local-first email archive safety baseline"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["PyYAML>=6.0.2"]
+
+[project.scripts]
+mailarchive = "mailarchive.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pyright>=1.1.390",
+  "ruff>=0.9",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+reportMissingTypeStubs = false
