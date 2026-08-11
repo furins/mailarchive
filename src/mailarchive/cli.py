@@ -1,4 +1,4 @@
-"""Local-only command-line interface for M1."""
+"""Local-only command-line interface for canonical ingest and derived search."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from typing import NoReturn
 from mailarchive.config import ConfigError, display_config, load_config
 from mailarchive.db import connect, initialize
 from mailarchive.ingest import IngestError, ingest_file
+from mailarchive.notmuch import NotmuchAdapter, NotmuchError, search_canonical_messages
 
 
 def _emit(value: object, as_json: bool) -> None:
@@ -50,6 +51,15 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--account", required=True, help="configured destination account")
     ingest.add_argument("--config", required=True, help="path to YAML configuration")
     ingest.add_argument("--json", action="store_true", help="emit JSON")
+    index = subcommands.add_parser("index", help="rebuildable local notmuch index operations")
+    index_subcommands = index.add_subparsers(dest="index_command", required=True)
+    refresh = index_subcommands.add_parser("refresh", help="run managed notmuch new without hooks")
+    refresh.add_argument("--config", required=True, help="path to YAML configuration")
+    refresh.add_argument("--json", action="store_true", help="emit JSON")
+    search = subcommands.add_parser("search", help="search the local notmuch index")
+    search.add_argument("query", help="notmuch query")
+    search.add_argument("--config", required=True, help="path to YAML configuration")
+    search.add_argument("--json", action="store_true", help="emit JSON")
     return parser
 
 
@@ -113,7 +123,16 @@ def main(argv: list[str] | None = None) -> int:
                 args.json,
             )
             return 0
-    except (ConfigError, IngestError, OSError, sqlite3.DatabaseError) as error:
+        if args.command == "index":
+            adapter = NotmuchAdapter(config)
+            adapter.refresh()
+            _emit({"refreshed": True, "notmuch_version": adapter.version()}, args.json)
+            return 0
+        if args.command == "search":
+            results = search_canonical_messages(config, args.query)
+            _emit([result.as_dict() for result in results], args.json)
+            return 0
+    except (ConfigError, IngestError, NotmuchError, OSError, sqlite3.DatabaseError) as error:
         _error(str(error))
     _error("unsupported command")
 

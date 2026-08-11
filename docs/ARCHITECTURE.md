@@ -141,6 +141,10 @@ Recommended:
 │   └── sha256/
 ├── state/
 │   ├── mailarchive.sqlite3
+│   ├── notmuch/
+│   │   ├── config
+│   │   ├── db/
+│   │   └── hooks/
 │   └── locks/
 ├── metadata/
 │   ├── exports/
@@ -149,6 +153,13 @@ Recommended:
 ```
 
 Exact system paths SHALL be configurable.
+
+notmuch configuration and database files are derived state and live outside `mail/`.
+MailArchive always supplies its managed configuration explicitly; it disables Maildir flag
+synchronization and indexing decryption. `notmuch new` runs with hooks disabled. notmuch
+file search results are resolved through `canonical_messages.local_path`; its Message-ID
+grouping and tags are not canonical identity, account ownership, integrity, or retention
+state.
 
 ## 3. Message lifecycle
 
