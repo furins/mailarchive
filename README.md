@@ -4,7 +4,24 @@ Local-first, searchable and verifiable email archiving for multiple Gmail, IMAP 
 
 ## Status
 
-Specification phase. No destructive remote-mail behavior is permitted in the initial milestones.
+M0 provides a local-only configuration, database, and CLI safety baseline. No provider
+access or destructive remote-mail behavior exists.
+
+## M0 quick start
+
+Install the project with its development tools, then use a configuration that points to
+paths you can write (the checked-in example intentionally uses production-style paths):
+
+```bash
+uv sync --all-groups
+uv run mailarchive config check --config ./config.example.yaml
+uv run mailarchive db init --config ./your-config.yaml
+uv run mailarchive status --config ./your-config.yaml --json
+```
+
+`remote_deletion_enabled` defaults to `false`; M0 has no remote-mutation command or
+provider implementation. `remote_retention_days: never` is the explicit never-delete
+configuration. Configuration summaries redact `config_ref` values.
 
 ## Core design
 
