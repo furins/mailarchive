@@ -13,7 +13,7 @@ Migration = Callable[[sqlite3.Connection], None]
 
 
 def _migration_1(connection: sqlite3.Connection) -> None:
-    connection.executescript(
+    connection.execute(
         """
         CREATE TABLE accounts (
             id INTEGER PRIMARY KEY,
@@ -27,7 +27,11 @@ def _migration_1(connection: sqlite3.Connection) -> None:
             config_ref TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
-        );
+        )
+        """
+    )
+    connection.execute(
+        """
         CREATE TABLE audit_events (
             id INTEGER PRIMARY KEY,
             timestamp TEXT NOT NULL,
@@ -36,7 +40,7 @@ def _migration_1(connection: sqlite3.Connection) -> None:
             account_id INTEGER REFERENCES accounts(id),
             result TEXT NOT NULL,
             details_json TEXT NOT NULL DEFAULT '{}'
-        );
+        )
         """
     )
 
@@ -58,6 +62,22 @@ def connect(path: Path) -> sqlite3.Connection:
     return connection
 
 
+def _apply_migration(connection: sqlite3.Connection, version: int, migration: Migration) -> None:
+    """Apply one migration and its version record as one SQLite transaction."""
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        migration(connection)
+        connection.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            (version, utc_now()),
+        )
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+
+
 def initialize(path: Path, accounts: tuple[AccountConfig, ...] = ()) -> None:
     """Apply migrations and reconcile M0 account metadata idempotently."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -66,14 +86,11 @@ def initialize(path: Path, accounts: tuple[AccountConfig, ...] = ()) -> None:
             "CREATE TABLE IF NOT EXISTS schema_migrations "
             "(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
         )
+        connection.commit()
         applied = {row[0] for row in connection.execute("SELECT version FROM schema_migrations")}
         for version, migration in MIGRATIONS:
             if version not in applied:
-                migration(connection)
-                connection.execute(
-                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (version, utc_now()),
-                )
+                _apply_migration(connection, version, migration)
         for account in accounts:
             now = utc_now()
             connection.execute(
