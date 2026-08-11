@@ -1,4 +1,4 @@
-"""Typed configuration models used by the M0 safety baseline."""
+"""Typed configuration and canonical-message models."""
 
 from __future__ import annotations
 
@@ -36,3 +36,21 @@ class AppConfig:
     archive: ArchiveConfig
     database: DatabaseConfig
     accounts: tuple[AccountConfig, ...]
+
+
+@dataclass(frozen=True)
+class CanonicalMessage:
+    """Inventory metadata for one immutable, byte-identified message."""
+
+    id: str
+    account_id: int
+    sha256: str
+    local_path: Path
+    size_bytes: int
+    message_id_header: str | None
+    message_date: str | None
+    downloaded_at: str
+    archived_at: str
+    integrity_status: str
+    integrity_verified_at: str | None
+    created_at: str

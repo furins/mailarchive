@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
+from re import fullmatch
 from typing import Any, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -17,27 +18,27 @@ class ConfigError(ValueError):
     """Raised when configuration cannot safely be used."""
 
 
-def _mapping(value: object, label: str) -> Mapping[str, object]:
+def _mapping(value: object, label: str) -> Mapping[object, object]:
     if not isinstance(value, Mapping):
         raise ConfigError(f"{label} must be a mapping")
-    return cast(Mapping[str, object], value)
+    return cast(Mapping[object, object], value)
 
 
-def _required_string(values: Mapping[str, object], field: str, label: str) -> str:
+def _required_string(values: Mapping[object, object], field: str, label: str) -> str:
     value = values.get(field)
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(f"{label}.{field} must be a non-empty string")
     return value
 
 
-def _required_bool(values: Mapping[str, object], field: str, label: str, default: bool) -> bool:
+def _required_bool(values: Mapping[object, object], field: str, label: str, default: bool) -> bool:
     value = values.get(field, default)
     if not isinstance(value, bool):
         raise ConfigError(f"{label}.{field} must be a boolean")
     return value
 
 
-def _required_nonnegative_int(values: Mapping[str, object], field: str, label: str) -> int:
+def _required_nonnegative_int(values: Mapping[object, object], field: str, label: str) -> int:
     value = values.get(field)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ConfigError(f"{label}.{field} must be a non-negative integer")
@@ -51,6 +52,17 @@ def _retention_days(value: object, label: str) -> int | None:
         raise ConfigError(
             f"{label}.remote_retention_days must be a non-negative integer or 'never'"
         )
+    return value
+
+
+def _account_name(value: object) -> str:
+    """Validate a portable single-component Maildir account name."""
+    if not isinstance(value, str) or not value or value in {".", ".."}:
+        raise ConfigError("account names must be non-empty safe strings")
+    if "/" in value or "\\" in value or Path(value).is_absolute():
+        raise ConfigError("account names must not be paths")
+    if fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value) is None:
+        raise ConfigError("account names must use only letters, digits, '.', '_' or '-'")
     return value
 
 
@@ -72,9 +84,8 @@ def load_config(path: Path) -> AppConfig:
     except ZoneInfoNotFoundError as error:
         raise ConfigError(f"archive.timezone is invalid: {timezone}") from error
     accounts: list[AccountConfig] = []
-    for name, raw_account in account_values.items():
-        if not name:
-            raise ConfigError("account names must be non-empty strings")
+    for raw_name, raw_account in account_values.items():
+        name = _account_name(raw_name)
         label = f"accounts.{name}"
         account = _mapping(raw_account, label)
         kind = _required_string(account, "kind", label)

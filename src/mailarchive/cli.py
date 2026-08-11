@@ -1,4 +1,4 @@
-"""Local-only command-line interface for M0."""
+"""Local-only command-line interface for M1."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from typing import NoReturn
 
 from mailarchive.config import ConfigError, display_config, load_config
 from mailarchive.db import connect, initialize
+from mailarchive.ingest import IngestError, ingest_file
 
 
 def _emit(value: object, as_json: bool) -> None:
@@ -44,6 +45,11 @@ def build_parser() -> argparse.ArgumentParser:
     status = subcommands.add_parser("status", help="show minimal local database status")
     status.add_argument("--config", required=True, help="path to YAML configuration")
     status.add_argument("--json", action="store_true", help="emit JSON")
+    ingest = subcommands.add_parser("ingest", help="ingest one local RFC822 .eml file")
+    ingest.add_argument("path", help="path to a local .eml file")
+    ingest.add_argument("--account", required=True, help="configured destination account")
+    ingest.add_argument("--config", required=True, help="path to YAML configuration")
+    ingest.add_argument("--json", action="store_true", help="emit JSON")
     return parser
 
 
@@ -66,6 +72,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "status":
             initialized = config.database.path.exists()
             account_count = 0
+            canonical_message_count = 0
             schema_version = 0
             if initialized:
                 with connect(config.database.path) as connection:
@@ -75,18 +82,38 @@ def main(argv: list[str] | None = None) -> int:
                     account_row = connection.execute("SELECT COUNT(*) FROM accounts").fetchone()
                     schema_version = int(version_row[0] or 0)
                     account_count = int(account_row[0])
+                    if schema_version >= 2:
+                        count_row = connection.execute(
+                            "SELECT COUNT(*) FROM canonical_messages"
+                        ).fetchone()
+                        canonical_message_count = int(count_row[0])
             _emit(
                 {
                     "database_initialized": initialized,
                     "database_path": str(config.database.path),
                     "schema_version": schema_version,
                     "account_count": account_count,
+                    "canonical_message_count": canonical_message_count,
                     "remote_mutation_supported": False,
                 },
                 args.json,
             )
             return 0
-    except (ConfigError, OSError, sqlite3.DatabaseError) as error:
+        if args.command == "ingest":
+            result = ingest_file(config, Path(args.path), args.account)
+            message = result.canonical_message
+            _emit(
+                {
+                    "canonical_message_id": message.id,
+                    "sha256": message.sha256,
+                    "local_path": str(message.local_path),
+                    "size_bytes": message.size_bytes,
+                    "created": result.created,
+                },
+                args.json,
+            )
+            return 0
+    except (ConfigError, IngestError, OSError, sqlite3.DatabaseError) as error:
         _error(str(error))
     _error("unsupported command")
 
