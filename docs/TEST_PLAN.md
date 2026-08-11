@@ -27,6 +27,18 @@ Production accounts are never test fixtures.
 - deletion is disabled by default;
 - secret values are not printed.
 
+### M3 IMAP acquisition
+
+- generated mbsync configuration is verified as pull-only (`Pull New`, `Create Near`, and no
+  far-side remove/expunge operation);
+- only one configured account/folder channel can be invoked, never `mbsync -a`;
+- the persistent mbsync Maildir mirror is outside canonical `mail/`;
+- a disposable loopback IMAP integration environment seeds known raw RFC822 bytes, checks the
+  server's UIDVALIDITY/UID, count, content, and flags after sync, then compares server, mirror,
+  and canonical bytes exactly;
+- native `.mbsyncstate` parsing is tested against the installed mbsync version; malformed or
+  incomplete mapping may not create a remote link but must not lose canonical mail.
+
 ### Ingest
 
 - import one `.eml`;

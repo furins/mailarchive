@@ -154,6 +154,13 @@ Recommended:
 
 Exact system paths SHALL be configurable.
 
+For M3 IMAP, mbsync owns a persistent non-canonical mirror at
+`staging/mbsync/<account>/<safe-folder-id>/`. The adapter imports its downloaded bytes into
+`mail/<account>/` only after a successful pull-only sync; mbsync never receives the canonical
+Maildir as its Near store. Each requested folder has one explicit channel and process lock.
+M3 deliberately does not use mbsync dry-run as a safety argument because Maildir dry-run
+side-effects have been reported; safety is the generated pull-only config plus explicit channel.
+
 notmuch configuration and database files are derived state and live outside `mail/`.
 MailArchive always supplies its managed configuration explicitly; it disables Maildir flag
 synchronization and indexing decryption. `notmuch new` runs with hooks disabled. notmuch

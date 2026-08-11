@@ -143,10 +143,43 @@ def _migration_3(connection: sqlite3.Connection) -> None:
     connection.execute("ALTER TABLE audit_events_m1_replacement RENAME TO audit_events")
 
 
+def _migration_4(connection: sqlite3.Connection) -> None:
+    """Add M3 remote identity facts; UIDVALIDITY is part of every identity."""
+    connection.execute(
+        """
+        CREATE TABLE remote_messages (
+            id TEXT PRIMARY KEY,
+            account_id INTEGER NOT NULL REFERENCES accounts(id),
+            remote_folder TEXT NOT NULL,
+            uidvalidity INTEGER NOT NULL CHECK (uidvalidity > 0),
+            remote_uid INTEGER NOT NULL CHECK (remote_uid > 0),
+            message_id_header TEXT,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            remote_present INTEGER NOT NULL CHECK (remote_present IN (0, 1)),
+            identity_confidence TEXT NOT NULL CHECK (identity_confidence IN ('proven')),
+            UNIQUE(account_id, remote_folder, uidvalidity, remote_uid)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE remote_canonical_links (
+            remote_message_id TEXT NOT NULL REFERENCES remote_messages(id),
+            canonical_message_id TEXT NOT NULL REFERENCES canonical_messages(id),
+            link_reason TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(remote_message_id, canonical_message_id)
+        )
+        """
+    )
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _migration_1),
     (2, _migration_2),
     (3, _migration_3),
+    (4, _migration_4),
 )
 
 

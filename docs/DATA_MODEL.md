@@ -37,6 +37,7 @@ Suggested fields:
 id
 account_id
 remote_folder
+uidvalidity               # required with remote_uid for ordinary IMAP identity
 remote_uid
 provider_message_id
 provider_thread_id
