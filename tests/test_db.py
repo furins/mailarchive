@@ -15,7 +15,7 @@ def test_database_initializes_idempotently(config_file: Path) -> None:
     initialize(config.database.path, config.accounts)
     initialize(config.database.path, config.accounts)
     with connect(config.database.path) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 2
         assert connection.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 1
 
 
@@ -73,3 +73,25 @@ def test_failed_migration_rolls_back_and_is_retryable(
             "SELECT COUNT(*) FROM schema_migrations WHERE version = 1"
         ).fetchone()
         assert migration_row[0] == 1
+
+
+def test_removed_account_is_disabled(config_file: Path) -> None:
+    config = load_config(config_file)
+    initial_accounts = config.accounts + (
+        config.accounts[0].__class__(
+            name="removed",
+            kind="imap",
+            enabled=True,
+            remote_retention_days=365,
+            remote_deletion_enabled=False,
+            required_verified_backups=2,
+            config_ref="env:REMOVED_ACCOUNT",
+        ),
+    )
+    initialize(config.database.path, initial_accounts)
+    initialize(config.database.path, config.accounts)
+    with connect(config.database.path) as connection:
+        removed_row = connection.execute(
+            "SELECT enabled FROM accounts WHERE name = 'removed'"
+        ).fetchone()
+        assert removed_row[0] == 0
