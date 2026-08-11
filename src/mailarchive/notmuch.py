@@ -13,7 +13,14 @@ from typing import Final, cast
 from mailarchive.db import connect
 from mailarchive.models import AppConfig, CanonicalMessage
 
-DEFAULT_TIMEOUT_SECONDS: Final = 60.0
+COMMAND_TIMEOUT_SECONDS: Final = 60.0
+REFRESH_TIMEOUT_SECONDS: Final = 600.0
+_NOTMUCH_ENVIRONMENT_OVERRIDES: Final = (
+    "NOTMUCH_DATABASE",
+    "NOTMUCH_CONFIG",
+    "NOTMUCH_PROFILE",
+    "MAILDIR",
+)
 
 
 class NotmuchError(RuntimeError):
@@ -125,6 +132,14 @@ def write_managed_config(config: AppConfig) -> NotmuchLayout:
     return layout
 
 
+def isolated_notmuch_environment() -> dict[str, str]:
+    """Copy ordinary process settings while removing notmuch/user-Maildir overrides."""
+    environment = os.environ.copy()
+    for variable in _NOTMUCH_ENVIRONMENT_OVERRIDES:
+        environment.pop(variable, None)
+    return environment
+
+
 class NotmuchAdapter:
     """Run only managed-config notmuch commands with bounded subprocess behavior."""
 
@@ -133,31 +148,35 @@ class NotmuchAdapter:
         config: AppConfig,
         *,
         executable: str = "notmuch",
-        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        command_timeout_seconds: float = COMMAND_TIMEOUT_SECONDS,
+        refresh_timeout_seconds: float = REFRESH_TIMEOUT_SECONDS,
     ) -> None:
         self.config = config
         self.executable = executable
-        self.timeout_seconds = timeout_seconds
+        self.command_timeout_seconds = command_timeout_seconds
+        self.refresh_timeout_seconds = refresh_timeout_seconds
 
-    def _run(self, arguments: list[str]) -> subprocess.CompletedProcess[str]:
+    def _run(
+        self, arguments: list[str], *, timeout_seconds: float | None = None
+    ) -> subprocess.CompletedProcess[str]:
         layout = write_managed_config(self.config)
         command = [self.executable, f"--config={layout.config_path}", *arguments]
+        timeout = self.command_timeout_seconds if timeout_seconds is None else timeout_seconds
         try:
             completed = subprocess.run(
                 command,
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=self.timeout_seconds,
+                timeout=timeout,
+                env=isolated_notmuch_environment(),
             )
         except FileNotFoundError as error:
             raise NotmuchError(
                 "notmuch executable is unavailable; install the 'notmuch' package and retry"
             ) from error
         except subprocess.TimeoutExpired as error:
-            raise NotmuchError(
-                f"notmuch command timed out after {self.timeout_seconds:g} seconds"
-            ) from error
+            raise NotmuchError(f"notmuch command timed out after {timeout:g} seconds") from error
         if completed.returncode != 0:
             detail = completed.stderr.strip() or "no diagnostic output"
             raise NotmuchError(f"notmuch command failed (exit {completed.returncode}): {detail}")
@@ -170,7 +189,7 @@ class NotmuchAdapter:
 
     def refresh(self) -> None:
         """Create or incrementally update the derived index without running hooks."""
-        self._run(["new", "--no-hooks"])
+        self._run(["new", "--no-hooks"], timeout_seconds=self.refresh_timeout_seconds)
 
     def search_files(self, query: str) -> list[Path]:
         """Return absolute canonical file paths from a file-level JSON search."""

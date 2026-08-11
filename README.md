@@ -45,6 +45,10 @@ history.
 
 M2 generates its own non-interactive notmuch configuration at
 `<archive.root>/state/notmuch/config` and passes it explicitly to every notmuch command.
+Each subprocess also removes `NOTMUCH_DATABASE`, `NOTMUCH_CONFIG`, `NOTMUCH_PROFILE`, and
+`MAILDIR` from its inherited environment, preventing user configuration from redirecting the
+managed index. Routine commands use a 60-second timeout; index refresh has a bounded
+10-minute timeout for first builds and rebuilds.
 Its Xapian database is `<archive.root>/state/notmuch/db`, outside the canonical Maildir;
 it can be removed and recreated by running `mailarchive index refresh`. The managed
 configuration has `maildir.synchronize_flags=false`, so notmuch tags cannot rename
