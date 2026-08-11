@@ -1,0 +1,48 @@
+archive:
+  root: /srv/mailarchive
+  timezone: Europe/Rome
+
+database:
+  path: /srv/mailarchive/state/mailarchive.sqlite3
+
+accounts:
+  personal:
+    kind: imap
+    enabled: true
+    remote_retention_days: 365
+    remote_deletion_enabled: false
+    required_verified_backups: 2
+    config_ref: secret-or-external-config-reference
+
+  work:
+    kind: imap
+    enabled: true
+    remote_retention_days: 730
+    remote_deletion_enabled: false
+    required_verified_backups: 2
+    config_ref: secret-or-external-config-reference
+
+spam:
+  enabled: true
+  suspect_quarantine_days: 365
+  spam_quarantine_days: 180
+  protect_known_contacts: true
+  protect_previous_correspondents: true
+
+fast_path:
+  idle_enabled: true
+  fallback_poll_seconds: 90
+
+search:
+  notmuch_enabled: true
+  recoll_enabled: true
+
+backup:
+  required_verified_copies_default: 2
+  repositories:
+    local:
+      enabled: true
+      repository_ref: external-secret-or-config
+    secondary:
+      enabled: true
+      repository_ref: external-secret-or-config
