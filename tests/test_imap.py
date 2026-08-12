@@ -13,6 +13,7 @@ from mailarchive.db import connect
 from mailarchive.imap import (
     ImapAdapter,
     ImapError,
+    encode_mailbox_name,
     folder_lock,
     parse_fetch_response,
     register_remote_link,
@@ -38,6 +39,33 @@ def _configure_imap(config_file: Path, **overrides: object) -> None:
 def test_plaintext_non_loopback_is_rejected(config_file: Path) -> None:
     _configure_imap(config_file, host="imap.example.test")
     with pytest.raises(ConfigError, match="loopback"):
+        load_config(config_file)
+
+
+@pytest.mark.parametrize(
+    ("folder", "encoded"),
+    [
+        ("INBOX", '"INBOX"'),
+        ("Sent Items", '"Sent Items"'),
+        ("Archive/2025", '"Archive/2025"'),
+        ("Trash", '"Trash"'),
+        ('quoted "folder"', '"quoted \\"folder\\""'),
+        ("back\\slash", '"back\\\\slash"'),
+    ],
+)
+def test_mailbox_names_are_explicitly_quoted(folder: str, encoded: str) -> None:
+    assert encode_mailbox_name(folder) == encoded
+
+
+def test_non_ascii_mailbox_is_rejected_before_network(config_file: Path) -> None:
+    _configure_imap(config_file, folders=["Posta in arrivo €"])
+    with pytest.raises(ConfigError, match="ASCII"):
+        load_config(config_file)
+
+
+def test_stale_process_sync_timeout_is_rejected(config_file: Path) -> None:
+    _configure_imap(config_file, sync_timeout_seconds=3600)
+    with pytest.raises(ConfigError, match="unsupported"):
         load_config(config_file)
 
 
@@ -118,7 +146,7 @@ def test_sync_uses_only_read_only_uid_operations(
     monkeypatch.setattr(ImapAdapter, "_open", fake_open)
     results = ImapAdapter(config).sync("test", "INBOX")
     assert len(results) == 1
-    assert ("select", ("INBOX",), {"readonly": True}) in client.calls
+    assert ("select", ('"INBOX"',), {"readonly": True}) in client.calls
     assert ("uid", ("search", "ALL"), {}) in client.calls
     assert ("uid", ("fetch", "1", "(UID BODY.PEEK[])"), {}) in client.calls
     assert all(
@@ -183,7 +211,10 @@ def test_missing_credential_and_unconfigured_folder_fail_closed(
         ImapAdapter(config).sync("test", "Sent Items")
 
 
-@pytest.mark.parametrize("folder", ["INBOX", "Sent Items", "Archive/2025", "Trash"])
+@pytest.mark.parametrize(
+    "folder",
+    ["INBOX", "Sent Items", "Archive/2025", "Trash", 'quoted "folder"', "back\\slash"],
+)
 def test_remote_folder_name_is_preserved_in_sqlite(
     config_file: Path, monkeypatch: pytest.MonkeyPatch, folder: str
 ) -> None:
@@ -200,6 +231,64 @@ def test_remote_folder_name_is_preserved_in_sqlite(
     with connect(config.database.path) as connection:
         stored = connection.execute("SELECT remote_folder FROM remote_messages").fetchone()
     assert stored is not None and str(stored[0]) == folder
+
+
+def test_sync_refreshes_last_seen_without_refetching(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_imap(config_file)
+    config = load_config(config_file)
+    client = _ReadOnlyClient()
+    timestamps = iter(("2026-01-01T00:00:00+00:00", "2026-01-02T00:00:00+00:00"))
+    monkeypatch.setenv("MAILARCHIVE_TEST_SECRET", "fixture")
+    monkeypatch.setattr("mailarchive.imap.utc_now", lambda: next(timestamps))
+
+    def fake_open(_adapter: ImapAdapter, _account: AccountConfig) -> _ReadOnlyClient:
+        return client
+
+    monkeypatch.setattr(ImapAdapter, "_open", fake_open)
+    ImapAdapter(config).sync("test", "INBOX")
+    with connect(config.database.path) as connection:
+        first = connection.execute(
+            "SELECT first_seen_at, last_seen_at FROM remote_messages"
+        ).fetchone()
+    assert first is not None
+    fetch_count = sum(call[1][0] == "fetch" for call in client.calls if call[0] == "uid")
+    ImapAdapter(config).sync("test", "INBOX")
+    with connect(config.database.path) as connection:
+        second = connection.execute(
+            "SELECT first_seen_at, last_seen_at FROM remote_messages"
+        ).fetchone()
+    assert second is not None
+    assert tuple(first) == ("2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00")
+    assert tuple(second) == ("2026-01-01T00:00:00+00:00", "2026-01-02T00:00:00+00:00")
+    assert sum(call[1][0] == "fetch" for call in client.calls if call[0] == "uid") == fetch_count
+
+
+def test_sync_audit_counts_remote_seen_fetched_and_imported(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_imap(config_file)
+    config = load_config(config_file)
+    client = _ReadOnlyClient()
+    monkeypatch.setenv("MAILARCHIVE_TEST_SECRET", "fixture")
+
+    def fake_open(_adapter: ImapAdapter, _account: AccountConfig) -> _ReadOnlyClient:
+        return client
+
+    monkeypatch.setattr(ImapAdapter, "_open", fake_open)
+    ImapAdapter(config).sync("test", "INBOX")
+    with connect(config.database.path) as connection:
+        details = connection.execute(
+            "SELECT details_json FROM audit_events WHERE event_type='imap.sync.succeeded'"
+        ).fetchone()
+    assert details is not None
+    assert yaml.safe_load(str(details[0])) == {
+        "fetched": 1,
+        "folder": "INBOX",
+        "imported": 1,
+        "remote_seen": 1,
+    }
 
 
 def test_remote_identity_cannot_link_to_two_canonical_messages(

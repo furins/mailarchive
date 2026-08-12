@@ -24,6 +24,11 @@ folder read-only, discovers UIDs using `UID SEARCH`, and obtains each unseen mes
 Maildir; there is no mbsync mirror or generated mbsync configuration. It never issues STORE,
 COPY, MOVE, EXPUNGE, APPEND, DELETE, CREATE, RENAME, or CLOSE.
 
+Configured folder names are retained exactly in SQLite and lock identity, while MailArchive
+encodes them as IMAP quoted strings for protocol commands. M3 supports ASCII folder names
+(including spaces, `/`, `\\`, and quotes); non-ASCII names are rejected because modified UTF-7
+is intentionally not implemented yet.
+
 IMAP credentials are only `config_ref: env:VARIABLE_NAME`; the secret value is not written to
 SQLite, audit events, normal errors, or JSON output. Production settings use `IMAPS` or
 `STARTTLS` with normal certificate and hostname verification. `INSECURE_LOOPBACK` exists only

@@ -85,26 +85,38 @@ def _imap_config(account: Mapping[object, object], label: str) -> ImapConfig | N
         raise ConfigError(f"{label}.imap.folders must be a non-empty list of remote folder names")
     folder_values = cast(list[object], folders_raw)
     if not folder_values or not all(
-        isinstance(folder, str) and folder and not any(c in folder for c in "\x00\r\n")
+        isinstance(folder, str)
+        and folder
+        and folder.isascii()
+        and not any(c in folder for c in "\x00\r\n")
         for folder in folder_values
     ):
-        raise ConfigError(f"{label}.imap.folders must be a non-empty list of remote folder names")
+        raise ConfigError(
+            f"{label}.imap.folders must be non-empty ASCII remote folder names "
+            "without CR, LF, or NUL"
+        )
     folders_list = cast(list[str], folder_values)
     folders = tuple(folders_list)
     if len(set(folders)) != len(folders):
         raise ConfigError(f"{label}.imap.folders must not contain duplicates")
-    connect_timeout = _required_nonnegative_int(
-        values, "connection_timeout_seconds", f"{label}.imap"
-    ) if "connection_timeout_seconds" in values else 60
-    sync_timeout = _required_nonnegative_int(
-        values, "sync_timeout_seconds", f"{label}.imap"
-    ) if "sync_timeout_seconds" in values else 3600
-    if connect_timeout == 0 or sync_timeout == 0:
-        raise ConfigError(f"{label}.imap timeouts must be positive")
+    if "sync_timeout_seconds" in values:
+        raise ConfigError(
+            f"{label}.imap.sync_timeout_seconds is unsupported for direct IMAP acquisition"
+        )
+    connect_timeout = (
+        _required_nonnegative_int(values, "connection_timeout_seconds", f"{label}.imap")
+        if "connection_timeout_seconds" in values
+        else 60
+    )
+    if connect_timeout == 0:
+        raise ConfigError(f"{label}.imap.connection_timeout_seconds must be positive")
     return ImapConfig(
-        host=host, port=port, username=_required_string(values, "username", f"{label}.imap"),
-        tls_mode=cast("Any", tls_mode), folders=folders,
-        connection_timeout_seconds=connect_timeout, sync_timeout_seconds=sync_timeout,
+        host=host,
+        port=port,
+        username=_required_string(values, "username", f"{label}.imap"),
+        tls_mode=cast("Any", tls_mode),
+        folders=folders,
+        connection_timeout_seconds=connect_timeout,
     )
 
 
@@ -178,9 +190,13 @@ def display_config(config: AppConfig) -> dict[str, object]:
                 "remote_deletion_enabled": account.remote_deletion_enabled,
                 "required_verified_backups": account.required_verified_backups,
                 "config_ref": redact_secret_reference(account.config_ref),
-                "imap": None if account.imap is None else {
-                    "host": account.imap.host, "port": account.imap.port,
-                    "username": account.imap.username, "tls_mode": account.imap.tls_mode,
+                "imap": None
+                if account.imap is None
+                else {
+                    "host": account.imap.host,
+                    "port": account.imap.port,
+                    "username": account.imap.username,
+                    "tls_mode": account.imap.tls_mode,
                     "folders": list(account.imap.folders),
                 },
             }

@@ -45,6 +45,13 @@ def _ssl_context() -> ssl.SSLContext:
     return ssl.create_default_context()
 
 
+def encode_mailbox_name(folder: str) -> str:
+    """Encode an ASCII mailbox as an IMAP quoted string for imaplib command arguments."""
+    if not folder or not folder.isascii() or any(character in folder for character in "\x00\r\n"):
+        raise ImapError("IMAP mailbox must be a non-empty ASCII name without CR, LF, or NUL")
+    return '"' + folder.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def parse_fetch_response(requested_uid: int, data: Sequence[object]) -> FetchResult:
     """Validate the one BODY.PEEK[] literal returned for an explicit UID FETCH."""
     matches: list[FetchResult] = []
@@ -137,6 +144,27 @@ def _linked_uids(
     return {int(row[0]) for row in rows}
 
 
+def _refresh_last_seen(
+    connection: sqlite3.Connection,
+    account: int,
+    folder: str,
+    uidvalidity: int,
+    remote_uids: set[int],
+    observed_at: str,
+) -> None:
+    """Record that already-proven identities were observed without refetching bodies."""
+    ordered_uids = sorted(remote_uids)
+    for start in range(0, len(ordered_uids), 500):
+        chunk = ordered_uids[start : start + 500]
+        placeholders = ", ".join("?" for _ in chunk)
+        connection.execute(
+            "UPDATE remote_messages SET last_seen_at=? "
+            "WHERE account_id=? AND remote_folder=? AND uidvalidity=? "
+            "AND identity_confidence='proven' AND remote_uid IN (" + placeholders + ")",
+            (observed_at, account, folder, uidvalidity, *chunk),
+        )
+
+
 def register_remote_link(
     config: AppConfig,
     account_name: str,
@@ -144,6 +172,7 @@ def register_remote_link(
     uidvalidity: int,
     uid: int,
     canonical: CanonicalMessage,
+    observed_at: str | None = None,
 ) -> None:
     conflict = False
     with connect(config.database.path) as connection:
@@ -155,7 +184,7 @@ def register_remote_link(
             remote_id = (
                 f"{aid}:{hashlib.sha256(f'{folder}\0{uidvalidity}\0{uid}'.encode()).hexdigest()}"
             )
-            now = utc_now()
+            now = observed_at or utc_now()
             connection.execute(
                 """INSERT INTO remote_messages(
                    id, account_id, remote_folder, uidvalidity, remote_uid, message_id_header,
@@ -258,7 +287,8 @@ class ImapAdapter:
                 client = self._open(account)
                 if client.login(account.imap.username, password)[0] != "OK":
                     raise ImapError("IMAP authentication failed")
-                if client.select(folder, readonly=True)[0] != "OK":
+                mailbox = encode_mailbox_name(folder)
+                if client.select(mailbox, readonly=True)[0] != "OK":
                     raise ImapError("IMAP mailbox cannot be selected read-only")
                 uidvalidity = _parse_uidvalidity(client)
                 status, uid_data = client.uid("search", "ALL")
@@ -268,10 +298,14 @@ class ImapAdapter:
                 if any(not value.isdigit() or int(value) <= 0 for value in uid_tokens):
                     raise ImapError("IMAP UID discovery returned an invalid UID")
                 remote_uids = {int(value) for value in uid_tokens}
+                observed_at = utc_now()
                 with connect(self.config.database.path) as connection:
                     aid = account_id(connection, account_name)
                     if aid is None:
                         raise ImapError("account is not active in local state")
+                    _refresh_last_seen(
+                        connection, aid, folder, uidvalidity, remote_uids, observed_at
+                    )
                     known = _linked_uids(connection, aid, folder, uidvalidity)
                 results: list[IngestResult] = []
                 for uid in sorted(remote_uids - known):
@@ -293,6 +327,7 @@ class ImapAdapter:
                         uidvalidity,
                         uid,
                         result.canonical_message,
+                        observed_at,
                     )
                     results.append(result)
                     if result.created:
@@ -325,8 +360,9 @@ class ImapAdapter:
                 "success",
                 {
                     "folder": folder,
+                    "remote_seen": len(remote_uids),
+                    "fetched": len(results),
                     "imported": sum(item.created for item in results),
-                    "seen": len(results),
                 },
             )
             return results

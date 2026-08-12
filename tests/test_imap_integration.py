@@ -18,7 +18,7 @@ import yaml
 
 from mailarchive.config import load_config
 from mailarchive.db import connect
-from mailarchive.imap import ImapAdapter
+from mailarchive.imap import ImapAdapter, encode_mailbox_name
 from mailarchive.notmuch import NotmuchAdapter, search_canonical_messages
 
 
@@ -155,11 +155,23 @@ def dovecot_loopback(tmp_path: Path) -> Generator[tuple[int, Path, Path], None, 
         process.wait(timeout=10)
 
 
-def _snapshot(port: int) -> tuple[int, dict[int, tuple[tuple[bytes, ...], bytes]]]:
+def _create_test_mailbox(port: int, folder: str) -> None:
+    """Fixture setup only: production MailArchive never creates IMAP mailboxes."""
     client = imaplib.IMAP4("127.0.0.1", port)
     try:
         assert client.login("fixture", "fixture-password")[0] == "OK"
-        assert client.select("INBOX", readonly=True)[0] == "OK"
+        assert client.create(encode_mailbox_name(folder))[0] == "OK"
+    finally:
+        client.logout()
+
+
+def _snapshot(
+    port: int, folder: str = "INBOX"
+) -> tuple[int, dict[int, tuple[tuple[bytes, ...], bytes]]]:
+    client = imaplib.IMAP4("127.0.0.1", port)
+    try:
+        assert client.login("fixture", "fixture-password")[0] == "OK"
+        assert client.select(encode_mailbox_name(folder), readonly=True)[0] == "OK"
         uidvalidity = int(client.response("UIDVALIDITY")[1][0])
         status, values = client.uid("search", "ALL")
         assert status == "OK"
@@ -182,13 +194,18 @@ def test_direct_loopback_acquisition_preserves_server_bytes(
     first = _raw("<same@example.test>", "loopback one")
     (mail / "new" / "one").write_bytes(first)
     uidvalidity, before = _snapshot(port)
+    sent_folder = "Sent Items"
+    _create_test_mailbox(port, sent_folder)
+    sent = _raw("<sent@example.test>", "loopback sent")
+    (mail / ".Sent Items" / "new" / "sent-one").write_bytes(sent)
+    sent_uidvalidity, sent_before = _snapshot(port, sent_folder)
     values = yaml.safe_load(config_file.read_text())
     values["accounts"]["test"]["imap"] = {
         "host": "127.0.0.1",
         "port": port,
         "username": "fixture",
         "tls_mode": "INSECURE_LOOPBACK",
-        "folders": ["INBOX"],
+        "folders": ["INBOX", sent_folder],
     }
     config_file.write_text(yaml.safe_dump(values))
     monkeypatch.setenv("MAILARCHIVE_TEST_SECRET", "fixture-password")
@@ -207,6 +224,16 @@ def test_direct_loopback_acquisition_preserves_server_bytes(
         ).fetchone()
     assert tuple(remote) == (uidvalidity, next(iter(before)))
     assert str(link[0]) == canonical.id
+    sent_results = ImapAdapter(config).sync("test", sent_folder)
+    assert len(sent_results) == 1
+    assert sent_results[0].canonical_message.local_path.read_bytes() == sent
+    assert _snapshot(port, sent_folder) == (sent_uidvalidity, sent_before)
+    with connect(config.database.path) as connection:
+        sent_remote = connection.execute(
+            "SELECT remote_folder, uidvalidity FROM remote_messages WHERE remote_folder=?",
+            (sent_folder,),
+        ).fetchone()
+    assert sent_remote is not None and tuple(sent_remote) == (sent_folder, sent_uidvalidity)
     assert ImapAdapter(config).sync("test", "INBOX") == []
     (mail / "new" / "two").write_bytes(
         _raw("<same@example.test>", "loopback two", "different bytes")

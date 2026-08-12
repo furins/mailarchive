@@ -29,7 +29,6 @@ class ImapConfig:
     tls_mode: TlsMode
     folders: tuple[str, ...]
     connection_timeout_seconds: int
-    sync_timeout_seconds: int
 
 
 @dataclass(frozen=True)
