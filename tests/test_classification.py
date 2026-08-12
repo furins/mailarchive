@@ -184,6 +184,7 @@ def test_cross_device_copy_failure_leaves_source_and_no_final_destination(
     raw = b"exact bytes"
     source.write_bytes(raw)
     digest = hashlib.sha256(raw).hexdigest()
+
     def cross_device(*_arguments: object) -> None:
         raise OSError("cross-device")
 
@@ -244,3 +245,53 @@ def test_rspamd_mapping_and_exact_request_bytes(
 def test_rspamd_rejects_non_loopback_endpoint(endpoint: str) -> None:
     with pytest.raises(ValueError, match="loopback"):
         RspamdAdapter(endpoint)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\xff",
+        b"{",
+        b"[]",
+        b"null",
+        b'{"score":1}',
+        b'{"action":"no action"}',
+        b'{"action":"no action","score":true}',
+        b'{"action":"no action","score":"1"}',
+        b'{"action":"unknown","score":1}',
+        b'{"action":"no action","score":1,"is_skipped":true}',
+    ],
+)
+def test_rspamd_invalid_or_skipped_response_fails_safe(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch, payload: bytes
+) -> None:
+    class _Response:
+        def __enter__(self) -> _Response:
+            return self
+
+        def __exit__(self, *_arguments: object) -> None:
+            pass
+
+        def read(self) -> bytes:
+            return payload
+
+    def response(*_args: object, **_kwargs: object) -> _Response:
+        return _Response()
+
+    monkeypatch.setattr("mailarchive.classification.urllib.request.urlopen", response)
+    config = load_config(config_file)
+    raw = b"From: a\r\n\r\nSECRET-RFC822-MARKER"
+    pending = ingest_bytes(config, raw, "test").canonical_message
+    result = RspamdAdapter().classify(raw)
+    assert result.classification == "suspect"
+    quarantined = apply_classification(config, pending, result)
+    assert quarantined.storage_state == "quarantined" and quarantined.archived_at is None
+    assert quarantined.local_path.read_bytes() == raw
+    with connect(config.database.path) as db:
+        details = " ".join(
+            str(row[0])
+            for row in db.execute(
+                "SELECT details_json FROM audit_events WHERE canonical_message_id=?", (pending.id,)
+            )
+        )
+    assert "SECRET-RFC822-MARKER" not in details

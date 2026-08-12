@@ -197,6 +197,12 @@ and `quarantine/` for quarantine search. This prevents quarantined content from 
 ordinary archive query. SQLite remains authoritative for each canonical object's lifecycle,
 classification, path, retention, and visibility; no safety decision relies on a notmuch tag.
 
+Each derived index owns independent managed configuration and hook paths as well as its database.
+Concurrent archive/quarantine refreshes therefore cannot swap mail roots by rewriting a shared
+notmuch configuration. Staging is indexed nowhere. M7 performs no permanent deletion and no
+provider mutation; provider SPAM metadata is non-authoritative and classifier failure becomes
+SUSPECT quarantine.
+
 Pending state is locally recoverable: every provider sync reconciles account-scoped pending rows
 from SQLite before provider acquisition. This verifies the stored SHA and classifies only the local
 exact bytes; it neither re-downloads a known provider message nor mutates a provider. File moves

@@ -76,6 +76,11 @@ def test_managed_configuration_is_deterministic_and_separate(config_file: Path) 
     assert "decrypt=false" in contents
     assert "tags=archive" in contents
     assert "inbox" not in contents
+    quarantine_layout = managed_layout(config, "quarantine")
+    assert layout.config_path != quarantine_layout.config_path
+    assert layout.database_path != quarantine_layout.database_path
+    assert layout.hook_directory != quarantine_layout.hook_directory
+    assert "mail_root=" + str(quarantine_layout.mail_root) in managed_config_text(quarantine_layout)
     assert "unread" not in contents
     assert contents == managed_config_text(layout)
 

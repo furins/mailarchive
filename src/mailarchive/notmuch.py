@@ -70,9 +70,9 @@ def managed_layout(config: AppConfig, kind: NotmuchIndexKind = "archive") -> Not
     return NotmuchLayout(
         mail_root=mail_root,
         state_root=state_root,
-        config_path=state_root / "config",
+        config_path=state_root / f"{kind}.config",
         database_path=database_path,
-        hook_directory=state_root / "hooks",
+        hook_directory=state_root / f"{kind}-hooks",
     )
 
 

@@ -74,7 +74,11 @@ class RspamdAdapter:
         if data.get("is_skipped") is True:
             return ClassificationResult("suspect", None, "classifier-skipped")
         action, score = data.get("action"), data.get("score")
-        if not isinstance(action, str) or not isinstance(score, (int, float)):
+        if (
+            not isinstance(action, str)
+            or isinstance(score, bool)
+            or not isinstance(score, (int, float))
+        ):
             return ClassificationResult("suspect", None, "classifier-malformed-response")
         if action == "no action":
             verdict: Classification = "ham"
