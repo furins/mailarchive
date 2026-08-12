@@ -243,12 +243,18 @@ class _ManagedGmailSession:
     """GET transport that prevents google-auth request-time refresh bypasses."""
 
     def __init__(
-        self, credentials: Credentials, token_path: Path, session: requests.Session | None = None
+        self,
+        credentials: Credentials,
+        token_path: Path,
+        session: requests.Session | None = None,
+        *,
+        persist: bool = True,
     ) -> None:
-        self.credentials, self.token_path, self.session = (
+        self.credentials, self.token_path, self.session, self.persist = (
             credentials,
             token_path,
             session or requests.Session(),
+            persist,
         )
 
     def _refresh(self) -> None:
@@ -256,7 +262,9 @@ class _ManagedGmailSession:
             self.credentials.refresh(GoogleRequest())
         except RefreshError as error:
             raise GmailAuthError("Gmail OAuth refresh failed") from error
-        _write_token(self.token_path, _serialized_readonly_credentials(self.credentials))
+        serialized = _serialized_readonly_credentials(self.credentials)
+        if self.persist:
+            _write_token(self.token_path, serialized)
 
     def get(self, url: str, **kwargs: object) -> requests.Response:
         if not self.credentials.valid:
@@ -269,7 +277,10 @@ class _ManagedGmailSession:
         response = self.session.get(url, headers=headers, **cast(Any, kwargs))
         if response.status_code in {401, 403}:
             self._refresh()
-            headers["Authorization"] = f"Bearer {self.credentials.token}"
+            refreshed_token = self.credentials.token
+            if not isinstance(refreshed_token, str) or not refreshed_token:
+                raise GmailAuthError("Gmail OAuth access token is unavailable")
+            headers["Authorization"] = f"Bearer {refreshed_token}"
             response = self.session.get(url, headers=headers, **cast(Any, kwargs))
         return response
 
@@ -325,7 +336,8 @@ def authorize(
     if not credentials.refresh_token:
         raise GmailAuthError("OAuth authorization did not provide a refresh token")
     client = (
-        client_factory or (lambda c: GmailApiClient(_ManagedGmailSession(c, _token_path(account))))
+        client_factory
+        or (lambda c: GmailApiClient(_ManagedGmailSession(c, _token_path(account), persist=False)))
     )(credentials)
     profile = client.profile()
     actual = _valid_id(profile.get("emailAddress"), "profile email")

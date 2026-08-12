@@ -26,6 +26,7 @@ from mailarchive.gmail import (
     GmailTransientError,
     GmailWatcher,
     _ManagedGmailSession,  # pyright: ignore[reportPrivateUsage]
+    authorize,
     decode_raw,
     load_credentials,
 )
@@ -209,6 +210,65 @@ def test_invalid_retry_after_uses_bounded_exponential_delay(retry_after: str) ->
     with pytest.raises(GmailTransientError):
         GmailApiClient(Session(), sleeper=delays.append).profile()
     assert delays == [0.25, 0.5]
+
+
+def test_bootstrap_profile_mismatch_never_writes_refreshed_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(_gmail_config(tmp_path))
+    account = config.accounts[0]
+    secret = account.gmail.oauth_client_secret_file  # type: ignore[union-attr]
+    secret.write_text("{}", encoding="utf-8")
+    secret.chmod(0o600)
+    token = tmp_path / "token.json"
+    token.write_text("old-token", encoding="utf-8")
+    token.chmod(0o600)
+
+    class Credentials:
+        refresh_token = "REFRESH_SECRET_MARKER"
+
+        def __init__(self) -> None:
+            self.valid, self.token = False, ""
+
+        def refresh(self, _request: object) -> None:
+            self.valid, self.token = True, "new"
+
+        def to_json(self) -> str:
+            return json.dumps(
+                {
+                    "token": "ACCESS_SECRET_MARKER",
+                    "refresh_token": "REFRESH_SECRET_MARKER",
+                    "scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+                }
+            )
+
+    class Flow:
+        def run_local_server(self, **kwargs: object) -> Credentials:
+            assert kwargs["access_type"] == "offline"
+            return Credentials()
+
+        monkeypatch.setattr(
+            "mailarchive.gmail.InstalledAppFlow.from_client_secrets_file",
+            lambda *_args, **_kwargs: Flow(),  # pyright: ignore[reportUnknownLambdaType,reportUnknownArgumentType]
+    )
+
+    class Response:
+        status_code = 200
+        headers: dict[str, str] = {}
+
+        def json(self) -> object:
+            return {"emailAddress": "wrong@example.test"}
+
+    class Session:
+        def get(self, *_args: object, **_kwargs: object) -> Response:
+            return Response()
+
+    with pytest.raises(GmailAuthError):
+        authorize(
+            account,
+            lambda c: GmailApiClient(_ManagedGmailSession(c, token, Session(), persist=False)),  # type: ignore[arg-type]
+        )  # type: ignore[arg-type]
+    assert token.read_text(encoding="utf-8") == "old-token"
 
 
 def test_managed_request_time_refresh_persists_and_rejects_refresh_error(tmp_path: Path) -> None:
