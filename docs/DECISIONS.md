@@ -203,6 +203,11 @@ notmuch configuration. Staging is indexed nowhere. M7 performs no permanent dele
 provider mutation; provider SPAM metadata is non-authoritative and classifier failure becomes
 SUSPECT quarantine.
 
+For a canonical message without Message-ID, notmuch's real generated `notmuch-sha1-<digest>` ID
+is used only to select its derived index message after verifying the selector resolves to the
+expected local path. The SHA-1 reproduces notmuch state only; canonical identity and integrity
+remain account-scoped SHA-256.
+
 Pending state is locally recoverable: every provider sync reconciles account-scoped pending rows
 from SQLite before provider acquisition. This verifies the stored SHA and classifies only the local
 exact bytes; it neither re-downloads a known provider message nor mutates a provider. File moves

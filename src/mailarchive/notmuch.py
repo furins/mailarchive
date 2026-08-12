@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -260,7 +261,16 @@ class NotmuchAdapter:
             # that group deliberately; SQLite remains authoritative per file.
             message_id = row["message_id_header"]
             if isinstance(message_id, str) and message_id:
-                self.tag(changes, f"id:{message_id.strip('<>')}")
+                selector = f"id:{message_id.strip('<>')}"
+            else:
+                # notmuch derives this identifier for messages without a
+                # Message-ID. SHA-1 is only reproducing derived index state.
+                digest = hashlib.sha1(path.read_bytes(), usedforsecurity=False).hexdigest()
+                selector = f"id:notmuch-sha1-{digest}"
+            selected = self.search_files(selector)
+            if path not in selected:
+                raise NotmuchError("derived notmuch selector does not resolve canonical path")
+            self.tag(changes, selector)
 
 
 SearchScope = Literal["archived", "quarantine", "all"]

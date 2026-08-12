@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -427,3 +428,41 @@ def test_split_indexes_isolate_collision_query_terms(config_file: Path, tmp_path
     assert _result_ids(config, "body:spam-only-token") == []
     assert _result_ids(config, "body:spam-only-token", scope="quarantine") == [second.id]
     assert _result_ids(config, "body:spam-only-token", scope="all") == [second.id]
+
+
+@pytest.mark.skipif(shutil.which("notmuch") is None, reason="requires locally installed notmuch")
+def test_no_message_id_uses_characterized_notmuch_sha1_id(
+    config_file: Path, tmp_path: Path
+) -> None:
+    config = load_config(config_file)
+    raw = b"From: no-id@example.test\r\nSubject: no id\r\n\r\nno-id-token\r\n"
+    source = tmp_path / "no-id.eml"
+    source.write_bytes(raw)
+    ham = ingest_file(config, source, "test").canonical_message
+    adapter = NotmuchAdapter(config, kind="archive")
+    adapter.refresh()
+    expected = "notmuch-sha1-" + hashlib.sha1(raw, usedforsecurity=False).hexdigest()
+    output = adapter._run(  # pyright: ignore[reportPrivateUsage]
+        ["search", "--exclude=false", "--output=messages", "--format=json", "--", "no-id-token"]
+    )
+    identifiers = json.loads(output.stdout)
+    assert identifiers == [expected]
+    assert adapter.search_files(f"id:{expected}") == [ham.local_path.resolve()]
+    tags = adapter._run(["search", "--output=tags", "--", f"id:{expected}"])  # pyright: ignore[reportPrivateUsage]
+    assert {"archive", "ham"}.issubset(set(tags.stdout.split()))
+    assert ham.local_path.read_bytes() == raw
+    from mailarchive.classification import ClassificationResult, apply_classification
+
+    spam_raw = b"From: no-id@example.test\r\nSubject: spam no id\r\n\r\nspam-no-id-token\r\n"
+    spam = apply_classification(
+        config,
+        ingest_bytes(config, spam_raw, "test").canonical_message,
+        ClassificationResult("spam", 9, "test"),
+    )
+    quarantine = NotmuchAdapter(config, kind="quarantine")
+    quarantine.refresh()
+    spam_id = "notmuch-sha1-" + hashlib.sha1(spam_raw, usedforsecurity=False).hexdigest()
+    assert quarantine.search_files(f"id:{spam_id}") == [spam.local_path.resolve()]
+    spam_tags = quarantine._run(["search", "--output=tags", "--", f"id:{spam_id}"])  # pyright: ignore[reportPrivateUsage]
+    assert {"archive", "quarantine", "spam"}.issubset(set(spam_tags.stdout.split()))
+    assert spam.local_path.read_bytes() == spam_raw
