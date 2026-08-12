@@ -224,6 +224,15 @@ short periodic INBOX poll, approximately every 1–2 minutes
 
 M3 has no watcher or automatic IMAP polling; every network acquisition is an explicit command.
 
+M4 adds `mailarchive imap watch` for ordinary IMAP INBOX only. Python 3.14 stdlib
+`imaplib.idle()` runs on a dedicated, read-only notification connection; it never downloads a
+message body. The already-existing M3 adapter uses a separate connection for canonical
+`UID FETCH BODY.PEEK[]` acquisition. IDLE is armed before each catch-up sync, uses 30-second
+bounded windows and 0.1-second burst coalescing, then re-arms. A 600-second reconciliation and
+90-second polling fallback preserve correctness when notification is unavailable. The watcher has
+its own lifetime lock and SQLite heartbeat health; notmuch failure is degraded local indexing and
+is retried without refetching. Slow-path workers remain independent.
+
 ### Gmail
 
 The implementation milestone SHALL choose between a Gmail API aware path and a carefully configured Gmail IMAP path based on current operational validation.

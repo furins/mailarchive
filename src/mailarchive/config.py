@@ -10,7 +10,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
-from mailarchive.models import AccountConfig, AppConfig, ArchiveConfig, DatabaseConfig, ImapConfig
+from mailarchive.models import (
+    AccountConfig,
+    AppConfig,
+    ArchiveConfig,
+    DatabaseConfig,
+    FastPathConfig,
+    ImapConfig,
+)
 from mailarchive.safety import REMOTE_DELETION_DEFAULT, redact_secret_reference
 
 
@@ -110,6 +117,17 @@ def _imap_config(account: Mapping[object, object], label: str) -> ImapConfig | N
     )
     if connect_timeout == 0:
         raise ConfigError(f"{label}.imap.connection_timeout_seconds must be positive")
+    fast_path_raw = values.get("fast_path", {})
+    fast_path_values = _mapping(fast_path_raw, f"{label}.imap.fast_path")
+    idle_enabled = _required_bool(
+        fast_path_values, "idle_enabled", f"{label}.imap.fast_path", True
+    )
+    reconcile = fast_path_values.get("reconcile_interval_seconds", 600)
+    poll = fast_path_values.get("poll_interval_seconds", 90)
+    if isinstance(reconcile, bool) or not isinstance(reconcile, int) or not 60 <= reconcile <= 1740:
+        raise ConfigError(f"{label}.imap.fast_path.reconcile_interval_seconds must be 60..1740")
+    if isinstance(poll, bool) or not isinstance(poll, int) or not 60 <= poll <= 120:
+        raise ConfigError(f"{label}.imap.fast_path.poll_interval_seconds must be 60..120")
     return ImapConfig(
         host=host,
         port=port,
@@ -117,6 +135,7 @@ def _imap_config(account: Mapping[object, object], label: str) -> ImapConfig | N
         tls_mode=cast("Any", tls_mode),
         folders=folders,
         connection_timeout_seconds=connect_timeout,
+        fast_path=FastPathConfig(idle_enabled, reconcile, poll),
     )
 
 
@@ -198,6 +217,13 @@ def display_config(config: AppConfig) -> dict[str, object]:
                     "username": account.imap.username,
                     "tls_mode": account.imap.tls_mode,
                     "folders": list(account.imap.folders),
+                    "fast_path": {
+                        "idle_enabled": account.imap.fast_path.idle_enabled,
+                        "reconcile_interval_seconds": (
+                            account.imap.fast_path.reconcile_interval_seconds
+                        ),
+                        "poll_interval_seconds": account.imap.fast_path.poll_interval_seconds,
+                    },
                 },
             }
             for account in config.accounts

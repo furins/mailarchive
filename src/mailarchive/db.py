@@ -162,6 +162,34 @@ def _migration_4(connection: sqlite3.Connection) -> None:
         )
         """
     )
+
+
+def _migration_5(connection: sqlite3.Connection) -> None:
+    """Persist bounded, secret-free M4 watcher operational health."""
+    connection.execute(
+        """
+        CREATE TABLE fast_path_health (
+            account_id INTEGER NOT NULL REFERENCES accounts(id),
+            remote_folder TEXT NOT NULL,
+            mode TEXT NOT NULL CHECK (
+                mode IN ('idle', 'poll', 'reconnecting', 'degraded', 'stopped')
+            ),
+            watcher_started_at TEXT,
+            last_heartbeat_at TEXT,
+            last_event_at TEXT,
+            last_sync_started_at TEXT,
+            last_sync_succeeded_at TEXT,
+            last_index_succeeded_at TEXT,
+            last_error_at TEXT,
+            last_error_kind TEXT,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0 CHECK (consecutive_failures >= 0),
+            reconnect_count INTEGER NOT NULL DEFAULT 0 CHECK (reconnect_count >= 0),
+            index_pending INTEGER NOT NULL DEFAULT 0 CHECK (index_pending IN (0, 1)),
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(account_id, remote_folder)
+        )
+        """
+    )
     connection.execute(
         """
         CREATE TABLE remote_canonical_links (
@@ -180,6 +208,7 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (2, _migration_2),
     (3, _migration_3),
     (4, _migration_4),
+    (5, _migration_5),
 )
 
 

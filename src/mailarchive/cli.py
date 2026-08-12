@@ -5,13 +5,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 import sqlite3
 import sys
+import threading
 from pathlib import Path
 from typing import NoReturn
 
 from mailarchive.config import ConfigError, display_config, load_config
 from mailarchive.db import connect, initialize
+from mailarchive.fastpath import FastPathWatcher, fast_path_status
 from mailarchive.imap import ImapAdapter, ImapError
 from mailarchive.ingest import IngestError, ingest_file
 from mailarchive.notmuch import NotmuchAdapter, NotmuchError, search_canonical_messages
@@ -69,6 +72,10 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--folder", required=True, help="one configured remote folder")
     sync.add_argument("--config", required=True, help="path to YAML configuration")
     sync.add_argument("--json", action="store_true", help="emit JSON")
+    watch = imap_subcommands.add_parser("watch", help="watch one IMAP INBOX using IDLE or safe polling")
+    watch.add_argument("--account", required=True, help="one configured ordinary IMAP account")
+    watch.add_argument("--config", required=True, help="path to YAML configuration")
+    watch.add_argument("--json", action="store_true", help="emit JSON startup/errors only")
     return parser
 
 
@@ -106,6 +113,7 @@ def main(argv: list[str] | None = None) -> int:
                             "SELECT COUNT(*) FROM canonical_messages"
                         ).fetchone()
                         canonical_message_count = int(count_row[0])
+            health = [record.__dict__ for record in fast_path_status(config)] if initialized else []
             _emit(
                 {
                     "database_initialized": initialized,
@@ -114,6 +122,7 @@ def main(argv: list[str] | None = None) -> int:
                     "account_count": account_count,
                     "canonical_message_count": canonical_message_count,
                     "remote_mutation_supported": False,
+                    "fast_path": health,
                 },
                 args.json,
             )
@@ -142,6 +151,21 @@ def main(argv: list[str] | None = None) -> int:
             _emit([result.as_dict() for result in results], args.json)
             return 0
         if args.command == "imap":
+            if args.imap_command == "watch":
+                stop = threading.Event()
+                previous = {name: signal.getsignal(name) for name in (signal.SIGINT, signal.SIGTERM)}
+                def request_stop(_signum: int, _frame: object) -> None:
+                    stop.set()
+                try:
+                    signal.signal(signal.SIGINT, request_stop)
+                    signal.signal(signal.SIGTERM, request_stop)
+                    if args.json:
+                        _emit({"account": args.account, "folder": "INBOX", "watching": True}, True)
+                    FastPathWatcher(config, args.account, stop).run()
+                finally:
+                    for name, handler in previous.items():
+                        signal.signal(name, handler)
+                return 0
             results = ImapAdapter(config).sync(args.account, args.folder)
             _emit({"account": args.account, "folder": args.folder, "seen": len(results),
                    "imported": sum(result.created for result in results)}, args.json)

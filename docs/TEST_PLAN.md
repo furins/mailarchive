@@ -112,6 +112,11 @@ Verify:
 - watcher reconnects;
 - polling fallback recovers missed notification.
 
+M4 additionally requires a genuine disposable Dovecot IDLE acceptance test proving an APPEND
+produces an IDLE trigger, separate M3 acquisition, exact BODY.PEEK[] canonical bytes, unchanged
+server flags/body, and notmuch visibility. Unit tests cover arm-before-sync, bounded IDLE lifecycle,
+burst coalescing, polling, reconnection, watcher locking, stale local health and no-network status.
+
 ## 6. Backup tests
 
 - successful backup run recorded;

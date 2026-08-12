@@ -54,7 +54,7 @@ def _safe_dovecot_diagnostic(log: Path, process: subprocess.Popen[str]) -> str:
 
 
 @pytest.fixture
-def dovecot_loopback(tmp_path: Path) -> Generator[tuple[int, Path, Path], None, None]:
+def dovecot_loopback(tmp_path: Path) -> Generator[tuple[int, Path, Path]]:
     root = tmp_path / "dovecot"
     mail = root / "mail"
     user = pwd.getpwuid(os.getuid()).pw_name

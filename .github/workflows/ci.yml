@@ -13,7 +13,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
       - run: sudo apt-get update && sudo apt-get install --yes dovecot-imapd notmuch
       - run: uv sync --all-groups --locked
       - run: uv run pytest
