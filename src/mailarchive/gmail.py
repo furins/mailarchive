@@ -264,7 +264,12 @@ class _ManagedGmailSession:
             raise GmailAuthError("Gmail OAuth refresh failed") from error
         serialized = _serialized_readonly_credentials(self.credentials)
         if self.persist:
-            _write_token(self.token_path, serialized)
+            try:
+                _write_token(self.token_path, serialized)
+            except OSError as error:
+                raise GmailAuthError(
+                    "Gmail refreshed credential cannot be safely persisted"
+                ) from error
 
     def get(self, url: str, **kwargs: object) -> requests.Response:
         if not self.credentials.valid:

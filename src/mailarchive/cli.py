@@ -140,8 +140,30 @@ def main(argv: list[str] | None = None) -> int:
                         ).fetchone()
                         canonical_message_count = int(count_row[0])
             health = [record.__dict__ for record in fast_path_status(config)] if initialized else []
-            gmail_status: list[dict[str, object]] = []
+            gmail_status: list[dict[str, object]] = [
+                {
+                    "account": account.name,
+                    "provider": "gmail",
+                    "token_file_present": Path(account.config_ref[5:]).is_file(),
+                    "full_sync_required": True,
+                    "last_successful_sync": None,
+                    "last_full_sync": None,
+                    "last_partial_sync": None,
+                    "known_provider_messages": 0,
+                    "remote_present_provider_messages": 0,
+                    "known_labels": 0,
+                    "watcher_mode": None,
+                    "watcher_state": "not-started",
+                    "last_heartbeat": None,
+                    "last_successful_index": None,
+                    "index_pending": False,
+                    "last_safe_error_category": None,
+                }
+                for account in config.accounts
+                if account.kind == "gmail" and account.gmail is not None
+            ]
             if initialized:
+                gmail_status = []
                 with connect(config.database.path) as connection:
                     for account in config.accounts:
                         if account.kind != "gmail" or account.gmail is None:

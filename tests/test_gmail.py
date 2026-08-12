@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -250,7 +251,7 @@ def test_bootstrap_profile_mismatch_never_writes_refreshed_token(
         monkeypatch.setattr(
             "mailarchive.gmail.InstalledAppFlow.from_client_secrets_file",
             lambda *_args, **_kwargs: Flow(),  # pyright: ignore[reportUnknownLambdaType,reportUnknownArgumentType]
-    )
+        )
 
     class Response:
         status_code = 200
@@ -810,3 +811,84 @@ def test_expired_history_full_failure_and_empty_fallback_keep_safe_state(tmp_pat
             assert tuple(
                 db.execute("SELECT history_id,full_sync_required FROM gmail_sync_state").fetchone()
             ) == (None if not fail_full else "1", 1)
+
+
+@pytest.mark.parametrize(
+    ("bodies", "expected_canonical"),
+    [
+        (
+            {
+                "G1": b"Message-ID: <same>\r\n\r\nidentical",
+                "G2": b"Message-ID: <same>\r\n\r\nidentical",
+            },
+            1,
+        ),
+        ({"G1": b"Message-ID: <same>\r\n\r\none", "G2": b"Message-ID: <same>\r\n\r\ntwo"}, 2),
+    ],
+)
+def test_provider_identity_duplicate_matrix(
+    tmp_path: Path, bodies: dict[str, bytes], expected_canonical: int
+) -> None:
+    class Matrix(FakeGmail):
+        def __init__(self) -> None:
+            super().__init__(b"")
+
+        def labels(self) -> dict[str, object]:
+            return {
+                "labels": [
+                    {"id": "INBOX", "name": "INBOX", "type": "system"},
+                    {"id": "STARRED", "name": "STARRED", "type": "system"},
+                ]
+            }
+
+        def messages(
+            self, page_token: str | None = None, *, max_results: int = 500
+        ) -> dict[str, object]:
+            return {"messages": [{"id": "G1"}, {"id": "G2"}]}
+
+        def message(self, message_id: str, format: str) -> dict[str, object]:
+            return {
+                "id": message_id,
+                "threadId": "shared-thread",
+                "historyId": "1",
+                "labelIds": ["INBOX", "STARRED"],
+                "raw": base64.urlsafe_b64encode(bodies[message_id]).decode().rstrip("="),
+            }
+
+        def history(self, history_id: str, page_token: str | None = None) -> dict[str, object]:
+            return {"historyId": "2", "history": []}
+
+    config = load_config(_gmail_config(tmp_path))
+    GmailAdapter(config, lambda _account: Matrix()).sync("gmail")  # type: ignore[arg-type]
+    with connect(config.database.path) as db:
+        assert db.execute("SELECT COUNT(*) FROM remote_messages").fetchone()[0] == 2
+        assert db.execute("SELECT COUNT(*) FROM remote_canonical_links").fetchone()[0] == 2
+        assert (
+            db.execute("SELECT COUNT(*) FROM canonical_messages").fetchone()[0]
+            == expected_canonical
+        )
+        assert (
+            db.execute("SELECT COUNT(DISTINCT provider_thread_id) FROM remote_messages").fetchone()[
+                0
+            ]
+            == 1
+        )
+
+
+def test_raw_multipart_fidelity_without_padding(tmp_path: Path) -> None:
+    raw = (
+        b"Message-ID: <fidelity>\r\nX-Folded: alpha\r\n beta\r\n"
+        b"Content-Type: multipart/mixed; boundary=Z\r\n\r\n--Z\r\n"
+        b"Content-Type: application/octet-stream\r\n\r\n\x00\xffbinary\r\n--Z--"
+    )
+    config = load_config(_gmail_config(tmp_path))
+    fake = FakeGmail(raw)
+    GmailAdapter(config, lambda _account: fake).sync("gmail")  # type: ignore[arg-type]
+    with connect(config.database.path) as db:
+        row = db.execute("SELECT local_path,sha256 FROM canonical_messages").fetchone()
+        assert (
+            decode_raw(base64.urlsafe_b64encode(raw).decode().rstrip("="))
+            == Path(str(row[0])).read_bytes()
+            == raw
+        )
+        assert str(row[1]) == hashlib.sha256(raw).hexdigest()
