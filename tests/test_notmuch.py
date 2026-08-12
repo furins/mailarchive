@@ -387,8 +387,10 @@ def test_collision_lifecycle_visibility_is_filtered_by_sqlite(
         ["search", "--exclude=false", "--output=tags", "--", "id:collision@example.test"]
     )
     assert {"quarantine", "spam"}.issubset(set(quarantine_tags.stdout.split()))
-    shutil.rmtree(managed_layout(config).database_path)
+    shutil.rmtree(managed_layout(config, "archive").database_path)
+    shutil.rmtree(managed_layout(config, "quarantine").database_path)
     adapter.refresh()
+    NotmuchAdapter(config, kind="quarantine").refresh()
     assert _result_ids(config, "collision") == [first.id]
     assert _result_ids(config, "collision", scope="quarantine") == [second.id]
 
@@ -466,6 +468,17 @@ def test_no_message_id_uses_characterized_notmuch_sha1_id(
     spam_tags = quarantine._run(["search", "--output=tags", "--", f"id:{spam_id}"])  # pyright: ignore[reportPrivateUsage]
     assert {"archive", "quarantine", "spam"}.issubset(set(spam_tags.stdout.split()))
     assert spam.local_path.read_bytes() == spam_raw
+    shutil.rmtree(managed_layout(config, "archive").database_path)
+    shutil.rmtree(managed_layout(config, "quarantine").database_path)
+    adapter.refresh()
+    quarantine.refresh()
+    assert adapter.search_files(f"id:{expected}") == [ham.local_path.resolve()]
+    assert quarantine.search_files(f"id:{spam_id}") == [spam.local_path.resolve()]
+    rebuilt_ham_tags = adapter._run(["search", "--output=tags", "--", f"id:{expected}"])  # pyright: ignore[reportPrivateUsage]
+    rebuilt_spam_tags = quarantine._run(["search", "--output=tags", "--", f"id:{spam_id}"])  # pyright: ignore[reportPrivateUsage]
+    assert {"archive", "ham"}.issubset(set(rebuilt_ham_tags.stdout.split()))
+    assert {"archive", "quarantine", "spam"}.issubset(set(rebuilt_spam_tags.stdout.split()))
+    assert ham.local_path.read_bytes() == raw and spam.local_path.read_bytes() == spam_raw
 
 
 @pytest.mark.skipif(shutil.which("notmuch") is None, reason="requires locally installed notmuch")
