@@ -110,16 +110,54 @@ are deliberately out of scope. History polling defaults to 90 seconds; expired h
 safe full sync. Token and OAuth client-secret files must remain outside `archive.root`. SPAM and
 TRASH are inventoried as provider labels only; M7 owns local spam/quarantine policy.
 
-## ADR-017 — M6 POP3 uses direct controlled retrieval, pending getmail6 acceptance
+## ADR-017 — M6 POP3 uses direct controlled retrieval; getmail6 is rejected
 
-Status: accepted with a documented evaluation limitation.
+Status: accepted.
 
-getmail6 was not installed in the M6 implementation environment, so it was not admitted to the
-canonical path without the mandated real-binary experiment. `mailarchive pop3 sync` instead uses
-a small direct, read-only POP3 client which performs only USER, PASS, UIDL, RETR and QUIT; its
-code has no DELE operation or delete-related configuration. UIDL is the account-scoped provider
-identity and SQLite is authoritative; a getmail oldmail file would be rebuildable subordinate
-state only. Before getmail6 can be used, the disposable-server byte-fidelity experiment must pass
-for all M6 fixtures with explicitly safe options (`delete=false`, `delete_after=0`,
-`delete_bigger_than=0`, `delivered_to=false`, `received=false`, `mark_read=false`) and prove no
-DELE. getmail6 never writes canonical storage directly.
+The real `/home/stefano/.local/bin/getmail` binary, getmail 6.20.00, was tested against a
+disposable loopback POP3 server by `uv run pytest tests/test_getmail6_acceptance.py -v`. The test
+generates a 0600 temporary rcfile and invokes:
+
+```text
+/home/stefano/.local/bin/getmail --getmaildir <temporary-state> --rcfile <temporary-rcfile>
+```
+
+Its exact rcfile is:
+
+```ini
+[retriever]
+type = SimplePOP3Retriever
+server = 127.0.0.1
+port = <temporary loopback port>
+username = acceptance-user
+password = acceptance-password
+timeout = 10
+
+[destination]
+type = Maildir
+path = <temporary staging Maildir>/
+
+[options]
+read_all = true
+delete = false
+delete_after = 0
+delete_bigger_than = 0
+delivered_to = false
+received = false
+mark_read = false
+```
+
+All eleven fixtures differed: normal CRLF, folded headers, multipart MIME, base64 attachment,
+malformed-but-storable bytes, no final newline, two distinct messages sharing RFC Message-ID,
+two UIDLs with identical bytes, and leading-dot body lines. Every delivered file began with the
+added `Return-Path: <unknown>` header (first difference offset 0); getmail also reconstructed POP3 lines
+with native LF line endings, and the no-final-newline fixture gained a final LF. Its Maildir
+destination therefore cannot preserve canonical RFC822 bytes even with Delivered-To and Received
+disabled. The server observed only USER, PASS, UIDL, LIST, RETR, and QUIT; DELE was absent and all
+eleven mailbox entries remained present.
+
+`mailarchive pop3 sync` consequently remains the production direct UIDL/RETR adapter. This is an
+intentional roadmap deviation: canonical RFC822 byte immutability takes priority over the original
+getmail6 preference. SQLite is authoritative for POP3 provider identity; any getmail oldmail file
+would be subordinate, rebuildable state only. getmail6 is not a runtime dependency and never writes
+MailArchive canonical storage.

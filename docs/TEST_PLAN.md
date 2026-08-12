@@ -143,8 +143,11 @@ burst coalescing, polling, reconnection, watcher locking, stale local health and
   success;
 - migration from M5 retains IMAP/Gmail identities, links and `fast_path_health`, with a clean
   `foreign_key_check`;
-- getmail6 is evaluated only by a real executable against the same disposable server and strict
-  non-destructive configuration. It remains rejected/unavailable until that experiment passes.
+- `tests/test_getmail6_acceptance.py` invokes the real getmail 6.20.00 binary against a disposable
+  server using explicit non-destructive settings. It proves every seeded fixture changes in staging
+  (added `Return-Path`, LF reconstruction, and final-LF addition where applicable), proves DELE is
+  absent, and proves the source mailbox remains unchanged. Reproduce with
+  `uv run pytest tests/test_getmail6_acceptance.py -v`; the test cleanly skips if getmail is absent.
 
 ## 7. Integrity tests
 
