@@ -97,7 +97,7 @@ Production accounts are never test fixtures.
   untrusted filenames as paths; malformed/missing/mismatched source fails message-locally;
 - zero-attachment messages retain a successful extraction marker, retries are idempotent,
   and HAM/quarantine transitions preserve relationships while changing search visibility;
-- real Recoll indexes only extensionless attachment blobs with its managed config. Search
+- real Recoll indexes only extensionless text and PDF attachment blobs with its managed config. Search
   candidates are resolved through SQLite, including archived/quarantine/all scope tests;
 - migration v8 to v9 preserves existing provider, Gmail, lifecycle and audit state with a
   clean foreign key check.

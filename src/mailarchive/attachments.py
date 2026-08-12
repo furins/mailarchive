@@ -10,6 +10,11 @@ import sqlite3
 import tempfile
 from dataclasses import dataclass
 from email import policy
+from email.errors import (
+    InvalidBase64CharactersDefect,
+    InvalidBase64LengthDefect,
+    InvalidBase64PaddingDefect,
+)
 from email.message import Message
 from email.parser import BytesParser
 from pathlib import Path
@@ -22,6 +27,7 @@ from mailarchive.models import AppConfig, CanonicalMessage
 ExtractionErrorKind = Literal[
     "canonical-missing",
     "canonical-sha-mismatch",
+    "canonical-io",
     "mime-parse",
     "attachment-decode",
     "attachment-storage",
@@ -74,7 +80,7 @@ class AttachmentSearchResult:
 def attachment_blob_path(config: AppConfig, digest: str) -> Path:
     if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
         raise AttachmentError("attachment digest is invalid")
-    return config.archive.root / "attachments" / "sha256" / digest[:2] / digest
+    return config.archive.root.resolve() / "attachments" / "sha256" / digest[:2] / digest
 
 
 def _fsync_directory(directory: Path) -> None:
@@ -138,6 +144,18 @@ def parse_attachments(raw_bytes: bytes) -> list[ExtractedPart]:
             raise AttachmentError("MIME attachment decoding failed") from error
         if not isinstance(payload, bytes):
             raise AttachmentError("MIME attachment decoding produced no bytes")
+        if part.get("Content-Transfer-Encoding", "").lower() == "base64" and any(
+            isinstance(
+                defect,
+                (
+                    InvalidBase64CharactersDefect,
+                    InvalidBase64PaddingDefect,
+                    InvalidBase64LengthDefect,
+                ),
+            )
+            for defect in part.defects
+        ):
+            raise AttachmentError("MIME attachment base64 decoding defect")
         results.append(
             ExtractedPart(
                 part_index=len(results),
@@ -182,7 +200,9 @@ def _record_failure(
             db.commit()
 
 
-def _extract_one(config: AppConfig, message: CanonicalMessage, *, force: bool) -> bool:
+def _extract_one(
+    config: AppConfig, message: CanonicalMessage, *, retry_failed: bool, force: bool
+) -> bool:
     if message.storage_state not in {"archived", "quarantined"}:
         return False
     with connect(config.database.path) as db:
@@ -197,14 +217,22 @@ def _extract_one(config: AppConfig, message: CanonicalMessage, *, force: bool) -
         and prior["source_sha256"] == message.sha256
     ):
         return False
+    if not force and prior is not None and prior["status"] == "failed" and not retry_failed:
+        return False
     if not message.local_path.is_file():
         _record_failure(config, message, "canonical-missing")
         return False
-    if sha256_file(message.local_path) != message.sha256:
+    try:
+        canonical_sha256 = sha256_file(message.local_path)
+        raw_bytes = message.local_path.read_bytes()
+    except OSError:
+        _record_failure(config, message, "canonical-io")
+        return False
+    if canonical_sha256 != message.sha256:
         _record_failure(config, message, "canonical-sha-mismatch")
         return False
     try:
-        parts = parse_attachments(message.local_path.read_bytes())
+        parts = parse_attachments(raw_bytes)
     except AttachmentError as error:
         _record_failure(
             config, message, "attachment-decode" if "decod" in str(error) else "mime-parse"
@@ -289,7 +317,11 @@ def reconcile_attachments(
             ).fetchall()
             messages = [canonical_message_by_id(db, str(row["id"])) for row in rows]
             messages = [message for message in messages if message is not None]
-    return [message.id for message in messages if _extract_one(config, message, force=force)]
+    return [
+        message.id
+        for message in messages
+        if _extract_one(config, message, retry_failed=retry_failed, force=force)
+    ]
 
 
 def search_attachment_relationships(

@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
+import mailarchive.attachments as attachment_module
 from mailarchive.attachments import attachment_blob_path, reconcile_attachments
 from mailarchive.classification import ClassificationResult, apply_classification
 from mailarchive.config import load_config
@@ -86,3 +90,99 @@ def test_missing_canonical_fails_closed_without_relationships(config_file: Path)
             == "canonical-missing"
         )
         assert db.execute("SELECT COUNT(*) FROM message_attachments").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("payload", ("YWJ@", "YQ=", "Y"))
+def test_malformed_base64_fails_closed_without_partial_relationships(
+    config_file: Path, payload: str
+) -> None:
+    raw = _message(
+        "--x\r\nContent-Disposition: attachment; filename=broken.bin\r\n"
+        "Content-Transfer-Encoding: base64\r\n\r\n"
+        f"{payload}\r\n"
+    )
+    config, message = _archive(config_file, raw)
+    assert reconcile_attachments(config) == []
+    assert message.local_path.read_bytes() == raw
+    with connect(config.database.path) as db:
+        assert (
+            db.execute("SELECT last_error_kind FROM attachment_extractions").fetchone()[0]
+            == "attachment-decode"
+        )
+        assert db.execute("SELECT COUNT(*) FROM message_attachments").fetchone()[0] == 0
+        details = db.execute(
+            "SELECT details_json FROM audit_events WHERE event_type='attachments.extraction.failed'"
+        ).fetchone()[0]
+        assert details == '{"error_kind": "attachment-decode"}'
+
+
+def test_canonical_io_failure_is_message_local(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, first = _archive(
+        config_file, _message("--x\r\nContent-Disposition: attachment\r\n\r\na\r\n")
+    )
+    _, broken = _archive(
+        config_file, _message("--x\r\nContent-Disposition: attachment\r\n\r\nb\r\n")
+    )
+    _, third = _archive(
+        config_file, _message("--x\r\nContent-Disposition: attachment\r\n\r\nc\r\n")
+    )
+    original = attachment_module.sha256_file
+
+    def hash_or_fail(path: Path) -> str:
+        if path == broken.local_path:
+            raise OSError("fixture")
+        return original(path)
+
+    monkeypatch.setattr(attachment_module, "sha256_file", hash_or_fail)
+    assert reconcile_attachments(config) == sorted([first.id, third.id])
+    with connect(config.database.path) as db:
+        assert (
+            db.execute(
+                "SELECT last_error_kind FROM attachment_extractions WHERE canonical_message_id=?",
+                (broken.id,),
+            ).fetchone()[0]
+            == "canonical-io"
+        )
+
+
+def test_retry_failed_and_force_semantics(config_file: Path) -> None:
+    config, message = _archive(
+        config_file, _message("--x\r\nContent-Disposition: attachment\r\n\r\nx\r\n")
+    )
+    message.local_path.unlink()
+    assert reconcile_attachments(config) == []
+    with connect(config.database.path) as db:
+        first_update = db.execute("SELECT updated_at FROM attachment_extractions").fetchone()[0]
+    assert reconcile_attachments(config, retry_failed=False) == []
+    with connect(config.database.path) as db:
+        assert (
+            db.execute("SELECT updated_at FROM attachment_extractions").fetchone()[0]
+            == first_update
+        )
+    message.local_path.parent.mkdir(parents=True, exist_ok=True)
+    message.local_path.write_bytes(_message("--x\r\nContent-Disposition: attachment\r\n\r\nx\r\n"))
+    assert reconcile_attachments(config, retry_failed=True) == [message.id]
+    assert reconcile_attachments(config, force=True) == [message.id]
+
+
+def test_relative_archive_root_uses_absolute_attachment_paths(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = load_config(config_file)
+    monkeypatch.chdir(tmp_path)
+    relative_config = replace(config, archive=replace(config.archive, root=Path("relative-root")))
+    result = ingest_bytes(
+        relative_config,
+        _message("--x\r\nContent-Disposition: attachment\r\n\r\nrelative\r\n"),
+        "test",
+    )
+    message = apply_classification(
+        relative_config, result.canonical_message, ClassificationResult("ham", None, "test")
+    )
+    assert reconcile_attachments(relative_config) == [message.id]
+    with connect(relative_config.database.path) as db:
+        path = Path(db.execute("SELECT content_path FROM attachments").fetchone()[0])
+    assert path.is_absolute()
+    assert path.is_relative_to((tmp_path / "relative-root").resolve())

@@ -433,7 +433,7 @@ def _migration_9(connection: sqlite3.Connection) -> None:
             attachment_count INTEGER NOT NULL CHECK(attachment_count>=0),
             extracted_at TEXT,
             last_error_kind TEXT CHECK(last_error_kind IS NULL OR last_error_kind IN
-                ('canonical-missing','canonical-sha-mismatch','mime-parse','attachment-decode',
+                ('canonical-missing','canonical-sha-mismatch','canonical-io','mime-parse','attachment-decode',
                  'attachment-storage','database')),
             updated_at TEXT NOT NULL,
             CHECK((status='success' AND extracted_at IS NOT NULL AND last_error_kind IS NULL)

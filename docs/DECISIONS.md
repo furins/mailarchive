@@ -233,9 +233,10 @@ message-local bounded errors; retries rederive safely and orphan immutable blobs
 Relationships attach to canonical ID, so M7 HAM/quarantine transitions do not re-extract content.
 
 Recoll is a single managed, rebuildable derived index under `state/recoll/config` and
-`state/recoll/db`, with the content-addressed attachment store as its only topdir. CI installs
-real Recoll and poppler-utils to characterize extensionless blobs; the chosen direct-store layout
-retains canonical content paths unchanged. Recoll returns candidates only: SQLite maps each SHA to
-relationships and applies archived/quarantine/all lifecycle scope at query time. Commands use argv
-lists, explicit `-c` configuration and bounded timeouts. M8 does not call providers, alter
-fast-path acquisition, mutate remote mail, or implement deletion.
+`state/recoll/db`, with the content-addressed attachment store as its only topdir. Local Recoll
+1.43.0 and CI's Ubuntu 24.04 Recoll 1.36.1 characterize extensionless text and PDF blobs through
+the direct store, so no alias view is needed. Recoll returns candidates only: SQLite maps each SHA
+to relationships and applies archived/quarantine/all lifecycle scope at query time. Bounded audit
+events include refresh, rebuild, and `recoll.search.failed`; commands use argv lists, explicit
+`-c` configuration and bounded timeouts. M8 does not call providers, alter fast-path acquisition,
+mutate remote mail, or implement deletion.

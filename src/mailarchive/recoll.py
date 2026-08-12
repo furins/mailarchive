@@ -30,7 +30,7 @@ class RecollLayout:
 
 
 def managed_layout(config: AppConfig) -> RecollLayout:
-    root = config.archive.root
+    root = config.archive.root.resolve()
     return RecollLayout(
         root / "state" / "recoll" / "config",
         root / "state" / "recoll" / "db",
@@ -173,7 +173,7 @@ class RecollAdapter:
 
     def record_search_failure(self) -> None:
         """Record a bounded derived-search failure without changing canonical state."""
-        self._audit("recoll.refresh.failed", "failed")
+        self._audit("recoll.search.failed", "failed")
 
 
 def search_attachments(
