@@ -58,6 +58,11 @@ account+provider_message_id. `gmail_labels` is keyed by account+label_id and
 opaque history checkpoints and local timestamps/error categories.
 The full-sync checkpoint is committed only after catch-up history replay succeeds.
 
+M6 adds `provider_kind='pop3'`. POP3 stores the server UIDL in `provider_message_id`, with a
+partial unique key on `(account_id, provider_message_id)` for POP3. RFC Message-ID is metadata
+only. A UIDL can link to exactly one canonical object; a conflicting re-link fails closed. Two
+UIDLs may link to the same account-scoped SHA-256 canonical object.
+
 ## 4. canonical_messages
 
 Represents preserved message bytes.

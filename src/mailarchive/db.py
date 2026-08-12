@@ -229,6 +229,7 @@ def _migration_6(connection: sqlite3.Connection) -> None:
         )
         """
     )
+
     connection.execute("""
         INSERT INTO remote_messages_v6(
             id, account_id, provider_kind, remote_folder, uidvalidity, remote_uid,
@@ -300,6 +301,56 @@ def _migration_6(connection: sqlite3.Connection) -> None:
     """)
 
 
+def _migration_7(connection: sqlite3.Connection) -> None:
+    """Add POP3 UIDL identities without altering prior provider identities or links."""
+    connection.execute(
+        """
+        CREATE TABLE remote_messages_v7 (
+            id TEXT PRIMARY KEY,
+            account_id INTEGER NOT NULL REFERENCES accounts(id),
+            provider_kind TEXT NOT NULL CHECK (provider_kind IN ('imap', 'gmail', 'pop3')),
+            remote_folder TEXT,
+            uidvalidity INTEGER,
+            remote_uid INTEGER,
+            provider_message_id TEXT,
+            provider_thread_id TEXT,
+            message_id_header TEXT,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            remote_present INTEGER NOT NULL CHECK (remote_present IN (0, 1)),
+            identity_confidence TEXT NOT NULL CHECK (identity_confidence IN ('proven')),
+            CHECK ((provider_kind='imap' AND remote_folder IS NOT NULL AND uidvalidity > 0
+                   AND remote_uid > 0 AND provider_message_id IS NULL)
+                OR (provider_kind IN ('gmail', 'pop3') AND provider_message_id IS NOT NULL
+                   AND remote_folder IS NULL AND uidvalidity IS NULL AND remote_uid IS NULL)),
+            UNIQUE(id, account_id)
+        )
+        """
+    )
+    connection.execute("INSERT INTO remote_messages_v7 SELECT * FROM remote_messages")
+    connection.execute(
+        """CREATE TABLE remote_canonical_links_v7 (
+            remote_message_id TEXT PRIMARY KEY REFERENCES remote_messages_v7(id),
+            canonical_message_id TEXT NOT NULL REFERENCES canonical_messages(id),
+            link_reason TEXT NOT NULL, created_at TEXT NOT NULL,
+            UNIQUE(remote_message_id, canonical_message_id))"""
+    )
+    connection.execute("INSERT INTO remote_canonical_links_v7 SELECT * FROM remote_canonical_links")
+    connection.execute("DROP TABLE remote_canonical_links")
+    connection.execute("DROP TABLE remote_messages")
+    connection.execute("ALTER TABLE remote_messages_v7 RENAME TO remote_messages")
+    connection.execute("ALTER TABLE remote_canonical_links_v7 RENAME TO remote_canonical_links")
+    connection.execute("""CREATE UNIQUE INDEX remote_messages_imap_identity
+        ON remote_messages(account_id, remote_folder, uidvalidity, remote_uid)
+        WHERE provider_kind='imap'""")
+    connection.execute("""CREATE UNIQUE INDEX remote_messages_gmail_identity
+        ON remote_messages(account_id, provider_message_id)
+        WHERE provider_kind='gmail'""")
+    connection.execute("""CREATE UNIQUE INDEX remote_messages_pop3_identity
+        ON remote_messages(account_id, provider_message_id)
+        WHERE provider_kind='pop3'""")
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _migration_1),
     (2, _migration_2),
@@ -307,6 +358,7 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (4, _migration_4),
     (5, _migration_5),
     (6, _migration_6),
+    (7, _migration_7),
 )
 
 

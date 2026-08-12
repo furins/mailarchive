@@ -54,6 +54,20 @@ accounts:
       oauth_client_secret_file: /etc/mailarchive/secrets/google-oauth-client.json
       poll_interval_seconds: 90
 
+  legacy-pop3:
+    kind: pop3
+    enabled: false
+    remote_retention_days: 365
+    remote_deletion_enabled: false
+    required_verified_backups: 2
+    config_ref: env:MAILARCHIVE_LEGACY_POP3_PASSWORD
+    pop3:
+      host: pop.example.invalid
+      port: 995
+      username: you@example.invalid
+      tls_mode: POP3S
+      connection_timeout_seconds: 30
+
 spam:
   enabled: true
   suspect_quarantine_days: 365

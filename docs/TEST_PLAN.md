@@ -132,6 +132,20 @@ burst coalescing, polling, reconnection, watcher locking, stale local health and
 - verification failure revokes/blocks safety evidence;
 - two records from the same logical repository do not accidentally count as two independent required copies if policy demands distinct repositories.
 
+### M6 POP3 acquisition
+
+- a disposable local POP3 server verifies UIDL/RETR byte preservation for CRLF, folded headers,
+  multipart bodies, binary/base64 payloads, malformed messages, duplicate Message-ID, identical
+  bytes, and no final newline;
+- no DELE command is accepted or issued and a sync leaves the mailbox unchanged;
+- UIDL idempotency skips already-linked bodies; a UIDL cannot be relinked to a different SHA;
+- failed retrieval does not register a provider link, and a rerun safely completes partial local
+  success;
+- migration from M5 retains IMAP/Gmail identities, links and `fast_path_health`, with a clean
+  `foreign_key_check`;
+- getmail6 is evaluated only by a real executable against the same disposable server and strict
+  non-destructive configuration. It remains rejected/unavailable until that experiment passes.
+
 ## 7. Integrity tests
 
 - modified local `.eml` produces hash mismatch;

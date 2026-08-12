@@ -20,6 +20,7 @@ from mailarchive.gmail import GmailAdapter, GmailError, GmailWatcher, authorize
 from mailarchive.imap import ImapAdapter, ImapError
 from mailarchive.ingest import IngestError, ingest_file
 from mailarchive.notmuch import NotmuchAdapter, NotmuchError, search_canonical_messages
+from mailarchive.pop3 import Pop3Adapter, Pop3Error
 
 
 def _emit(value: object, as_json: bool) -> None:
@@ -102,6 +103,12 @@ def build_parser() -> argparse.ArgumentParser:
     gmail_watch.add_argument("--account", required=True)
     gmail_watch.add_argument("--config", required=True)
     gmail_watch.add_argument("--json", action="store_true")
+    pop3 = subcommands.add_parser("pop3", help="read-only POP3 fallback acquisition")
+    pop3_subcommands = pop3.add_subparsers(dest="pop3_command", required=True)
+    pop3_sync = pop3_subcommands.add_parser("sync", help="retrieve new UIDLs without deletion")
+    pop3_sync.add_argument("--account", required=True)
+    pop3_sync.add_argument("--config", required=True)
+    pop3_sync.add_argument("--json", action="store_true")
     return parser
 
 
@@ -350,11 +357,16 @@ def main(argv: list[str] | None = None) -> int:
                 for name, handler in previous.items():
                     signal.signal(name, handler)
             return 0
+        if args.command == "pop3":
+            result = Pop3Adapter(config).sync(args.account)
+            _emit(result.__dict__, args.json)
+            return 0
     except (
         ConfigError,
         IngestError,
         ImapError,
         GmailError,
+        Pop3Error,
         NotmuchError,
         OSError,
         sqlite3.DatabaseError,

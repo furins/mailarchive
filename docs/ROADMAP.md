@@ -120,6 +120,10 @@ Deliver:
 - state tracking;
 - no delete-after-retrieve by default.
 
+Implemented as direct controlled POP3 UIDL/RETR acquisition while getmail6 remains unaccepted:
+the required real-binary byte-fidelity experiment could not run because getmail6 was unavailable
+in the implementation environment. No delete option or remote mutation path is exposed.
+
 ## M7 — Spam quarantine
 
 Deliver:

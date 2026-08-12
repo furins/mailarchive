@@ -109,3 +109,17 @@ ingest without rewriting bytes. Gmail IMAP, Pub/Sub, users.watch, and all Gmail 
 are deliberately out of scope. History polling defaults to 90 seconds; expired history requires a
 safe full sync. Token and OAuth client-secret files must remain outside `archive.root`. SPAM and
 TRASH are inventoried as provider labels only; M7 owns local spam/quarantine policy.
+
+## ADR-017 — M6 POP3 uses direct controlled retrieval, pending getmail6 acceptance
+
+Status: accepted with a documented evaluation limitation.
+
+getmail6 was not installed in the M6 implementation environment, so it was not admitted to the
+canonical path without the mandated real-binary experiment. `mailarchive pop3 sync` instead uses
+a small direct, read-only POP3 client which performs only USER, PASS, UIDL, RETR and QUIT; its
+code has no DELE operation or delete-related configuration. UIDL is the account-scoped provider
+identity and SQLite is authoritative; a getmail oldmail file would be rebuildable subordinate
+state only. Before getmail6 can be used, the disposable-server byte-fidelity experiment must pass
+for all M6 fixtures with explicitly safe options (`delete=false`, `delete_after=0`,
+`delete_bigger_than=0`, `delivered_to=false`, `received=false`, `mark_read=false`) and prove no
+DELE. getmail6 never writes canonical storage directly.

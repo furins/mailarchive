@@ -8,6 +8,7 @@ from typing import Literal
 
 AccountKind = Literal["imap", "gmail", "pop3"]
 TlsMode = Literal["IMAPS", "STARTTLS", "INSECURE_LOOPBACK"]
+Pop3TlsMode = Literal["POP3S", "STARTTLS", "INSECURE_LOOPBACK"]
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,17 @@ class GmailConfig:
 
 
 @dataclass(frozen=True)
+class Pop3Config:
+    """POP3 connection facts. Credentials remain an external config reference."""
+
+    host: str
+    port: int
+    username: str
+    tls_mode: Pop3TlsMode
+    connection_timeout_seconds: int
+
+
+@dataclass(frozen=True)
 class AccountConfig:
     name: str
     kind: AccountKind
@@ -59,6 +71,7 @@ class AccountConfig:
     config_ref: str
     imap: ImapConfig | None = None
     gmail: GmailConfig | None = None
+    pop3: Pop3Config | None = None
 
 
 @dataclass(frozen=True)
