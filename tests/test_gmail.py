@@ -23,6 +23,7 @@ from mailarchive.gmail import (
     GmailApiClient,
     GmailAuthError,
     GmailHistoryExpired,
+    GmailIdentityConflict,
     GmailResponseError,
     GmailTransientError,
     GmailWatcher,
@@ -31,6 +32,7 @@ from mailarchive.gmail import (
     decode_raw,
     load_credentials,
 )
+from mailarchive.ingest import ingest_bytes
 
 
 class FakeGmail:
@@ -892,3 +894,26 @@ def test_raw_multipart_fidelity_without_padding(tmp_path: Path) -> None:
             == raw
         )
         assert str(row[1]) == hashlib.sha256(raw).hexdigest()
+
+
+def test_same_provider_id_conflict_preserves_existing_link(tmp_path: Path) -> None:
+    config = load_config(_gmail_config(tmp_path))
+    fake = FakeGmail(b"Message-ID: <a>\r\n\r\nA")
+    adapter = GmailAdapter(config, lambda _account: fake)  # type: ignore[arg-type]
+    adapter.sync("gmail")
+    with connect(config.database.path) as db:
+        aid = int(db.execute("SELECT id FROM accounts WHERE name='gmail'").fetchone()[0])
+        before = db.execute("SELECT canonical_message_id FROM remote_canonical_links").fetchone()[0]
+    changed = ingest_bytes(config, b"Message-ID: <a>\r\n\r\nB", "gmail", source_kind="test")
+    with pytest.raises(GmailIdentityConflict):
+        adapter._register(  # pyright: ignore[reportPrivateUsage]
+            aid,
+            {"id": "G1", "threadId": "T1", "labelIds": ["INBOX", "IMPORTANT", "Label_123"]},
+            changed,
+            {"INBOX", "IMPORTANT", "Label_123"},
+        )
+    with connect(config.database.path) as db:
+        assert (
+            db.execute("SELECT canonical_message_id FROM remote_canonical_links").fetchone()[0]
+            == before
+        )
