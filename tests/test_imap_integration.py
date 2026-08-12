@@ -65,6 +65,10 @@ def dovecot_loopback(
     """Start an empty, plaintext-only-on-loopback Dovecot instance for tests."""
     root = tmp_path / "dovecot"
     local_user = pwd.getpwuid(os.getuid()).pw_name
+    version = subprocess.run(
+        ["dovecot", "--version"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    dovecot_24 = version.startswith("2.4.")
     mail = root / "mail"
     for part in ("cur", "new", "tmp"):
         (mail / part).mkdir(parents=True)
@@ -73,11 +77,43 @@ def dovecot_loopback(
     password_file.write_text("fixture:{PLAIN}fixture-password\n", encoding="utf-8")
     config = root / "dovecot.conf"
     log_path = root / "dovecot.log"
+    auth_configuration = (
+        (
+            "passdb passwd-file {",
+            f"  passwd_file_path = {password_file}",
+            "}",
+            "userdb static {",
+            "  static_allow_all_users = yes",
+            "  userdb_fields {",
+            f"    uid = {os.getuid()}",
+            f"    gid = {os.getgid()}",
+            f"    home = {root}",
+            "  }",
+            "}",
+        )
+        if dovecot_24
+        else (
+            "disable_plaintext_auth = no",
+            f"mail_location = maildir:{mail}",
+            "passdb {",
+            "  driver = passwd-file",
+            f"  args = scheme=PLAIN username_format=%u {password_file}",
+            "}",
+            "userdb {",
+            "  driver = static",
+            f"  args = uid={os.getuid()} gid={os.getgid()} home={root}",
+            "}",
+        )
+    )
+    version_configuration = (
+        ("dovecot_config_version = 2.4.0", "dovecot_storage_version = 2.4.0")
+        if dovecot_24
+        else ()
+    )
     config.write_text(
         "\n".join(
             (
-                "dovecot_config_version = 2.4.0",
-                "dovecot_storage_version = 2.4.0",
+                *version_configuration,
                 f"default_internal_user = {local_user}",
                 f"default_internal_group = {local_user}",
                 f"default_login_user = {local_user}",
@@ -88,19 +124,8 @@ def dovecot_loopback(
                 f"log_path = {log_path}",
                 "ssl = no",
                 "auth_mechanisms = plain",
-                "mail_driver = maildir",
-                f"mail_path = {mail}",
-                "passdb passwd-file {",
-                f"  passwd_file_path = {password_file}",
-                "}",
-                "userdb static {",
-                "  static_allow_all_users = yes",
-                "  userdb_fields {",
-                f"    uid = {os.getuid()}",
-                f"    gid = {os.getgid()}",
-                f"    home = {root}",
-                "  }",
-                "}",
+                *(("mail_driver = maildir", f"mail_path = {mail}") if dovecot_24 else ()),
+                *auth_configuration,
                 "service imap-login {",
                 f"  user = {local_user}",
                 "  chroot =",
