@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
-from mailarchive.models import AccountConfig, AppConfig, ArchiveConfig, DatabaseConfig
+from mailarchive.models import AccountConfig, AppConfig, ArchiveConfig, DatabaseConfig, ImapConfig
 from mailarchive.safety import REMOTE_DELETION_DEFAULT, redact_secret_reference
 
 
@@ -66,6 +66,60 @@ def _account_name(value: object) -> str:
     return value
 
 
+def _imap_config(account: Mapping[object, object], label: str) -> ImapConfig | None:
+    raw = account.get("imap")
+    if raw is None:
+        return None
+    values = _mapping(raw, f"{label}.imap")
+    host = _required_string(values, "host", f"{label}.imap")
+    port = _required_nonnegative_int(values, "port", f"{label}.imap")
+    if not 1 <= port <= 65535:
+        raise ConfigError(f"{label}.imap.port must be between 1 and 65535")
+    tls_mode = _required_string(values, "tls_mode", f"{label}.imap")
+    if tls_mode not in {"IMAPS", "STARTTLS", "INSECURE_LOOPBACK"}:
+        raise ConfigError(f"{label}.imap.tls_mode must be IMAPS, STARTTLS, or INSECURE_LOOPBACK")
+    if tls_mode == "INSECURE_LOOPBACK" and host.lower() not in {"localhost", "127.0.0.1", "::1"}:
+        raise ConfigError(f"{label}.imap insecure mode is permitted only for a loopback host")
+    folders_raw = values.get("folders", ["INBOX"])
+    if not isinstance(folders_raw, list):
+        raise ConfigError(f"{label}.imap.folders must be a non-empty list of remote folder names")
+    folder_values = cast(list[object], folders_raw)
+    if not folder_values or not all(
+        isinstance(folder, str)
+        and folder
+        and folder.isascii()
+        and not any(c in folder for c in "\x00\r\n")
+        for folder in folder_values
+    ):
+        raise ConfigError(
+            f"{label}.imap.folders must be non-empty ASCII remote folder names "
+            "without CR, LF, or NUL"
+        )
+    folders_list = cast(list[str], folder_values)
+    folders = tuple(folders_list)
+    if len(set(folders)) != len(folders):
+        raise ConfigError(f"{label}.imap.folders must not contain duplicates")
+    if "sync_timeout_seconds" in values:
+        raise ConfigError(
+            f"{label}.imap.sync_timeout_seconds is unsupported for direct IMAP acquisition"
+        )
+    connect_timeout = (
+        _required_nonnegative_int(values, "connection_timeout_seconds", f"{label}.imap")
+        if "connection_timeout_seconds" in values
+        else 60
+    )
+    if connect_timeout == 0:
+        raise ConfigError(f"{label}.imap.connection_timeout_seconds must be positive")
+    return ImapConfig(
+        host=host,
+        port=port,
+        username=_required_string(values, "username", f"{label}.imap"),
+        tls_mode=cast("Any", tls_mode),
+        folders=folders,
+        connection_timeout_seconds=connect_timeout,
+    )
+
+
 def load_config(path: Path) -> AppConfig:
     """Load a configuration file; absent or malformed safety settings are rejected."""
     try:
@@ -107,6 +161,7 @@ def load_config(path: Path) -> AppConfig:
                     account, "required_verified_backups", label
                 ),
                 config_ref=_required_string(account, "config_ref", label),
+                imap=_imap_config(account, label) if kind == "imap" else None,
             )
         )
     if not accounts:
@@ -135,6 +190,15 @@ def display_config(config: AppConfig) -> dict[str, object]:
                 "remote_deletion_enabled": account.remote_deletion_enabled,
                 "required_verified_backups": account.required_verified_backups,
                 "config_ref": redact_secret_reference(account.config_ref),
+                "imap": None
+                if account.imap is None
+                else {
+                    "host": account.imap.host,
+                    "port": account.imap.port,
+                    "username": account.imap.username,
+                    "tls_mode": account.imap.tls_mode,
+                    "folders": list(account.imap.folders),
+                },
             }
             for account in config.accounts
         ],

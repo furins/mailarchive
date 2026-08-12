@@ -1,4 +1,5 @@
 """Local-only command-line interface for canonical ingest and derived search."""
+# ruff: noqa: E501
 
 from __future__ import annotations
 
@@ -11,6 +12,7 @@ from typing import NoReturn
 
 from mailarchive.config import ConfigError, display_config, load_config
 from mailarchive.db import connect, initialize
+from mailarchive.imap import ImapAdapter, ImapError
 from mailarchive.ingest import IngestError, ingest_file
 from mailarchive.notmuch import NotmuchAdapter, NotmuchError, search_canonical_messages
 
@@ -60,6 +62,13 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("query", help="notmuch query")
     search.add_argument("--config", required=True, help="path to YAML configuration")
     search.add_argument("--json", action="store_true", help="emit JSON")
+    imap = subcommands.add_parser("imap", help="explicit read-only IMAP acquisition")
+    imap_subcommands = imap.add_subparsers(dest="imap_command", required=True)
+    sync = imap_subcommands.add_parser("sync", help="pull one configured IMAP folder into the local archive")
+    sync.add_argument("--account", required=True, help="one configured IMAP account")
+    sync.add_argument("--folder", required=True, help="one configured remote folder")
+    sync.add_argument("--config", required=True, help="path to YAML configuration")
+    sync.add_argument("--json", action="store_true", help="emit JSON")
     return parser
 
 
@@ -132,7 +141,12 @@ def main(argv: list[str] | None = None) -> int:
             results = search_canonical_messages(config, args.query)
             _emit([result.as_dict() for result in results], args.json)
             return 0
-    except (ConfigError, IngestError, NotmuchError, OSError, sqlite3.DatabaseError) as error:
+        if args.command == "imap":
+            results = ImapAdapter(config).sync(args.account, args.folder)
+            _emit({"account": args.account, "folder": args.folder, "seen": len(results),
+                   "imported": sum(result.created for result in results)}, args.json)
+            return 0
+    except (ConfigError, IngestError, ImapError, NotmuchError, OSError, sqlite3.DatabaseError) as error:
         _error(str(error))
     _error("unsupported command")
 

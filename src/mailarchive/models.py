@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Literal
 
 AccountKind = Literal["imap", "gmail", "pop3"]
+TlsMode = Literal["IMAPS", "STARTTLS", "INSECURE_LOOPBACK"]
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,16 @@ class DatabaseConfig:
 
 
 @dataclass(frozen=True)
+class ImapConfig:
+    host: str
+    port: int
+    username: str
+    tls_mode: TlsMode
+    folders: tuple[str, ...]
+    connection_timeout_seconds: int
+
+
+@dataclass(frozen=True)
 class AccountConfig:
     name: str
     kind: AccountKind
@@ -29,6 +40,7 @@ class AccountConfig:
     remote_deletion_enabled: bool
     required_verified_backups: int
     config_ref: str
+    imap: ImapConfig | None = None
 
 
 @dataclass(frozen=True)

@@ -27,6 +27,17 @@ Production accounts are never test fixtures.
 - deletion is disabled by default;
 - secret values are not printed.
 
+### M3 IMAP acquisition
+
+- only one configured account/folder can be selected, read-only, using UID SEARCH and UID FETCH
+  BODY.PEEK[]; mutating IMAP commands are absent;
+- FETCH parsing rejects missing, mismatching, malformed, or ambiguous UID/literal responses;
+- a disposable loopback IMAP integration environment seeds known raw RFC822 bytes, checks the
+  server's UIDVALIDITY/UID, count, content, and flags after sync, then compares server and
+  canonical bytes exactly;
+- UID plus UIDVALIDITY creates a one-to-one remote-to-canonical link; duplicate or conflicting
+  linkage fails closed without altering the server or canonical bytes.
+
 ### Ingest
 
 - import one `.eml`;

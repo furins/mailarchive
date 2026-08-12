@@ -68,7 +68,7 @@ notmuch can group multiple canonical files sharing a Message-ID.
 
 Deliver:
 
-- mbsync adapter;
+- direct read-only IMAP adapter;
 - account/folder mapping;
 - UID metadata capture;
 - read-only/default-safe configuration;

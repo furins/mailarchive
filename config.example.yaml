@@ -12,7 +12,13 @@ accounts:
     remote_retention_days: 365
     remote_deletion_enabled: false
     required_verified_backups: 2
-    config_ref: secret-or-external-config-reference
+    config_ref: env:MAILARCHIVE_PERSONAL_IMAP_PASSWORD
+    imap:
+      host: imap.example.invalid
+      port: 993
+      username: you@example.invalid
+      tls_mode: IMAPS
+      folders: [INBOX]
 
   work:
     kind: imap
@@ -20,7 +26,13 @@ accounts:
     remote_retention_days: 730
     remote_deletion_enabled: false
     required_verified_backups: 2
-    config_ref: secret-or-external-config-reference
+    config_ref: env:MAILARCHIVE_WORK_IMAP_PASSWORD
+    imap:
+      host: imap.example.invalid
+      port: 993
+      username: you@example.invalid
+      tls_mode: IMAPS
+      folders: [INBOX]
 
 spam:
   enabled: true
