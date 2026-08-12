@@ -25,6 +25,7 @@ from mailarchive.gmail import (
     GmailHistoryExpired,
     GmailIdentityConflict,
     GmailResponseError,
+    GmailSyncBusyError,
     GmailSyncResult,
     GmailTransientError,
     GmailWatcher,
@@ -120,7 +121,17 @@ def test_raw_decode_and_label_multiplicity_do_not_duplicate_canonical(tmp_path: 
         assert db.execute("SELECT COUNT(*) FROM remote_canonical_links").fetchone()[0] == 1
         assert db.execute("SELECT COUNT(*) FROM gmail_message_labels").fetchone()[0] == 3
         stored = Path(str(db.execute("SELECT local_path FROM canonical_messages").fetchone()[0]))
-    assert stored.read_bytes() == raw
+        assert stored.read_bytes() == raw
+
+
+def test_multilabel_identity_cardinality_is_exact(tmp_path: Path) -> None:
+    config = load_config(_gmail_config(tmp_path))
+    GmailAdapter(config, lambda _account: FakeGmail(b"Message-ID: <a>\r\n\r\nbody")).sync("gmail")  # type: ignore[arg-type]
+    with connect(config.database.path) as db:
+        assert db.execute("SELECT COUNT(*) FROM remote_messages").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM remote_canonical_links").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM canonical_messages").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM gmail_message_labels").fetchone()[0] == 3
 
 
 def test_client_uses_only_get_for_mailbox_calls() -> None:
@@ -938,6 +949,37 @@ class _WatcherEvent:
         return self.is_set()
 
 
+class _RecordingWatcher(GmailWatcher):
+    """Retain real health writes while making run-loop transitions observable."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self.transitions: list[tuple[str, int]] = []
+
+    def _health(self, mode: str, **values: object) -> None:
+        super()._health(mode, **values)
+        with connect(self.config.database.path) as db:
+            row = db.execute(
+                "SELECT mode,consecutive_failures FROM fast_path_health "
+                "WHERE remote_folder='__GMAIL__'"
+            ).fetchone()
+        self.transitions.append((str(row[0]), int(row[1] or 0)))
+
+
+class _BlockingEvent:
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def is_set(self) -> bool:
+        return self.release.is_set()
+
+    def wait(self, _seconds: float) -> bool:
+        self.entered.set()
+        self.release.wait(timeout=5)
+        return self.release.is_set()
+
+
 def test_watcher_run_loop_degrades_recovers_and_releases_lock(tmp_path: Path) -> None:
     config = load_config(_gmail_config(tmp_path))
 
@@ -958,7 +1000,7 @@ def test_watcher_run_loop_degrades_recovers_and_releases_lock(tmp_path: Path) ->
                 raise value
             return cast(GmailSyncResult, value)
 
-    watcher = GmailWatcher(
+    watcher = _RecordingWatcher(
         config,
         "gmail",
         cast(threading.Event, _WatcherEvent(3)),
@@ -966,6 +1008,12 @@ def test_watcher_run_loop_degrades_recovers_and_releases_lock(tmp_path: Path) ->
         refresh=lambda: None,
     )
     watcher.run()
+    first_failure = watcher.transitions.index(("degraded", 1))
+    second_failure = watcher.transitions.index(("degraded", 2))
+    recovered = watcher.transitions.index(("poll", 0), second_failure)
+    assert first_failure < second_failure < recovered
+    assert ("degraded", 1) in watcher.transitions[first_failure + 1 : second_failure]
+    assert watcher.transitions[-1] == ("stopped", 0)
     with connect(config.database.path) as db:
         assert tuple(
             db.execute("SELECT mode,consecutive_failures FROM fast_path_health").fetchone()
@@ -973,6 +1021,144 @@ def test_watcher_run_loop_degrades_recovers_and_releases_lock(tmp_path: Path) ->
     with gmail_lock(config, config.accounts[0], "watch"):
         with gmail_lock(config, config.accounts[0], "sync"):
             pass
+
+
+def test_watcher_watch_lock_excludes_concurrent_watcher_but_not_sync_lock(tmp_path: Path) -> None:
+    config = load_config(_gmail_config(tmp_path))
+
+    class Adapter:
+        def _account(self, _name: str) -> object:
+            return config.accounts[0]
+
+        def sync(self, _name: str) -> GmailSyncResult:
+            return GmailSyncResult("partial")
+
+    event = _BlockingEvent()
+    first = GmailWatcher(
+        config,
+        "gmail",
+        cast(threading.Event, event),
+        adapter=cast(GmailAdapter, Adapter()),
+    )
+    thread = threading.Thread(target=first.run)
+    thread.start()
+    assert event.entered.wait(timeout=5)
+    second = GmailWatcher(
+        config,
+        "gmail",
+        cast(threading.Event, _WatcherEvent(1)),
+        adapter=cast(GmailAdapter, Adapter()),
+    )
+    with pytest.raises(GmailSyncBusyError, match="already running"):
+        second.run()
+    # The short reconciliation lock remains available while the watcher waits.
+    with gmail_lock(config, config.accounts[0], "sync"):
+        pass
+    event.release.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    with gmail_lock(config, config.accounts[0], "watch"):
+        pass
+
+
+def test_watcher_sync_busy_is_retried_without_bypassing_sync_lock(tmp_path: Path) -> None:
+    config = load_config(_gmail_config(tmp_path))
+
+    class Event:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.waiting = threading.Event()
+            self.release = threading.Event()
+
+        def is_set(self) -> bool:
+            return self.calls >= 2
+
+        def wait(self, _seconds: float) -> bool:
+            self.calls += 1
+            if self.calls == 1:
+                self.waiting.set()
+                self.release.wait(timeout=5)
+            return self.is_set()
+
+    class Adapter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def _account(self, _name: str) -> object:
+            return config.accounts[0]
+
+        def sync(self, _name: str) -> GmailSyncResult:
+            self.calls += 1
+            # This is the same non-blocking lock used by the production adapter.
+            with gmail_lock(config, config.accounts[0], "sync"):
+                return GmailSyncResult("partial")
+
+    adapter = Adapter()
+    event = Event()
+    watcher = _RecordingWatcher(
+        config,
+        "gmail",
+        cast(threading.Event, event),
+        adapter=cast(GmailAdapter, adapter),
+    )
+    thread = threading.Thread(target=watcher.run)
+    with gmail_lock(config, config.accounts[0], "sync"):
+        thread.start()
+        assert event.waiting.wait(timeout=5)
+        assert adapter.calls == 1
+    event.release.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert adapter.calls == 2
+    assert ("poll", 0) in watcher.transitions
+
+
+def test_watcher_recovers_notmuch_locally_before_next_sync(tmp_path: Path) -> None:
+    config = load_config(_gmail_config(tmp_path))
+
+    class Adapter:
+        def __init__(self) -> None:
+            self.sync_calls = 0
+            self.raw_fetches = 0
+
+        def _account(self, _name: str) -> object:
+            return config.accounts[0]
+
+        def sync(self, _name: str) -> GmailSyncResult:
+            self.sync_calls += 1
+            if self.sync_calls == 1:
+                self.raw_fetches += 1
+            return GmailSyncResult("full" if self.sync_calls == 1 else "partial")
+
+    adapter = Adapter()
+    refresh_calls = 0
+
+    def refresh() -> None:
+        nonlocal refresh_calls
+        refresh_calls += 1
+        if refresh_calls == 1:
+            raise RuntimeError("index unavailable")
+
+    watcher = _RecordingWatcher(
+        config,
+        "gmail",
+        cast(threading.Event, _WatcherEvent(2)),
+        adapter=cast(GmailAdapter, adapter),
+        refresh=refresh,
+    )
+    watcher.run()
+    # First failure is repaired on the following loop before its normal poll;
+    # the repair itself cannot fetch any additional Gmail message body.
+    assert adapter.raw_fetches == 1
+    assert refresh_calls >= 2
+    assert ("poll", 0) in watcher.transitions
+    with connect(config.database.path) as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM audit_events WHERE event_type='gmail.fast_refresh.failed'"
+        ).fetchone()[0] == 1
+        assert db.execute(
+            "SELECT COUNT(*) FROM audit_events WHERE event_type='gmail.fast_refresh.recovered'"
+        ).fetchone()[0] == 1
 
 
 def test_watcher_auth_failure_stops_after_one_poll(tmp_path: Path) -> None:
