@@ -38,6 +38,13 @@ Production accounts are never test fixtures.
 - UID plus UIDVALIDITY creates a one-to-one remote-to-canonical link; duplicate or conflicting
   linkage fails closed without altering the server or canonical bytes.
 
+### M5 Gmail acquisition
+
+- use an injected/fake REST transport only, never a production account;
+- assert all mailbox calls are GET and Gmail write methods are unavailable;
+- verify RAW base64url byte fidelity, label-independent provider identity, full pagination,
+  history replay/expiry, and failure-safe checkpoints.
+
 ### Ingest
 
 - import one `.eml`;

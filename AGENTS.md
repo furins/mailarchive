@@ -15,6 +15,9 @@ MailArchive is a local-first email archival system designed to:
 
 The repository documentation under `docs/` is the source of truth.
 
+M5 Gmail production acquisition is Gmail REST API v1, read-only only; Gmail IMAP and remote
+mutation are not permitted until their explicitly approved future milestones.
+
 Read, in this order, before changing code:
 
 1. `docs/REQUIREMENTS.md`

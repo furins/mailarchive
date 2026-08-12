@@ -235,11 +235,11 @@ is retried without refetching. Slow-path workers remain independent.
 
 ### Gmail
 
-The implementation milestone SHALL choose between a Gmail API aware path and a carefully configured Gmail IMAP path based on current operational validation.
-
-Required property:
-
-- labels must not cause unsafe canonical duplication or ambiguous deletion mapping.
+M5 uses a Gmail REST API v1 adapter with only GET profile, labels, messages and history methods.
+It polls history every 90 seconds by default and refreshes notmuch after watcher acquisition.
+`Message.id` is provider-global identity; labels are many-to-many metadata and threadId is metadata.
+RAW endpoint bytes pass unchanged to canonical ingest. Gmail IMAP, Pub/Sub, and mailbox mutation
+are not implemented.
 
 ## 5. Slow-path scheduling
 

@@ -16,6 +16,7 @@ from mailarchive.models import (
     ArchiveConfig,
     DatabaseConfig,
     FastPathConfig,
+    GmailConfig,
     ImapConfig,
 )
 from mailarchive.safety import REMOTE_DELETION_DEFAULT, redact_secret_reference
@@ -119,9 +120,7 @@ def _imap_config(account: Mapping[object, object], label: str) -> ImapConfig | N
         raise ConfigError(f"{label}.imap.connection_timeout_seconds must be positive")
     fast_path_raw = values.get("fast_path", {})
     fast_path_values = _mapping(fast_path_raw, f"{label}.imap.fast_path")
-    idle_enabled = _required_bool(
-        fast_path_values, "idle_enabled", f"{label}.imap.fast_path", True
-    )
+    idle_enabled = _required_bool(fast_path_values, "idle_enabled", f"{label}.imap.fast_path", True)
     reconcile = fast_path_values.get("reconcile_interval_seconds", 600)
     poll = fast_path_values.get("poll_interval_seconds", 90)
     if isinstance(reconcile, bool) or not isinstance(reconcile, int) or not 60 <= reconcile <= 1740:
@@ -137,6 +136,35 @@ def _imap_config(account: Mapping[object, object], label: str) -> ImapConfig | N
         connection_timeout_seconds=connect_timeout,
         fast_path=FastPathConfig(idle_enabled, reconcile, poll),
     )
+
+
+def _absolute_secret_path(value: str, label: str, archive_root: Path) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        raise ConfigError(f"{label} must be an absolute path")
+    # resolve(strict=False) also catches a path through an existing symlink.
+    resolved = path.resolve(strict=False)
+    try:
+        resolved.relative_to(archive_root.resolve(strict=False))
+    except ValueError:
+        return resolved
+    raise ConfigError(f"{label} must not be inside archive.root")
+
+
+def _gmail_config(account: Mapping[object, object], label: str, archive_root: Path) -> GmailConfig:
+    if account.get("imap") is not None:
+        raise ConfigError(f"{label}.imap is not permitted for kind=gmail")
+    values = _mapping(account.get("gmail"), f"{label}.gmail")
+    email = _required_string(values, "account_email", f"{label}.gmail")
+    client_file = _absolute_secret_path(
+        _required_string(values, "oauth_client_secret_file", f"{label}.gmail"),
+        f"{label}.gmail.oauth_client_secret_file",
+        archive_root,
+    )
+    poll = values.get("poll_interval_seconds", 90)
+    if isinstance(poll, bool) or not isinstance(poll, int) or not 60 <= poll <= 120:
+        raise ConfigError(f"{label}.gmail.poll_interval_seconds must be 60..120")
+    return GmailConfig(email, client_file, poll)
 
 
 def load_config(path: Path) -> AppConfig:
@@ -156,6 +184,7 @@ def load_config(path: Path) -> AppConfig:
         ZoneInfo(timezone)
     except ZoneInfoNotFoundError as error:
         raise ConfigError(f"archive.timezone is invalid: {timezone}") from error
+    archive_root = Path(_required_string(archive_values, "root", "archive"))
     accounts: list[AccountConfig] = []
     for raw_name, raw_account in account_values.items():
         name = _account_name(raw_name)
@@ -169,6 +198,13 @@ def load_config(path: Path) -> AppConfig:
         )
         if remote_deletion_enabled:
             raise ConfigError(f"{label}.remote_deletion_enabled is unsupported in M0")
+        config_ref = _required_string(account, "config_ref", label)
+        gmail = None
+        if kind == "gmail":
+            if not config_ref.startswith("file:"):
+                raise ConfigError(f"{label}.config_ref must use file: for Gmail")
+            _absolute_secret_path(config_ref[5:], f"{label}.config_ref", archive_root)
+            gmail = _gmail_config(account, label, archive_root)
         accounts.append(
             AccountConfig(
                 name=name,
@@ -179,16 +215,15 @@ def load_config(path: Path) -> AppConfig:
                 required_verified_backups=_required_nonnegative_int(
                     account, "required_verified_backups", label
                 ),
-                config_ref=_required_string(account, "config_ref", label),
+                config_ref=config_ref,
                 imap=_imap_config(account, label) if kind == "imap" else None,
+                gmail=gmail,
             )
         )
     if not accounts:
         raise ConfigError("accounts must contain at least one account")
     return AppConfig(
-        archive=ArchiveConfig(
-            root=Path(_required_string(archive_values, "root", "archive")), timezone=timezone
-        ),
+        archive=ArchiveConfig(root=archive_root, timezone=timezone),
         database=DatabaseConfig(path=Path(_required_string(database_values, "path", "database"))),
         accounts=tuple(accounts),
     )
@@ -224,6 +259,13 @@ def display_config(config: AppConfig) -> dict[str, object]:
                         ),
                         "poll_interval_seconds": account.imap.fast_path.poll_interval_seconds,
                     },
+                },
+                "gmail": None
+                if account.gmail is None
+                else {
+                    "account_email": account.gmail.account_email,
+                    "oauth_client_secret_file": str(account.gmail.oauth_client_secret_file),
+                    "poll_interval_seconds": account.gmail.poll_interval_seconds,
                 },
             }
             for account in config.accounts

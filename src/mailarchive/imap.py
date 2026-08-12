@@ -9,15 +9,13 @@ import os
 import re
 import sqlite3
 import ssl
-import tempfile
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
 from typing import cast
 
 from mailarchive.db import account_id, connect, initialize, insert_audit_event, utc_now
-from mailarchive.ingest import IngestResult, ingest_file
+from mailarchive.ingest import IngestResult, ingest_bytes
 from mailarchive.models import AccountConfig, AppConfig, CanonicalMessage
 
 _ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]*\Z")
@@ -106,9 +104,7 @@ def _parse_uidvalidity(client: imaplib.IMAP4) -> int:
 
 
 @contextmanager
-def folder_lock(
-    config: AppConfig, account: AccountConfig, folder: str
-) -> Generator[None]:
+def folder_lock(config: AppConfig, account: AccountConfig, folder: str) -> Generator[None]:
     import fcntl
 
     digest = hashlib.sha256(f"{account.name}\0{folder}".encode()).hexdigest()[:16]
@@ -148,7 +144,7 @@ def _linked_uids(
     rows = connection.execute(
         """SELECT remote_uid FROM remote_messages JOIN remote_canonical_links
            ON remote_canonical_links.remote_message_id = remote_messages.id
-           WHERE account_id=? AND remote_folder=? AND uidvalidity=?
+           WHERE account_id=? AND provider_kind='imap' AND remote_folder=? AND uidvalidity=?
              AND identity_confidence='proven'""",
         (account, folder, uidvalidity),
     ).fetchall()
@@ -170,7 +166,7 @@ def _refresh_last_seen(
         placeholders = ", ".join("?" for _ in chunk)
         connection.execute(
             "UPDATE remote_messages SET last_seen_at=? "
-            "WHERE account_id=? AND remote_folder=? AND uidvalidity=? "
+            "WHERE account_id=? AND provider_kind='imap' AND remote_folder=? AND uidvalidity=? "
             "AND identity_confidence='proven' AND remote_uid IN (" + placeholders + ")",
             (observed_at, account, folder, uidvalidity, *chunk),
         )
@@ -198,15 +194,18 @@ def register_remote_link(
             now = observed_at or utc_now()
             connection.execute(
                 """INSERT INTO remote_messages(
-                   id, account_id, remote_folder, uidvalidity, remote_uid, message_id_header,
+                   id, account_id, provider_kind, remote_folder, uidvalidity, remote_uid,
+                   provider_message_id, provider_thread_id, message_id_header,
                    first_seen_at, last_seen_at, remote_present, identity_confidence)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'proven')
+                   VALUES (?, ?, 'imap', ?, ?, ?, NULL, NULL, ?, ?, ?, 1, 'proven')
                    ON CONFLICT(account_id, remote_folder, uidvalidity, remote_uid)
+                   WHERE provider_kind='imap'
                    DO UPDATE SET last_seen_at=excluded.last_seen_at, remote_present=1""",
                 (remote_id, aid, folder, uidvalidity, uid, canonical.message_id_header, now, now),
             )
             row = connection.execute(
-                "SELECT id FROM remote_messages WHERE account_id=? AND remote_folder=? "
+                "SELECT id FROM remote_messages WHERE account_id=? AND provider_kind='imap' "
+                "AND remote_folder=? "
                 "AND uidvalidity=? AND remote_uid=?",
                 (aid, folder, uidvalidity, uid),
             ).fetchone()
@@ -328,13 +327,9 @@ class ImapAdapter:
                     if status != "OK":
                         raise ImapError("IMAP BODY.PEEK[] fetch failed")
                     fetched = parse_fetch_response(uid, data)
-                    with tempfile.NamedTemporaryFile(suffix=".eml", delete=False) as temporary:
-                        temporary.write(fetched.raw_bytes)
-                        source = Path(temporary.name)
-                    try:
-                        result = ingest_file(self.config, source, account_name)
-                    finally:
-                        source.unlink(missing_ok=True)
+                    result = ingest_bytes(
+                        self.config, fetched.raw_bytes, account_name, source_kind="imap-body-peek"
+                    )
                     register_remote_link(
                         self.config,
                         account_name,
@@ -366,7 +361,7 @@ class ImapAdapter:
                 if client is not None:
                     try:
                         client.logout()
-                    except (OSError, imaplib.IMAP4.error):
+                    except OSError, imaplib.IMAP4.error:
                         pass
             _audit(
                 self.config,

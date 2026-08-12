@@ -109,6 +109,9 @@ Acceptance:
 - Gmail labels do not create unsafe canonical identity assumptions;
 - deletion mapping is not implemented yet.
 
+Implemented with Gmail REST API v1, `gmail.readonly`, provider-global `Message.id`, label catalog
+relationships, RAW byte ingest, history polling, and no Gmail mutation path.
+
 ## M6 — POP3 fallback
 
 Deliver:

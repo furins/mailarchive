@@ -54,13 +54,13 @@ def _metadata(raw_bytes: bytes) -> tuple[str | None, str | None]:
         parsed = BytesParser(policy=policy.compat32).parsebytes(raw_bytes)
         message_id = parsed.get("Message-ID")
         date_header = parsed.get("Date")
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None, None
     if not date_header:
         return message_id, None
     try:
         message_date = parsedate_to_datetime(date_header)
-    except (TypeError, ValueError, IndexError, OverflowError):
+    except TypeError, ValueError, IndexError, OverflowError:
         return message_id, None
     if message_date.tzinfo is None:
         return message_id, None
@@ -116,16 +116,15 @@ def create_canonical_file(destination: Path, raw_bytes: bytes, sha256: str) -> N
         raise
 
 
-def ingest_file(config: AppConfig, source_path: Path, account_name: str) -> IngestResult:
-    """Ingest one local .eml file without changing its source or canonical bytes."""
-    if source_path.suffix.lower() != ".eml" or not source_path.is_file():
-        raise IngestError("source must be an existing .eml file")
+def ingest_bytes(
+    config: AppConfig, raw_bytes: bytes, account_name: str, *, source_kind: str = "bytes"
+) -> IngestResult:
+    """Admit exact provider bytes without a temporary RFC822 file or MIME rewrite."""
     account = next((item for item in config.accounts if item.name == account_name), None)
     if account is None:
         raise IngestError(f"unknown account: {account_name}")
     if not account.enabled:
         raise IngestError(f"account is disabled: {account_name}")
-    raw_bytes = source_path.read_bytes()
     sha256 = hashlib.sha256(raw_bytes).hexdigest()
     message_id, message_date = _metadata(raw_bytes)
     initialize(config.database.path, config.accounts)
@@ -142,7 +141,7 @@ def ingest_file(config: AppConfig, source_path: Path, account_name: str) -> Inge
             existing,
             audit_account_id=local_account_id,
             audit_event_type="ingest.succeeded",
-            audit_details_json=json.dumps({"sha256": sha256, "source": source_path.name}),
+            audit_details_json=json.dumps({"sha256": sha256, "source_kind": source_kind}),
         )
         return IngestResult(canonical_message=stored, created=created)
     destination = _maildir_path(config.archive.root, account_name, sha256)
@@ -168,9 +167,16 @@ def ingest_file(config: AppConfig, source_path: Path, account_name: str) -> Inge
         audit_account_id=local_account_id,
         audit_event_type="ingest.succeeded",
         audit_details_json=json.dumps(
-            {"sha256": sha256, "source": source_path.name, "message_id": message_id}
+            {"sha256": sha256, "source_kind": source_kind, "message_id": message_id}
         ),
     )
     if not verify_canonical_message(stored):
         raise IngestError("canonical file is missing or fails its SHA-256 check after registration")
     return IngestResult(canonical_message=stored, created=created)
+
+
+def ingest_file(config: AppConfig, source_path: Path, account_name: str) -> IngestResult:
+    """Ingest one local .eml file without changing its source or canonical bytes."""
+    if source_path.suffix.lower() != ".eml" or not source_path.is_file():
+        raise IngestError("source must be an existing .eml file")
+    return ingest_bytes(config, source_path.read_bytes(), account_name, source_kind="file")

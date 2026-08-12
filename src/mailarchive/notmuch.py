@@ -238,13 +238,17 @@ def search_canonical_messages(config: AppConfig, query: str) -> list[SearchResul
     by_path = {
         Path(str(row["local_path"])).resolve(): SearchResult(
             canonical_message=CanonicalMessage(
-                id=str(row["id"]), account_id=int(row["account_id"]), sha256=str(row["sha256"]),
-                local_path=Path(str(row["local_path"])), size_bytes=int(row["size_bytes"]),
+                id=str(row["id"]),
+                account_id=int(row["account_id"]),
+                sha256=str(row["sha256"]),
+                local_path=Path(str(row["local_path"])),
+                size_bytes=int(row["size_bytes"]),
                 message_id_header=(
                     None if row["message_id_header"] is None else str(row["message_id_header"])
                 ),
                 message_date=None if row["message_date"] is None else str(row["message_date"]),
-                downloaded_at=str(row["downloaded_at"]), archived_at=str(row["archived_at"]),
+                downloaded_at=str(row["downloaded_at"]),
+                archived_at=str(row["archived_at"]),
                 integrity_status=str(row["integrity_status"]),
                 integrity_verified_at=(
                     None

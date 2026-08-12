@@ -146,6 +146,10 @@ Credentials and OAuth tokens SHALL:
 - use OS secret storage, restricted files, environment indirection or provider-supported token storage;
 - be redacted in diagnostic output.
 
+For M5 Gmail, OAuth token and client-secret files are absolute paths outside `archive.root`; token
+files must be 0600 and no token material is stored in SQLite or audit data. The production OAuth
+scope is `gmail.readonly` only.
+
 ## 12. Testing destructive logic
 
 Tests for remote deletion SHALL use:

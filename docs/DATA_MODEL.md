@@ -52,6 +52,11 @@ identity_confidence
 
 Unique constraints SHALL reflect provider semantics.
 
+M5 generalizes this to `provider_kind`: IMAP retains folder+UIDVALIDITY+UID, Gmail uses only
+account+provider_message_id. `gmail_labels` is keyed by account+label_id and
+`gmail_message_labels` is a cross-account-safe relationship table. `gmail_sync_state` stores only
+opaque history checkpoints and local timestamps/error categories.
+
 ## 4. canonical_messages
 
 Represents preserved message bytes.
