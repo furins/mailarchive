@@ -73,6 +73,17 @@ Production accounts are never test fixtures.
 - classification failure results in safe state;
 - quarantine never silently expires into deletion without policy checks.
 
+### M7 spam quarantine
+
+- exact bytes enter staging before classification; HAM promotion alone sets `archived_at`;
+- SUSPECT/SPAM and classifier failure remain exact-byte quarantine objects with NULL `archived_at`
+  unless previously admitted HAM;
+- overrides append history and preserve canonical ID/SHA/bytes; the latest manual override wins;
+- Rspamd input is exact RFC822 bytes and malformed, skipped, unknown, timeout, and unavailable
+  responses fail closed to SUSPECT; no response body is canonical content;
+- index rebuild reapplies tags from SQLite, excludes quarantine by default, and permits explicit
+  `tag:quarantine` searches; status and quarantine listing remain local-only.
+
 ## 4. Deletion predicate tests
 
 Before any remote deletion adapter exists, the eligibility policy SHALL have combinatorial coverage.

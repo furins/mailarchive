@@ -339,6 +339,12 @@ class ImapAdapter:
                         result.canonical_message,
                         observed_at,
                     )
+                    if result.created:
+                        from mailarchive.classification import classify_pending
+
+                        result = IngestResult(
+                            classify_pending(self.config, result.canonical_message), True
+                        )
                     results.append(result)
                     if result.created:
                         _audit(

@@ -67,8 +67,10 @@ def _metadata(raw_bytes: bytes) -> tuple[str | None, str | None]:
     return message_id, message_date.astimezone(UTC).isoformat()
 
 
-def _maildir_path(archive_root: Path, account_name: str, sha256: str) -> Path:
-    mail_root = (archive_root / "mail").resolve()
+def _maildir_path(
+    archive_root: Path, account_name: str, sha256: str, root: str = "staging"
+) -> Path:
+    mail_root = (archive_root / root).resolve()
     destination = mail_root / account_name / "cur" / f"{sha256}.eml"
     try:
         destination.resolve().relative_to(mail_root)
@@ -156,7 +158,9 @@ def ingest_bytes(
         message_id_header=message_id,
         message_date=message_date,
         downloaded_at=now,
-        archived_at=now,
+        archived_at=None,
+        storage_state="pending",
+        quarantined_at=None,
         integrity_status="verified",
         integrity_verified_at=now,
         created_at=now,
@@ -176,7 +180,22 @@ def ingest_bytes(
 
 
 def ingest_file(config: AppConfig, source_path: Path, account_name: str) -> IngestResult:
-    """Ingest one local .eml file without changing its source or canonical bytes."""
+    """Import a local .eml as explicit operator HAM archive admission.
+
+    Provider acquisition calls :func:`ingest_bytes` directly and stays pending
+    until classifier policy runs. This retains the M1 local-import workflow.
+    """
     if source_path.suffix.lower() != ".eml" or not source_path.is_file():
         raise IngestError("source must be an existing .eml file")
-    return ingest_bytes(config, source_path.read_bytes(), account_name, source_kind="file")
+    result = ingest_bytes(config, source_path.read_bytes(), account_name, source_kind="file")
+    if result.canonical_message.storage_state == "pending":
+        from mailarchive.classification import ClassificationResult, apply_classification
+
+        message = apply_classification(
+            config,
+            result.canonical_message,
+            ClassificationResult("ham", None, "operator-local-import", "local-import"),
+            manual=True,
+        )
+        return IngestResult(canonical_message=message, created=result.created)
+    return result

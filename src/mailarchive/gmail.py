@@ -572,6 +572,10 @@ class GmailAdapter:
             labels.clear()
             labels.update(self._labels(client, aid))
             _, updated = self._register(aid, response, result, labels)
+        if result is not None and result.created:
+            from mailarchive.classification import classify_pending
+
+            classify_pending(self.config, result.canonical_message)
         return (0 if known else 1, int(result.created) if result else 0, updated)
 
     def _pre_scan_anchor(self, client: GmailApiClient) -> str | None:

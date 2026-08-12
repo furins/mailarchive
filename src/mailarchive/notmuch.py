@@ -60,15 +60,13 @@ class SearchResult:
 def managed_layout(config: AppConfig) -> NotmuchLayout:
     """Return paths deliberately outside the canonical mail tree."""
     archive_root = config.archive.root.resolve()
-    mail_root = archive_root / "mail"
+    # Both finalized roots are indexable.  Pending staging and all local state
+    # are explicitly ignored below, so a pending message is never searchable.
+    mail_root = archive_root
     state_root = archive_root / "state" / "notmuch"
     database_path = state_root / "db"
-    try:
-        database_path.relative_to(mail_root)
-    except ValueError:
-        pass
-    else:  # pragma: no cover - defensive against a future layout regression
-        raise NotmuchError("notmuch database must not be inside the canonical mail root")
+    # `state/` is under mail_root so both finalized roots can be indexed, but
+    # is explicitly ignored in the managed [new] configuration.
     return NotmuchLayout(
         mail_root=mail_root,
         state_root=state_root,
@@ -98,6 +96,10 @@ def managed_config_text(layout: NotmuchLayout) -> str:
             "",
             "[new]",
             "tags=archive",
+            "ignore=staging;state;attachments;metadata;logs",
+            "",
+            "[search]",
+            "exclude_tags=quarantine",
             "",
             "[index]",
             "decrypt=false",
@@ -190,6 +192,7 @@ class NotmuchAdapter:
     def refresh(self) -> None:
         """Create or incrementally update the derived index without running hooks."""
         self._run(["new", "--no-hooks"], timeout_seconds=self.refresh_timeout_seconds)
+        self.reconcile_classification_tags()
 
     def search_files(self, query: str) -> list[Path]:
         """Return absolute canonical file paths from a file-level JSON search."""
@@ -214,6 +217,43 @@ class NotmuchAdapter:
         if not changes or any(not change.startswith(("+", "-")) for change in changes):
             raise ValueError("notmuch tag changes must be non-empty +tag or -tag values")
         self._run(["tag", *changes, "--", query])
+
+    def reconcile_classification_tags(self) -> None:
+        """Rebuild M7 derived tags exclusively from authoritative SQLite state."""
+        if not self.config.database.path.exists():
+            return
+        layout = managed_layout(self.config)
+        with connect(self.config.database.path) as connection:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='classifications'"
+                ).fetchone()
+                is None
+            ):
+                return
+            rows = connection.execute(
+                """SELECT c.local_path, x.classification FROM canonical_messages c
+                JOIN classifications x ON x.id=(SELECT id FROM classifications
+                    WHERE canonical_message_id=c.id ORDER BY manual_override DESC,id DESC LIMIT 1)
+                WHERE c.storage_state IN ('archived','quarantined')"""
+            ).fetchall()
+        for row in rows:
+            path = Path(str(row["local_path"])).resolve()
+            try:
+                relative = path.relative_to(layout.mail_root)
+            except ValueError as error:
+                raise NotmuchError(
+                    "canonical path lies outside managed notmuch mail root"
+                ) from error
+            classification = str(row["classification"])
+            changes = ["+archive", "-ham", "-suspect", "-spam", "-quarantine"]
+            if classification == "ham":
+                changes.append("+ham")
+            elif classification == "suspect":
+                changes.extend(("+quarantine", "+suspect"))
+            else:
+                changes.extend(("+quarantine", "+spam"))
+            self.tag(changes, f"path:{relative}")
 
 
 def search_canonical_messages(config: AppConfig, query: str) -> list[SearchResult]:

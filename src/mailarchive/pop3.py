@@ -270,6 +270,10 @@ class Pop3Adapter:
                     self.config, client.retr(number), account_name, source_kind="pop3-retr"
                 )
                 register_pop3_link(self.config, account_name, uidl, result.canonical_message)
+                if result.created:
+                    from mailarchive.classification import classify_pending
+
+                    classify_pending(self.config, result.canonical_message)
                 imported += int(result.created)
                 reused += int(not result.created)
             if "DELE" in client.commands:

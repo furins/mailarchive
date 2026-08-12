@@ -167,3 +167,26 @@ CRLF-terminated wire data line is retained, exactly one stuffing dot is removed 
 lines, and the `.` terminator line is excluded. POP3 cannot expose an unknowable pre-protocol local
 file representation without a final line delimiter. The adapter never treats such a representation
 as canonical. Duplicate UIDLs in one listing fail closed before any RETR or local state change.
+
+## ADR-018 — M7 local classification is fail-closed quarantine
+
+Status: accepted.
+
+New exact RFC822 bytes first enter `staging/<account>/cur`. `archived_at` remains NULL until a
+HAM verdict promotes those unchanged bytes to `mail/<account>/cur`; this is archive admission and
+starts the future retention clock. SUSPECT and SPAM move unchanged bytes to
+`quarantine/<account>/cur` and set `quarantined_at`; M7 performs no permanent deletion and no
+provider mutation.
+
+The production observation-only adapter POSTs the exact bytes as `message/rfc822` to loopback-only
+Rspamd `/checkv2`. `no action` maps to HAM; explicit spam actions map to SPAM; intermediate,
+unknown, skipped, malformed, timeout, and transport responses map to SUSPECT quarantine. No
+Rspamd rewritten content or learning endpoint is used. Provider spam labels are evidence only.
+
+SQLite records append-only verdicts. The latest manual override wins over automatic history. A
+manual HAM restores the same canonical ID/SHA to mail and assigns `archived_at` only if absent;
+manual SUSPECT/SPAM quarantines it while retaining any historical `archived_at`.
+
+notmuch indexes `archive.root`, ignoring staging and state roots. Quarantine receives explicit
+derived tags and is excluded from ordinary searches through `exclude_tags=quarantine`; tags can be
+reapplied solely from SQLite after rebuilding the index.

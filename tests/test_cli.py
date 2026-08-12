@@ -102,7 +102,9 @@ def test_gmail_status_is_strictly_local_for_initialized_state(
                 "database": {"path": str(database)},
                 "accounts": {
                     "gmail": {
-                        "kind": "gmail", "enabled": True, "remote_retention_days": 365,
+                        "kind": "gmail",
+                        "enabled": True,
+                        "remote_retention_days": 365,
                         "required_verified_backups": 2,
                         "config_ref": f"file:{tmp_path / 'token.json'}",
                         "gmail": {

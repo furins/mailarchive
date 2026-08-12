@@ -1153,12 +1153,18 @@ def test_watcher_recovers_notmuch_locally_before_next_sync(tmp_path: Path) -> No
     assert refresh_calls >= 2
     assert ("poll", 0) in watcher.transitions
     with connect(config.database.path) as db:
-        assert db.execute(
-            "SELECT COUNT(*) FROM audit_events WHERE event_type='gmail.fast_refresh.failed'"
-        ).fetchone()[0] == 1
-        assert db.execute(
-            "SELECT COUNT(*) FROM audit_events WHERE event_type='gmail.fast_refresh.recovered'"
-        ).fetchone()[0] == 1
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM audit_events WHERE event_type='gmail.fast_refresh.failed'"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM audit_events WHERE event_type='gmail.fast_refresh.recovered'"
+            ).fetchone()[0]
+            == 1
+        )
 
 
 def test_watcher_auth_failure_stops_after_one_poll(tmp_path: Path) -> None:

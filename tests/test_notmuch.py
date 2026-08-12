@@ -61,9 +61,11 @@ def test_managed_configuration_is_deterministic_and_separate(config_file: Path) 
     config = load_config(config_file)
     layout = write_managed_config(config)
     contents = layout.config_path.read_text(encoding="utf-8")
-    assert layout.mail_root == config.archive.root.resolve() / "mail"
+    assert layout.mail_root == config.archive.root.resolve()
     assert layout.database_path == config.archive.root.resolve() / "state" / "notmuch" / "db"
-    assert not layout.database_path.is_relative_to(layout.mail_root)
+    assert layout.database_path.is_relative_to(layout.mail_root)
+    assert "ignore=staging;state;attachments;metadata;logs" in contents
+    assert "exclude_tags=quarantine" in contents
     assert f"mail_root={layout.mail_root}" in contents
     assert f"path={layout.database_path}" in contents
     assert f"hook_dir={layout.hook_directory}" in contents
