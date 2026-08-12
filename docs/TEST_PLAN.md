@@ -89,6 +89,19 @@ Production accounts are never test fixtures.
 - a linked pending message can be reconciled locally without provider RAW/RETR/BODY.PEEK refetch;
   missing or hash-mismatched pending files fail closed and remain pending.
 
+### M8 attachments and Recoll
+
+- MIME leaves with `Content-Disposition: attachment` or a filename are extracted from
+  exact canonical bytes after transfer-decoding; ordinary unnamed body leaves are not;
+- content blobs are SHA-256 addressed, immutable, deduplicated globally, and never use
+  untrusted filenames as paths; malformed/missing/mismatched source fails message-locally;
+- zero-attachment messages retain a successful extraction marker, retries are idempotent,
+  and HAM/quarantine transitions preserve relationships while changing search visibility;
+- real Recoll indexes only extensionless text and PDF attachment blobs with its managed config. Search
+  candidates are resolved through SQLite, including archived/quarantine/all scope tests;
+- migration v8 to v9 preserves existing provider, Gmail, lifecycle and audit state with a
+  clean foreign key check.
+
 ## 4. Deletion predicate tests
 
 Before any remote deletion adapter exists, the eligibility policy SHALL have combinatorial coverage.

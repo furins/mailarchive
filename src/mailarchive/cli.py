@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import NoReturn
 
+from mailarchive.attachments import AttachmentError, reconcile_attachments
 from mailarchive.classification import ClassificationResult, apply_classification
 from mailarchive.config import ConfigError, display_config, load_config
 from mailarchive.db import account_id, connect, initialize
@@ -22,6 +23,7 @@ from mailarchive.imap import ImapAdapter, ImapError
 from mailarchive.ingest import IngestError, ingest_file
 from mailarchive.notmuch import NotmuchAdapter, NotmuchError, search_canonical_messages
 from mailarchive.pop3 import Pop3Adapter, Pop3Error
+from mailarchive.recoll import RecollAdapter, RecollError, search_attachments
 
 
 def _emit(value: object, as_json: bool) -> None:
@@ -126,6 +128,36 @@ def build_parser() -> argparse.ArgumentParser:
     pop3_sync.add_argument("--account", required=True)
     pop3_sync.add_argument("--config", required=True)
     pop3_sync.add_argument("--json", action="store_true")
+    attachments = subcommands.add_parser(
+        "attachments", help="local-only attachment extraction and search"
+    )
+    attachment_subcommands = attachments.add_subparsers(dest="attachments_command", required=True)
+    extract = attachment_subcommands.add_parser(
+        "extract", help="reconcile finalized canonical messages"
+    )
+    extract.add_argument("--canonical-id")
+    extract.add_argument("--force", action="store_true")
+    extract.add_argument("--config", required=True)
+    extract.add_argument("--json", action="store_true")
+    attachment_index = attachment_subcommands.add_parser(
+        "index", help="managed derived Recoll index"
+    )
+    attachment_index_subcommands = attachment_index.add_subparsers(
+        dest="attachment_index_command", required=True
+    )
+    for action in ("refresh", "rebuild"):
+        command = attachment_index_subcommands.add_parser(action)
+        command.add_argument("--config", required=True)
+        command.add_argument("--json", action="store_true")
+    attachment_search = attachment_subcommands.add_parser(
+        "search", help="search attachment content locally"
+    )
+    attachment_search.add_argument("query")
+    attachment_search.add_argument(
+        "--scope", choices=("archived", "quarantine", "all"), default="archived"
+    )
+    attachment_search.add_argument("--config", required=True)
+    attachment_search.add_argument("--json", action="store_true")
     return parser
 
 
@@ -153,6 +185,8 @@ def main(argv: list[str] | None = None) -> int:
             lifecycle: dict[str, int] = {}
             quarantine_counts: dict[str, int] = {}
             classifier_failure_count = 0
+            attachment_blob_count = attachment_reference_count = 0
+            attachment_extraction_counts: dict[str, int] = {}
             if initialized:
                 with connect(config.database.path) as connection:
                     version_row = connection.execute(
@@ -192,6 +226,21 @@ def main(argv: list[str] | None = None) -> int:
                                 "WHERE event_type='classification.failed' AND result='fail-safe'"
                             ).fetchone()[0]
                         )
+                    if schema_version >= 9:
+                        attachment_blob_count = int(
+                            connection.execute("SELECT COUNT(*) FROM attachments").fetchone()[0]
+                        )
+                        attachment_reference_count = int(
+                            connection.execute(
+                                "SELECT COUNT(*) FROM message_attachments"
+                            ).fetchone()[0]
+                        )
+                        attachment_extraction_counts = {
+                            str(row[0]): int(row[1])
+                            for row in connection.execute(
+                                "SELECT status,COUNT(*) FROM attachment_extractions GROUP BY status"
+                            )
+                        }
             health = [record.__dict__ for record in fast_path_status(config)] if initialized else []
             gmail_status: list[dict[str, object]] = [
                 {
@@ -313,12 +362,32 @@ def main(argv: list[str] | None = None) -> int:
                     "lifecycle_counts": lifecycle if initialized else {},
                     "quarantine_counts": quarantine_counts if initialized else {},
                     "classifier_failure_event_count": classifier_failure_count,
+                    "attachment_blob_count": attachment_blob_count,
+                    "attachment_reference_count": attachment_reference_count,
+                    "attachment_extraction_counts": attachment_extraction_counts,
                     "remote_mutation_supported": False,
                     "fast_path": health,
                     "gmail": gmail_status,
                 },
                 args.json,
             )
+            return 0
+        if args.command == "attachments":
+            initialize(config.database.path, config.accounts)
+            if args.attachments_command == "extract":
+                extracted = reconcile_attachments(config, args.canonical_id, force=args.force)
+                _emit({"extracted_canonical_ids": extracted, "count": len(extracted)}, args.json)
+                return 0
+            if args.attachments_command == "index":
+                adapter = RecollAdapter(config)
+                if args.attachment_index_command == "refresh":
+                    adapter.refresh()
+                else:
+                    adapter.rebuild()
+                _emit({"indexed": True, "recoll_version": adapter.version()}, args.json)
+                return 0
+            results = search_attachments(config, args.query, scope=args.scope)
+            _emit([result.as_dict() for result in results], args.json)
             return 0
         if args.command == "quarantine":
             if not config.database.path.exists():
@@ -463,6 +532,8 @@ def main(argv: list[str] | None = None) -> int:
         GmailError,
         Pop3Error,
         NotmuchError,
+        AttachmentError,
+        RecollError,
         OSError,
         sqlite3.DatabaseError,
     ) as error:

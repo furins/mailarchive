@@ -403,6 +403,44 @@ def _migration_8(connection: sqlite3.Connection) -> None:
     connection.execute("CREATE INDEX canonical_messages_state ON canonical_messages(storage_state)")
 
 
+def _migration_9(connection: sqlite3.Connection) -> None:
+    """M8 local attachment inventory; MIME facts belong to each message part."""
+    connection.execute("""
+        CREATE TABLE attachments (
+            id TEXT PRIMARY KEY CHECK(length(id)=64),
+            sha256 TEXT NOT NULL UNIQUE CHECK(length(sha256)=64),
+            size_bytes INTEGER NOT NULL CHECK(size_bytes>=0),
+            content_path TEXT NOT NULL UNIQUE,
+            first_seen_at TEXT NOT NULL,
+            CHECK(id=sha256)
+        )""")
+    connection.execute("""
+        CREATE TABLE message_attachments (
+            canonical_message_id TEXT NOT NULL REFERENCES canonical_messages(id),
+            attachment_id TEXT NOT NULL REFERENCES attachments(id),
+            part_index INTEGER NOT NULL CHECK(part_index>=0),
+            filename_original TEXT,
+            content_disposition TEXT,
+            declared_mime_type TEXT,
+            PRIMARY KEY(canonical_message_id,part_index)
+        )""")
+    connection.execute("CREATE INDEX message_attachments_attachment ON message_attachments(attachment_id)")
+    connection.execute("""
+        CREATE TABLE attachment_extractions (
+            canonical_message_id TEXT PRIMARY KEY REFERENCES canonical_messages(id),
+            source_sha256 TEXT NOT NULL CHECK(length(source_sha256)=64),
+            status TEXT NOT NULL CHECK(status IN ('success','failed')),
+            attachment_count INTEGER NOT NULL CHECK(attachment_count>=0),
+            extracted_at TEXT,
+            last_error_kind TEXT CHECK(last_error_kind IS NULL OR last_error_kind IN
+                ('canonical-missing','canonical-sha-mismatch','canonical-io','mime-parse','attachment-decode',
+                 'attachment-storage','database')),
+            updated_at TEXT NOT NULL,
+            CHECK((status='success' AND extracted_at IS NOT NULL AND last_error_kind IS NULL)
+               OR (status='failed' AND extracted_at IS NULL AND last_error_kind IS NOT NULL))
+        )""")
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _migration_1),
     (2, _migration_2),
@@ -412,6 +450,7 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (6, _migration_6),
     (7, _migration_7),
     (8, _migration_8),
+    (9, _migration_9),
 )
 
 

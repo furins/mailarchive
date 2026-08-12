@@ -213,3 +213,30 @@ from SQLite before provider acquisition. This verifies the stored SHA and classi
 exact bytes; it neither re-downloads a known provider message nor mutates a provider. File moves
 install the destination without overwrite (hard-link where possible; fsynced temporary copy and
 link installation otherwise), then remove the source only after the durable destination exists.
+
+## ADR-019 — M8 attachment extraction and Recoll are local derived state
+
+Status: accepted.
+
+M8 reads immutable canonical RFC822 bytes with Python's byte-oriented MIME parser and never
+serializes or rewrites them. A non-multipart leaf is an attachment iff it has
+`Content-Disposition: attachment` or a filename parameter. Attachment identity is SHA-256 of
+the payload after Content-Transfer-Encoding decoding, without archive expansion, format
+conversion, or charset normalization. Blobs are globally deduplicated at
+`<archive.root>/attachments/sha256/<first-two-hex>/<sha256>`; untrusted original filenames are
+SQLite metadata only and never form a filesystem path.
+
+The v9 catalog separates global immutable content from per-message part facts (original filename,
+disposition, and declared MIME type). A successful `attachment_extractions` row also records a
+zero-attachment scan. Failed parses, integrity checks, storage, and database operations are
+message-local bounded errors; retries rederive safely and orphan immutable blobs are harmless.
+Relationships attach to canonical ID, so M7 HAM/quarantine transitions do not re-extract content.
+
+Recoll is a single managed, rebuildable derived index under `state/recoll/config` and
+`state/recoll/db`, with the content-addressed attachment store as its only topdir. Local Recoll
+1.43.0 and CI's Ubuntu 24.04 Recoll 1.36.1 characterize extensionless text and PDF blobs through
+the direct store, so no alias view is needed. Recoll returns candidates only: SQLite maps each SHA
+to relationships and applies archived/quarantine/all lifecycle scope at query time. Bounded audit
+events include refresh, rebuild, and `recoll.search.failed`; commands use argv lists, explicit
+`-c` configuration and bounded timeouts. M8 does not call providers, alter fast-path acquisition,
+mutate remote mail, or implement deletion.
