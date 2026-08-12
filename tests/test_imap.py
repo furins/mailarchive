@@ -15,6 +15,7 @@ from mailarchive.imap import (
     managed_config_text,
     managed_layout,
     parse_mbsync_state,
+    sanitize_mbsync_diagnostic,
     validate_managed_config,
     write_managed_config,
 )
@@ -44,7 +45,7 @@ def test_managed_config_is_deterministic_and_pull_only(config_file: Path) -> Non
     assert layout.mirror_mailbox.is_relative_to(config.archive.root / "staging" / "mbsync")
     assert not layout.mirror_mailbox.is_relative_to(config.archive.root / "mail")
     for directive in (
-        "Sync Pull New", "Create Near", "Remove None", "Expunge None", "ExpungeSolo None",
+        "Sync Pull New", "Create Near", "Remove None", "Expunge None",
         "MaxSize 0", "FSync yes", "SyncState *", "CopyArrivalDate yes", "AltMap no",
     ):
         assert directive in text
@@ -53,7 +54,10 @@ def test_managed_config_is_deterministic_and_pull_only(config_file: Path) -> Non
     assert oct(layout.config_path.stat().st_mode & 0o777) == "0o600"
 
 
-@pytest.mark.parametrize("unsafe", ["Push", "Gone", "Flags", "Full", "Trash", "MaxMessages"])
+@pytest.mark.parametrize(
+    "unsafe",
+    ["Sync Push", "Sync Gone", "Sync Flags", "Sync Full", "Trash anything", "MaxMessages 10"],
+)
 def test_semantic_validator_rejects_far_side_or_unsafe_behavior(unsafe: str) -> None:
     safe = "\n".join(imap_module.REQUIRED_DIRECTIVES)
     with pytest.raises(ImapError, match="unsafe"):
@@ -68,6 +72,20 @@ def test_semantic_validator_rejects_all_accounts_command(config_file: Path) -> N
         validate_managed_config(text, ["mbsync", "-a"])
 
 
+@pytest.mark.parametrize("folder", ["INBOX", "Sent Items", "Archive/2025", "Trash"])
+def test_remote_folder_is_quoted_not_a_filesystem_identifier(
+    config_file: Path, folder: str
+) -> None:
+    _configure_imap(config_file, folders=[folder])
+    config = load_config(config_file)
+    text = managed_config_text(config, config.accounts[0], folder)
+    layout = managed_layout(config, config.accounts[0], folder)
+    assert f'Far ":far-store-test-9f86d081884c:{folder}"' in text
+    assert layout.mirror_mailbox.name.startswith("folder-")
+    assert len(layout.mirror_mailbox.name.rsplit("-", 1)[1]) == 12
+    validate_managed_config(text)
+
+
 def test_missing_credential_and_binary_fail_without_exposing_secret(
     config_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -80,6 +98,24 @@ def test_missing_credential_and_binary_fail_without_exposing_secret(
     with pytest.raises(ImapError, match="isync") as error:
         ImapMbsyncAdapter(config, executable="mbsync-not-present").sync("test", "INBOX")
     assert "actual-secret-value" not in str(error.value)
+
+
+def test_mbsync_stderr_redacts_configured_credentials(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_imap(config_file)
+    config = load_config(config_file)
+    monkeypatch.setenv("MAILARCHIVE_TEST_SECRET", "do-not-print-this")
+    text = sanitize_mbsync_diagnostic("authentication failed: do-not-print-this", config)
+    assert text == "authentication failed: <redacted>"
+
+    def failed(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 1, "", "error do-not-print-this")
+
+    monkeypatch.setattr(imap_module.subprocess, "run", failed)
+    with pytest.raises(ImapError, match="<redacted>") as error:
+        ImapMbsyncAdapter(config).sync("test", "INBOX")
+    assert "do-not-print-this" not in str(error.value)
 
 
 def test_plaintext_non_loopback_is_rejected(config_file: Path) -> None:
@@ -162,7 +198,6 @@ def test_state_parser_accepts_state_produced_by_installed_mbsync(tmp_path: Path)
                 "Create Near",
                 "Remove None",
                 "Expunge None",
-                "ExpungeSolo None",
                 "MaxSize 0",
                 "CopyArrivalDate yes",
                 "SyncState *",

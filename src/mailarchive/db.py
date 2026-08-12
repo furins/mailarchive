@@ -165,11 +165,11 @@ def _migration_4(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
         CREATE TABLE remote_canonical_links (
-            remote_message_id TEXT NOT NULL REFERENCES remote_messages(id),
+            remote_message_id TEXT PRIMARY KEY REFERENCES remote_messages(id),
             canonical_message_id TEXT NOT NULL REFERENCES canonical_messages(id),
             link_reason TEXT NOT NULL,
             created_at TEXT NOT NULL,
-            PRIMARY KEY(remote_message_id, canonical_message_id)
+            UNIQUE(remote_message_id, canonical_message_id)
         )
         """
     )

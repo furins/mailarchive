@@ -14,7 +14,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: sudo apt-get update && sudo apt-get install --yes isync notmuch
+      - run: sudo apt-get update && sudo apt-get install --yes dovecot-imapd isync notmuch
       - run: mbsync --version
       - run: uv sync --all-groups --locked
       - run: uv run pytest

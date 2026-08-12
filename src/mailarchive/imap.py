@@ -20,13 +20,14 @@ from mailarchive.ingest import IngestResult, ingest_file
 from mailarchive.models import AccountConfig, AppConfig, CanonicalMessage
 
 _ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]*\Z")
-_UID = re.compile(r"(?:^|,)U=(\d+)(?:,|$)")
+_UID = re.compile(r"(?:^|,)U=(\d+)(?=[:,]|$)")
 _STATE_PAIR = re.compile(r"^(\d+)\s+(\d+)(?:\s+\d+){0,2}\s*$")
 _SAFE = re.compile(r"[^A-Za-z0-9]+")
 REQUIRED_DIRECTIVES: Final = (
-    "Sync Pull New", "Create Near", "Remove None", "Expunge None", "ExpungeSolo None",
+    "Sync Pull New", "Create Near", "Remove None", "Expunge None",
     "MaxSize 0", "FSync yes", "SyncState *", "CopyArrivalDate yes", "AltMap no",
 )
+_DIAGNOSTIC_LIMIT: Final = 2_000
 
 
 class ImapError(RuntimeError):
@@ -63,6 +64,28 @@ def _credential_variable(reference: str) -> str:
     return reference[4:]
 
 
+def _configured_secret_values(config: AppConfig) -> tuple[str, ...]:
+    """Return present configured environment secrets for error redaction only."""
+    values: list[str] = []
+    for account in config.accounts:
+        if account.config_ref.startswith("env:") and _ENV_NAME.fullmatch(account.config_ref[4:]):
+            value = os.environ.get(account.config_ref[4:])
+            if value:
+                values.append(value)
+    return tuple(values)
+
+
+def sanitize_mbsync_diagnostic(stderr: str, config: AppConfig) -> str:
+    """Bound mbsync diagnostics while ensuring configured credentials cannot escape."""
+    sanitized = stderr
+    for secret in _configured_secret_values(config):
+        sanitized = sanitized.replace(secret, "<redacted>")
+    sanitized = sanitized.strip()
+    if len(sanitized) > _DIAGNOSTIC_LIMIT:
+        sanitized = sanitized[:_DIAGNOSTIC_LIMIT] + "… [truncated]"
+    return sanitized or "no diagnostic output"
+
+
 def managed_layout(config: AppConfig, account: AccountConfig, folder: str) -> ImapLayout:
     archive_root = config.archive.root.resolve()
     safe_folder = _identifier(folder, "folder")
@@ -72,7 +95,9 @@ def managed_layout(config: AppConfig, account: AccountConfig, folder: str) -> Im
         raise ImapError("mbsync mirror must be outside canonical Maildir")
     return ImapLayout(
         mirror_mailbox=mirror_mailbox,
-        config_path=archive_root / "state" / "mbsync" / account.name / "mbsyncrc",
+        config_path=(
+            archive_root / "state" / "mbsync" / account.name / f"{_identifier(folder, 'folder')}.mbsyncrc"
+        ),
         channel=_identifier(f"{account.name}:{folder}", "mailarchive"),
     )
 
@@ -84,37 +109,50 @@ def managed_config_text(config: AppConfig, account: AccountConfig, folder: str) 
     layout = managed_layout(config, account, folder)
     imap = account.imap
     tls = {"IMAPS": "IMAPS", "STARTTLS": "STARTTLS", "INSECURE_LOOPBACK": "None"}[imap.tls_mode]
+    far_store = _identifier(account.name, "far-store")
+    near_store = _identifier(account.name + ":" + folder, "near-store")
     # The only shell fragment is fixed and contains the validated variable name, never its value.
     pass_command = f'printf %s "${{{variable}}}"'
     return "\n".join((
         "# Managed by MailArchive; pull-only and never use with mbsync -a.",
-        "FSync yes", "",
+        "FSync yes", "InfoDelimiter :", "",
         f"IMAPAccount {_identifier(account.name, 'far-account')}",
         f"Host {_q(imap.host)}", f"Port {imap.port}", f"User {_q(imap.username)}",
         f"PassCmd {_q(pass_command)}", f"TLSType {tls}",
         f"Timeout {imap.connection_timeout_seconds}", "",
-        f"IMAPStore {_identifier(account.name, 'far-store')}",
-        f"Account {_identifier(account.name, 'far-account')}", "",
-        f"MaildirStore {_identifier(account.name + ':' + folder, 'near-store')}",
+        f"IMAPStore {far_store}", f"Account {_identifier(account.name, 'far-account')}", "",
+        f"MaildirStore {near_store}",
         f"Path {_q(str(layout.mirror_mailbox) + '/')}",
         f"Inbox {_q(str(layout.mirror_mailbox / 'INBOX'))}", "AltMap no", "",
         f"Channel {layout.channel}",
-        f"Far :{_identifier(account.name, 'far-store')}:{folder}",
-        f"Near :{_identifier(account.name + ':' + folder, 'near-store')}:INBOX",
-        "Sync Pull New", "Create Near", "Remove None", "Expunge None", "ExpungeSolo None",
+        f"Far {_q(':' + far_store + ':' + folder)}",
+        f"Near {_q(':' + near_store + ':INBOX')}",
+        "Sync Pull New", "Create Near", "Remove None", "Expunge None",
         "MaxSize 0", "CopyArrivalDate yes", "SyncState *", "",
     ))
 
 
 def validate_managed_config(text: str, command: list[str] | None = None) -> None:
     """Reject any generated config/command that could mutate the IMAP (far) side."""
-    if any(directive not in text for directive in REQUIRED_DIRECTIVES):
+    directives: list[tuple[str, str]] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, _, value = line.partition(" ")
+        directives.append((name, value.strip()))
+    if any((directive.split(" ", 1)[0], directive.split(" ", 1)[1]) not in directives for directive in REQUIRED_DIRECTIVES):
         raise ImapError("managed mbsync configuration lacks required pull-only directives")
-    forbidden = ("Push", "Gone", "Flags", "Full", "Create Far", "Create Both", "Remove Far",
-                 "Remove Both", "Expunge Far", "Expunge Both", "ExpungeSolo Far",
-                 "ExpungeSolo Both", "Trash", "TrashRemoteNew", "MaxMessages", "Patterns")
-    if any(item in text for item in forbidden):
-        raise ImapError("managed mbsync configuration permits an unsafe operation")
+    forbidden = {
+        "Sync": {"Push", "Gone", "Flags", "Full"}, "Create": {"Far", "Both"},
+        "Remove": {"Far", "Both"}, "Expunge": {"Far", "Both"},
+        "ExpungeSolo": {"Far", "Both"}, "Trash": None, "TrashRemoteNew": None,
+        "MaxMessages": None, "Patterns": None,
+    }
+    for name, value in directives:
+        prohibited_values = forbidden.get(name)
+        if name in forbidden and (prohibited_values is None or value in prohibited_values):
+            raise ImapError("managed mbsync configuration permits an unsafe operation")
     if command is not None and ("-a" in command or "--all" in command or len(command) != 4 or command[1] != "-c"):
         raise ImapError("mbsync must receive exactly one managed explicit channel")
 
@@ -145,7 +183,8 @@ def write_managed_config(config: AppConfig, account: AccountConfig, folder: str)
 
 def parse_mbsync_state(path: Path) -> StateMapping:
     """Parse the conservative M3 subset of native .mbsyncstate after a successful run."""
-    if path.name != ".mbsyncstate" or not path.is_file() or path.with_suffix(".new").exists():
+    companions = [path.parent / f"{path.name}{suffix}" for suffix in (".new", ".journal", ".lock")]
+    if path.name != ".mbsyncstate" or not path.is_file() or any(item.exists() for item in companions):
         raise ImapError("authoritative completed .mbsyncstate is unavailable")
     far_uidvalidity: int | None = None
     mappings: dict[int, int] = {}
@@ -202,8 +241,14 @@ def _audit(config: AppConfig, account_name: str, event: str, result: str, detail
         connection.commit()
 
 
-def _register_link(config: AppConfig, account_name: str, folder: str, uidvalidity: int, uid: int,
-                   canonical: CanonicalMessage) -> None:
+def _register_link(
+    config: AppConfig,
+    account_name: str,
+    folder: str,
+    uidvalidity: int,
+    uid: int,
+    canonical: CanonicalMessage,
+) -> bool:
     with connect(config.database.path) as connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
@@ -218,13 +263,34 @@ def _register_link(config: AppConfig, account_name: str, folder: str, uidvalidit
                 ON CONFLICT(account_id, remote_folder, uidvalidity, remote_uid) DO UPDATE SET last_seen_at=excluded.last_seen_at, remote_present=1""",
                 (remote_id, aid, folder, uidvalidity, uid, canonical.message_id_header, now, now))
             row = connection.execute("SELECT id FROM remote_messages WHERE account_id=? AND remote_folder=? AND uidvalidity=? AND remote_uid=?", (aid, folder, uidvalidity, uid)).fetchone()
-            connection.execute("INSERT OR IGNORE INTO remote_canonical_links(remote_message_id, canonical_message_id, link_reason, created_at) VALUES (?, ?, 'mbsync-state-uid-map', ?)", (str(row[0]), canonical.id, now))
+            existing_link = connection.execute(
+                "SELECT canonical_message_id FROM remote_canonical_links WHERE remote_message_id = ?",
+                (str(row[0]),),
+            ).fetchone()
+            if existing_link is not None and str(existing_link[0]) != canonical.id:
+                insert_audit_event(
+                    connection,
+                    actor="mailarchive.imap",
+                    event_type="imap.remote_link.failed",
+                    result="conflict",
+                    account_id=aid,
+                    canonical_message_id=canonical.id,
+                    details_json=json.dumps({"folder": folder, "uidvalidity": uidvalidity, "uid": uid}),
+                )
+                connection.commit()
+                return False
+            connection.execute(
+                "INSERT OR IGNORE INTO remote_canonical_links(remote_message_id, canonical_message_id, "
+                "link_reason, created_at) VALUES (?, ?, 'mbsync-state-uid-map', ?)",
+                (str(row[0]), canonical.id, now),
+            )
             insert_audit_event(connection, actor="mailarchive.imap", event_type="imap.remote_link.created", result="success", account_id=aid, canonical_message_id=canonical.id, details_json=json.dumps({"folder": folder, "uidvalidity": uidvalidity, "uid": uid}))
         except BaseException:
             connection.rollback()
             raise
         else:
             connection.commit()
+            return True
 
 
 class ImapMbsyncAdapter:
@@ -261,7 +327,10 @@ class ImapMbsyncAdapter:
                 raise ImapError(f"mbsync synchronization timed out after {account.imap.sync_timeout_seconds} seconds") from error
             if completed.returncode != 0:
                 _audit(self.config, account_name, "imap.sync.failed", "failed", {"folder": folder, "exit_code": completed.returncode})
-                raise ImapError(f"mbsync synchronization failed (exit {completed.returncode}); inspect local mbsync diagnostics")
+                diagnostic = sanitize_mbsync_diagnostic(completed.stderr, self.config)
+                raise ImapError(
+                    f"mbsync synchronization failed (exit {completed.returncode}): {diagnostic}"
+                )
             results: list[IngestResult] = []
             try:
                 state = parse_mbsync_state(layout.mirror_mailbox / "INBOX" / ".mbsyncstate")
