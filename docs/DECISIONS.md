@@ -191,6 +191,12 @@ notmuch indexes `archive.root`, ignoring staging and state roots. Quarantine rec
 derived tags and is excluded from ordinary searches through `exclude_tags=quarantine`; tags can be
 reapplied solely from SQLite after rebuilding the index.
 
+notmuch groups files by RFC Message-ID and its tags are therefore group-level hints only. Multiple
+canonical byte objects can share one notmuch logical message. SQLite remains authoritative for each
+canonical object's lifecycle, classification, path, retention, and visibility. MailArchive search
+uses notmuch with exclusions disabled only to generate candidate filenames, then filters those rows
+by SQLite scope (`archived`, `quarantine`, or `all`); no safety decision relies on a notmuch tag.
+
 Pending state is locally recoverable: every provider sync reconciles account-scoped pending rows
 from SQLite before provider acquisition. This verifies the stored SHA and classifies only the local
 exact bytes; it neither re-downloads a known provider message nor mutates a provider. File moves

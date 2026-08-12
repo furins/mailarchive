@@ -41,6 +41,23 @@ def test_db_init_and_status(config_file: Path, capsys: pytest.CaptureFixture[str
     assert '"database_initialized": true' in capsys.readouterr().out
 
 
+def test_search_scope_is_forwarded_without_lifecycle_query_parsing(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, object] = {}
+
+    def search(config: object, query: str, *, scope: str) -> list[object]:
+        seen.update(query=query, scope=scope)
+        return []
+
+    monkeypatch.setattr(cli_module, "search_canonical_messages", search)
+    assert (
+        main(["search", "tag:quarantine", "--scope", "quarantine", "--config", str(config_file)])
+        == 0
+    )
+    assert seen == {"query": "tag:quarantine", "scope": "quarantine"}
+
+
 def test_gmail_status_uninitialized_is_local_and_not_started(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

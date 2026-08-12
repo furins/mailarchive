@@ -67,6 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     refresh.add_argument("--json", action="store_true", help="emit JSON")
     search = subcommands.add_parser("search", help="search the local notmuch index")
     search.add_argument("query", help="notmuch query")
+    search.add_argument("--scope", choices=("archived", "quarantine", "all"), default="archived")
     search.add_argument("--config", required=True, help="path to YAML configuration")
     search.add_argument("--json", action="store_true", help="emit JSON")
     quarantine = subcommands.add_parser("quarantine", help="local-only quarantine operations")
@@ -364,7 +365,7 @@ def main(argv: list[str] | None = None) -> int:
             _emit({"refreshed": True, "notmuch_version": adapter.version()}, args.json)
             return 0
         if args.command == "search":
-            results = search_canonical_messages(config, args.query)
+            results = search_canonical_messages(config, args.query, scope=args.scope)
             _emit([result.as_dict() for result in results], args.json)
             return 0
         if args.command == "imap":

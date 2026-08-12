@@ -12,13 +12,14 @@ import yaml
 import mailarchive.notmuch as notmuch_module
 from mailarchive.config import load_config
 from mailarchive.db import connect
-from mailarchive.ingest import ingest_file, verify_canonical_message
+from mailarchive.ingest import ingest_bytes, ingest_file, verify_canonical_message
 from mailarchive.models import AppConfig
 from mailarchive.notmuch import (
     COMMAND_TIMEOUT_SECONDS,
     REFRESH_TIMEOUT_SECONDS,
     NotmuchAdapter,
     NotmuchError,
+    SearchScope,
     isolated_notmuch_environment,
     managed_config_text,
     managed_layout,
@@ -53,8 +54,10 @@ def _add_account(config_file: Path, name: str) -> None:
     config_file.write_text(yaml.safe_dump(values), encoding="utf-8")
 
 
-def _result_ids(config: AppConfig, query: str) -> list[str]:
-    return [item.canonical_message.id for item in search_canonical_messages(config, query)]
+def _result_ids(config: AppConfig, query: str, *, scope: SearchScope = "archived") -> list[str]:
+    return [
+        item.canonical_message.id for item in search_canonical_messages(config, query, scope=scope)
+    ]
 
 
 def test_managed_configuration_is_deterministic_and_separate(config_file: Path) -> None:
@@ -65,7 +68,7 @@ def test_managed_configuration_is_deterministic_and_separate(config_file: Path) 
     assert layout.database_path == config.archive.root.resolve() / "state" / "notmuch" / "db"
     assert layout.database_path.is_relative_to(layout.mail_root)
     assert "ignore=staging;state;attachments;metadata;logs" in contents
-    assert "exclude_tags=quarantine" in contents
+    assert "exclude_tags=quarantine" not in contents
     assert f"mail_root={layout.mail_root}" in contents
     assert f"path={layout.database_path}" in contents
     assert f"hook_dir={layout.hook_directory}" in contents
@@ -333,3 +336,48 @@ def test_duplicate_message_ids_and_accounts_remain_canonical(
     assert shared_other.canonical_message.local_path.read_bytes() == shared_bytes
     with connect(config.database.path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM canonical_messages").fetchone()[0] == 4
+
+
+@pytest.mark.skipif(shutil.which("notmuch") is None, reason="requires locally installed notmuch")
+def test_collision_lifecycle_visibility_is_filtered_by_sqlite(
+    config_file: Path, tmp_path: Path
+) -> None:
+    """A shared Message-ID has aggregate tags but independent canonical visibility."""
+    config = load_config(config_file)
+    ham = tmp_path / "ham.eml"
+    spam = tmp_path / "spam.eml"
+    _write_message(
+        ham,
+        message_id="<collision@example.test>",
+        subject="collision",
+        body="ham-token",
+        sender="c@example.test",
+    )
+    _write_message(
+        spam,
+        message_id="<collision@example.test>",
+        subject="collision",
+        body="spam-token",
+        sender="c@example.test",
+    )
+    first = ingest_file(config, ham, "test").canonical_message
+    from mailarchive.classification import ClassificationResult, apply_classification
+
+    second_pending = ingest_bytes(config, spam.read_bytes(), "test").canonical_message
+    second = apply_classification(
+        config, second_pending, ClassificationResult("spam", 9, "test-spam")
+    )
+    assert first.id != second.id and first.sha256 != second.sha256
+    adapter = NotmuchAdapter(config)
+    adapter.refresh()
+    assert _result_ids(config, "collision") == [first.id]
+    assert _result_ids(config, "collision", scope="quarantine") == [second.id]
+    assert set(_result_ids(config, "collision", scope="all")) == {first.id, second.id}
+    tags = adapter._run(  # pyright: ignore[reportPrivateUsage]
+        ["search", "--exclude=false", "--output=tags", "--", "id:collision@example.test"]
+    )
+    assert {"ham", "quarantine", "spam"}.issubset(set(tags.stdout.split()))
+    shutil.rmtree(managed_layout(config).database_path)
+    adapter.refresh()
+    assert _result_ids(config, "collision") == [first.id]
+    assert _result_ids(config, "collision", scope="quarantine") == [second.id]
