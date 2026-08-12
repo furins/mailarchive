@@ -85,6 +85,17 @@ class _Pop3Wire:
             raise Pop3Error("POP3 server rejected a read-only command")
         return line[3:].lstrip()
 
+    def _read_wire_line(self) -> bytes:
+        """Read one complete POP3 wire line, retaining its CRLF exactly."""
+        assert self.sock is not None
+        while b"\r\n" not in self.buffer:
+            data = self.sock.recv(65536)
+            if not data:
+                raise Pop3Error("POP3 server closed the connection unexpectedly")
+            self.buffer += data
+        line, self.buffer = self.buffer.split(b"\r\n", 1)
+        return line + b"\r\n"
+
     def command(self, command: str) -> bytes:
         if command.split(" ", 1)[0].upper() == "DELE":
             raise AssertionError("POP3 DELE is forbidden")
@@ -97,10 +108,14 @@ class _Pop3Wire:
 
     def multiline(self, command: str) -> bytes:
         self.command(command)
-        # Controlled test and production POP3 both use CRLF-dot-CRLF framing.
-        # Remove framing only; source bytes (including no final newline) remain intact.
-        raw = self._read_until(b"\r\n.\r\n")
-        return raw.replace(b"\r\n..", b"\r\n.")
+        result = bytearray()
+        while True:
+            line = self._read_wire_line()
+            if line == b".\r\n":
+                return bytes(result)
+            if line.startswith(b".."):
+                line = line[1:]
+            result.extend(line)
 
     def uidls(self) -> dict[int, str]:
         data = self.multiline("UIDL")
@@ -112,7 +127,12 @@ class _Pop3Wire:
             if len(fields) != 2 or not fields[0].isdigit() or int(fields[0]) <= 0:
                 raise Pop3Error("POP3 UIDL response is malformed")
             uidl = fields[1].decode("ascii", "strict")
-            if not uidl or any(c.isspace() for c in uidl) or int(fields[0]) in result:
+            if (
+                not uidl
+                or any(c.isspace() for c in uidl)
+                or int(fields[0]) in result
+                or uidl in result.values()
+            ):
                 raise Pop3Error("POP3 UIDL response is ambiguous")
             result[int(fields[0])] = uidl
         if not result and data:
@@ -123,6 +143,10 @@ class _Pop3Wire:
         if number <= 0:
             raise Pop3Error("invalid POP3 message number")
         return self.multiline(f"RETR {number}")
+
+
+# Public only for protocol-level acceptance tests; the adapter remains the runtime API.
+Pop3Wire = _Pop3Wire
 
 
 def _audit(
@@ -224,6 +248,8 @@ class Pop3Adapter:
             client.command(f"USER {account.pop3.username}")
             client.command(f"PASS {password}")
             uidls = client.uidls()
+            if len(set(uidls.values())) != len(uidls):
+                raise Pop3Error("POP3 UIDL response is ambiguous")
             with connect(self.config.database.path) as db:
                 aid = account_id(db, account_name)
                 if aid is None:

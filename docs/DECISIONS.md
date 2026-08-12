@@ -161,3 +161,9 @@ intentional roadmap deviation: canonical RFC822 byte immutability takes priority
 getmail6 preference. SQLite is authoritative for POP3 provider identity; any getmail oldmail file
 would be subordinate, rebuildable state only. getmail6 is not a runtime dependency and never writes
 MailArchive canonical storage.
+
+The canonical POP3 byte representation is the exact unstuffed data exposed by POP3 `RETR`: every
+CRLF-terminated wire data line is retained, exactly one stuffing dot is removed from dot-leading
+lines, and the `.` terminator line is excluded. POP3 cannot expose an unknowable pre-protocol local
+file representation without a final line delimiter. The adapter never treats such a representation
+as canonical. Duplicate UIDLs in one listing fail closed before any RETR or local state change.

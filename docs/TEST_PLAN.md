@@ -149,6 +149,10 @@ burst coalescing, polling, reconnection, watcher locking, stale local health and
   absent, and proves the source mailbox remains unchanged. Reproduce with
   `uv run pytest tests/test_getmail6_acceptance.py -v`; the test cleanly skips if getmail is absent.
 
+- direct POP3 tests decode fragmented multiline wire data line by line, including a first dot-leading
+  line, internal single/double-dot lines, final CRLF, folded/multipart/base64 data, and terminator
+  exclusion. Duplicate UIDLs fail before RETR, canonical ingest, provider identity, or link creation.
+
 ## 7. Integrity tests
 
 - modified local `.eml` produces hash mismatch;

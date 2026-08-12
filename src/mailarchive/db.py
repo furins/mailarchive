@@ -336,10 +336,24 @@ def _migration_7(connection: sqlite3.Connection) -> None:
             UNIQUE(remote_message_id, canonical_message_id))"""
     )
     connection.execute("INSERT INTO remote_canonical_links_v7 SELECT * FROM remote_canonical_links")
+    connection.execute(
+        """CREATE TABLE gmail_message_labels_v7 (
+            remote_message_id TEXT NOT NULL,
+            account_id INTEGER NOT NULL,
+            label_id TEXT NOT NULL,
+            PRIMARY KEY(remote_message_id, label_id),
+            FOREIGN KEY(remote_message_id, account_id)
+                REFERENCES remote_messages_v7(id, account_id),
+            FOREIGN KEY(account_id, label_id) REFERENCES gmail_labels(account_id, label_id)
+        )"""
+    )
+    connection.execute("INSERT INTO gmail_message_labels_v7 SELECT * FROM gmail_message_labels")
+    connection.execute("DROP TABLE gmail_message_labels")
     connection.execute("DROP TABLE remote_canonical_links")
     connection.execute("DROP TABLE remote_messages")
     connection.execute("ALTER TABLE remote_messages_v7 RENAME TO remote_messages")
     connection.execute("ALTER TABLE remote_canonical_links_v7 RENAME TO remote_canonical_links")
+    connection.execute("ALTER TABLE gmail_message_labels_v7 RENAME TO gmail_message_labels")
     connection.execute("""CREATE UNIQUE INDEX remote_messages_imap_identity
         ON remote_messages(account_id, remote_folder, uidvalidity, remote_uid)
         WHERE provider_kind='imap'""")

@@ -8,7 +8,7 @@ import pytest
 
 from mailarchive.config import load_config
 from mailarchive.db import connect
-from mailarchive.pop3 import Pop3Adapter, Pop3Error, register_pop3_link
+from mailarchive.pop3 import Pop3Adapter, Pop3Error, Pop3Wire, register_pop3_link
 
 
 def _config(tmp_path: Path) -> Path:
@@ -70,14 +70,68 @@ class FakeWire:
         return self.messages[number][1]
 
 
+def _pop3_wire_data(logical_retr_bytes: bytes) -> bytes:
+    """Encode logical RETR bytes into multiline POP3 wire data plus terminator."""
+    assert logical_retr_bytes.endswith(b"\r\n")
+    lines = logical_retr_bytes[:-2].split(b"\r\n")
+    return (
+        b"".join((b"." + line if line.startswith(b".") else line) + b"\r\n" for line in lines)
+        + b".\r\n"
+    )
+
+
+class FragmentedSocket:
+    def __init__(self, fragments: list[bytes]) -> None:
+        self.fragments = fragments
+        self.sent: list[bytes] = []
+
+    def recv(self, _size: int) -> bytes:
+        return self.fragments.pop(0) if self.fragments else b""
+
+    def sendall(self, data: bytes) -> None:
+        self.sent.append(data)
+
+
+@pytest.mark.parametrize(
+    ("logical", "fragments"),
+    [
+        (b".first\r\n", [b"+OK\r", b"\n..", b"first\r", b"\n.\r", b"\n"]),
+        (
+            b"one\r\n.second\r\n..third\r\n",
+            [b"+OK\r\n", b"one\r\n..second\r", b"\n...third\r\n.\r\n"],
+        ),
+        (b"body\r\n", [b"+OK\r\nbody\r\n.\r\n"]),
+        (
+            b"Subject: folded\r\n value\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n"
+            b"--x\r\nContent-Transfer-Encoding: base64\r\n\r\nAAEC/4A=\r\n--x--\r\n",
+            [
+                b"+OK\r\nSubject: folded\r\n value\r\n"
+                b"Content-Type: multipart/mixed; boundary=x\r\n",
+                b"\r\n--x\r\nContent-Transfer-Encoding: base64\r\n\r\nAAEC/4A=\r\n--x--\r\n.\r\n",
+            ],
+        ),
+    ],
+    ids=["first-dot-fragmented", "internal-dots", "final-crlf", "mime-base64"],
+)
+def test_pop3_multiline_decodes_exact_logical_retr_bytes(
+    tmp_path: Path, logical: bytes, fragments: list[bytes]
+) -> None:
+    config = load_config(_config(tmp_path))
+    socket = FragmentedSocket(fragments)
+    wire = Pop3Wire(config.accounts[0].pop3)  # type: ignore[arg-type]
+    wire.sock = socket  # type: ignore[assignment]
+    assert wire.multiline("RETR 1") == logical
+    assert socket.sent == [b"RETR 1\r\n"]
+
+
 def test_direct_loopback_pop3_preserves_raw_octets_and_issues_no_dele(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A disposable server exercises real POP3 commands, not a mocked adapter."""
     messages = {
-        1: ("U1", b"Subject: folded\r\n value\r\n\r\n--x\r\nAAEC\r\n--x--"),
-        2: ("U2", b"Message-ID: <duplicate>\r\n\r\nmalformed\x00bytes"),
-        3: ("U3", b"Message-ID: <duplicate>\r\n\r\nno-final-newline"),
+        1: ("U1", b"Subject: folded\r\n value\r\n\r\n.first\r\n"),
+        2: ("U2", b"Message-ID: <duplicate>\r\n\r\nmalformed\x00bytes\r\n"),
+        3: ("U3", b"Message-ID: <duplicate>\r\n\r\n--x\r\nAAEC/4A=\r\n--x--\r\n"),
     }
     commands: list[str] = []
 
@@ -93,7 +147,7 @@ def test_direct_loopback_pop3_preserves_raw_octets_and_issues_no_dele(
                     self.wfile.write(b".\r\n")
                 elif line.startswith("RETR "):
                     number = int(line.split()[1])
-                    self.wfile.write(b"+OK\r\n" + messages[number][1] + b"\r\n.\r\n")
+                    self.wfile.write(b"+OK\r\n" + _pop3_wire_data(messages[number][1]))
                 else:
                     self.wfile.write(b"+OK\r\n")
                 if line.startswith("QUIT"):
@@ -164,6 +218,25 @@ def test_pop3_uidl_cannot_remap_to_another_canonical(
     other = ingest_bytes(config, b"Message-ID: <same>\r\n\r\nchanged", "pop", source_kind="test")
     with pytest.raises(Pop3Error, match="conflicts"):
         register_pop3_link(config, "pop", "U1", other.canonical_message)
+
+
+def test_duplicate_uidls_fail_closed_before_retrieval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(_config(tmp_path))
+    FakeWire.messages = {
+        1: ("UID-X", b"Message-ID: <a>\r\n\r\nfirst\r\n"),
+        2: ("UID-X", b"Message-ID: <b>\r\n\r\nsecond\r\n"),
+    }
+    monkeypatch.setenv("POP_TEST_PASSWORD", "safe")
+    monkeypatch.setattr("mailarchive.pop3._Pop3Wire", FakeWire)
+    with pytest.raises(Pop3Error, match="ambiguous"):
+        Pop3Adapter(config).sync("pop")
+    assert "RETR" not in FakeWire.commands
+    with connect(config.database.path) as db:
+        assert db.execute("SELECT COUNT(*) FROM canonical_messages").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM remote_messages").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM remote_canonical_links").fetchone()[0] == 0
 
 
 def test_pop3_password_is_not_in_error_or_audit(

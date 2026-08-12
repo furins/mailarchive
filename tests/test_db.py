@@ -126,6 +126,55 @@ def test_real_v5_to_v6_preserves_imap_identity_links_and_health(
             )
 
 
+def test_v7_rebuild_preserves_gmail_label_foreign_key_graph(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repository-integrity regression: v7 rebuilds every table referencing identities."""
+    config = load_config(config_file)
+    original = database.MIGRATIONS
+    monkeypatch.setattr(database, "MIGRATIONS", original[:6])
+    initialize(config.database.path, config.accounts)
+    now = utc_now()
+    with connect(config.database.path) as db:
+        aid = int(db.execute("SELECT id FROM accounts WHERE name='test'").fetchone()[0])
+        db.execute(
+            "INSERT INTO canonical_messages VALUES (?, ?, ?, ?, 1, NULL, NULL, ?, ?, 'verified', ?, ?)",
+            ("gmail-canonical", aid, "g" * 64, "/tmp/gmail.eml", now, now, now, now),
+        )
+        db.execute(
+            """INSERT INTO remote_messages VALUES
+               ('gmail-remote', ?, 'gmail', NULL, NULL, NULL, 'G1', 'T1', NULL, ?, ?, 1, 'proven')""",
+            (aid, now, now),
+        )
+        db.execute(
+            "INSERT INTO remote_canonical_links VALUES ('gmail-remote', 'gmail-canonical', 'gmail-api-raw', ?)",
+            (now,),
+        )
+        db.execute(
+            "INSERT INTO gmail_labels VALUES (?, 'Label_1', 'Project', 'user', 1, ?, ?)",
+            (aid, now, now),
+        )
+        db.execute("INSERT INTO gmail_message_labels VALUES ('gmail-remote', ?, 'Label_1')", (aid,))
+        db.execute("INSERT INTO gmail_sync_state(account_id,updated_at) VALUES (?,?)", (aid, now))
+        db.commit()
+    monkeypatch.setattr(database, "MIGRATIONS", original)
+    initialize(config.database.path, config.accounts)
+    with connect(config.database.path) as db:
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 7
+        assert tuple(
+            db.execute(
+                "SELECT remote_message_id,account_id,label_id FROM gmail_message_labels"
+            ).fetchone()
+        ) == ("gmail-remote", aid, "Label_1")
+        assert tuple(
+            db.execute(
+                "SELECT remote_message_id,canonical_message_id FROM remote_canonical_links"
+            ).fetchone()
+        ) == ("gmail-remote", "gmail-canonical")
+        assert db.execute("SELECT provider_kind FROM remote_messages").fetchone()[0] == "gmail"
+        assert not db.execute("PRAGMA foreign_key_check").fetchall()
+
+
 def test_foreign_keys_are_enabled(config_file: Path) -> None:
     config = load_config(config_file)
     initialize(config.database.path)
