@@ -4,9 +4,22 @@ Local-first, searchable and verifiable email archiving for multiple Gmail, IMAP 
 
 ## Status
 
-M3 adds explicit ordinary-IMAP acquisition through direct read-only IMAP. SQLite inventory and exact
+M4 adds a long-running ordinary-IMAP INBOX fast path. SQLite inventory and exact
 RFC822/MIME bytes remain authoritative. Gmail, POP3, retention, and all remote mutation remain
 out of scope.
+
+## M4 IMAP fast path
+
+Python 3.14+ is required. `mailarchive imap watch --account NAME --config CONFIG` uses the
+public stdlib `imaplib.idle()` API only; there is no IMAPClient dependency. Its read-only
+notification connection selects INBOX and only observes bounded 30-second IDLE windows. A
+separate M3 connection remains the sole canonical acquisition path (`UID SEARCH` then `UID FETCH
+BODY.PEEK[]`). The watcher arms IDLE before each catch-up sync, coalesces event bursts, reconciles
+every ten minutes, and falls back to a stop-aware 90-second poll when IDLE is disabled or absent.
+It holds a dedicated lifetime watcher lock, while manual M3 sync remains available. Health is local
+SQLite state with a 180-second stale heartbeat threshold; indexing failures are retried locally and
+never cause body refetch. No systemd service, Gmail semantics, remote mutation, or slow-path worker
+is introduced by M4.
 
 ## M3 IMAP acquisition
 

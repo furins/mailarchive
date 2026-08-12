@@ -91,6 +91,10 @@ Acceptance:
 
 - slow workers can be disabled/broken without preventing fast-path visibility.
 
+Implemented for ordinary IMAP INBOX: stdlib Python 3.14 `imaplib.idle()` notification, separate
+M3 canonical acquisition connection, bounded/reconnecting watcher, polling fallback, notmuch
+refresh and local health. M5 Gmail semantics remains explicitly out of scope.
+
 ## M5 — Gmail semantics
 
 Deliver:

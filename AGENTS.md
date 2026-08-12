@@ -49,7 +49,7 @@ Read, in this order, before changing code:
 
 ## Coding principles
 
-- Primary implementation language: Python 3.12+.
+- Primary implementation language: Python 3.14+.
 - CLI: Typer or argparse; prefer Typer if it does not complicate packaging.
 - Database: SQLite, WAL mode where appropriate.
 - ORM is optional. Prefer explicit SQL or a lightweight layer if it keeps invariants clear.

@@ -29,6 +29,14 @@ class ImapConfig:
     tls_mode: TlsMode
     folders: tuple[str, ...]
     connection_timeout_seconds: int
+    fast_path: FastPathConfig
+
+
+@dataclass(frozen=True)
+class FastPathConfig:
+    idle_enabled: bool = True
+    reconcile_interval_seconds: int = 600
+    poll_interval_seconds: int = 90
 
 
 @dataclass(frozen=True)

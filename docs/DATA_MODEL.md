@@ -237,6 +237,12 @@ Audit events SHALL be append-oriented.
 
 ## 16. integrity invariants
 
+## 17. fast_path_health (M4)
+
+One local operational row per `(account_id, remote_folder)` records only bounded safe facts:
+effective mode, UTC heartbeats, last event/sync/index successes, failure category, reconnect count,
+and pending local index work. It contains no credentials, IMAP response payloads, or RFC822 bytes.
+
 At minimum:
 
 1. Every archived canonical object has a path and SHA-256.

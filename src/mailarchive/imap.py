@@ -29,6 +29,10 @@ class ImapError(RuntimeError):
     """A direct IMAP action was refused or did not complete safely."""
 
 
+class ImapSyncBusyError(ImapError):
+    """The short-lived M3 account/folder synchronization lock is held."""
+
+
 @dataclass(frozen=True)
 class FetchResult:
     uid: int
@@ -39,6 +43,11 @@ def _credential_variable(reference: str) -> str:
     if not reference.startswith("env:") or not _ENV_NAME.fullmatch(reference[4:]):
         raise ImapError("IMAP credentials must use config_ref: env:VARIABLE_NAME")
     return reference[4:]
+
+
+def credential_variable(reference: str) -> str:
+    """Validate configured credential indirection without exposing its value."""
+    return _credential_variable(reference)
 
 
 def _ssl_context() -> ssl.SSLContext:
@@ -99,7 +108,7 @@ def _parse_uidvalidity(client: imaplib.IMAP4) -> int:
 @contextmanager
 def folder_lock(
     config: AppConfig, account: AccountConfig, folder: str
-) -> Generator[None, None, None]:
+) -> Generator[None]:
     import fcntl
 
     digest = hashlib.sha256(f"{account.name}\0{folder}".encode()).hexdigest()[:16]
@@ -109,7 +118,9 @@ def folder_lock(
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
-            raise ImapError("IMAP account/folder synchronization is already running") from error
+            raise ImapSyncBusyError(
+                "IMAP account/folder synchronization is already running"
+            ) from error
         try:
             yield
         finally:
@@ -264,6 +275,10 @@ class ImapAdapter:
         return imaplib.IMAP4(
             settings.host, settings.port, timeout=settings.connection_timeout_seconds
         )
+
+    def open_notification_connection(self, account: AccountConfig) -> imaplib.IMAP4:
+        """Apply M3's TLS connection rules to M4's body-free notification client."""
+        return self._open(account)
 
     def sync(self, account_name: str, folder: str) -> list[IngestResult]:
         account = next((item for item in self.config.accounts if item.name == account_name), None)

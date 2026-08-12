@@ -19,6 +19,10 @@ accounts:
       username: you@example.invalid
       tls_mode: IMAPS
       folders: [INBOX]
+      fast_path:
+        idle_enabled: true
+        reconcile_interval_seconds: 600
+        poll_interval_seconds: 90
 
   work:
     kind: imap
@@ -33,6 +37,10 @@ accounts:
       username: you@example.invalid
       tls_mode: IMAPS
       folders: [INBOX]
+      fast_path:
+        idle_enabled: true
+        reconcile_interval_seconds: 600
+        poll_interval_seconds: 90
 
 spam:
   enabled: true
@@ -40,10 +48,6 @@ spam:
   spam_quarantine_days: 180
   protect_known_contacts: true
   protect_previous_correspondents: true
-
-fast_path:
-  idle_enabled: true
-  fallback_poll_seconds: 90
 
 search:
   notmuch_enabled: true
