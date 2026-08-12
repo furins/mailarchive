@@ -182,6 +182,26 @@ def test_foreign_keys_are_enabled(config_file: Path) -> None:
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
 
 
+def test_v8_failure_restores_foreign_keys_and_retries(config_file: Path) -> None:
+    config = load_config(config_file)
+    original = database.MIGRATIONS
+    database.MIGRATIONS = original[:7]
+    initialize(config.database.path, config.accounts)
+    database.MIGRATIONS = original
+    with connect(config.database.path) as db:
+
+        def fail(_connection: sqlite3.Connection) -> None:
+            raise RuntimeError("v8 injected failure")
+
+        with pytest.raises(RuntimeError, match="injected"):
+            database._apply_migration(db, 8, fail)  # pyright: ignore[reportPrivateUsage]
+        assert db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        database._apply_migration(db, 8, database._migration_8)  # pyright: ignore[reportPrivateUsage]
+        assert db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert not db.execute("PRAGMA foreign_key_check").fetchall()
+    initialize(config.database.path, config.accounts)
+
+
 def test_v8_lifecycle_constraints_reject_impossible_timestamp_combinations(
     config_file: Path,
 ) -> None:

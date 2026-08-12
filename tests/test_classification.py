@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 import mailarchive.classification as classification_module
 from mailarchive.classification import (
+    Classification,
     ClassificationResult,
     RspamdAdapter,
     apply_classification,
@@ -80,6 +82,53 @@ def test_latest_manual_override_wins_over_later_automatic_result(config_file: Pa
     with connect(config.database.path) as db:
         effective = effective_classification(db, message.id)
         assert effective is not None and effective["classification"] == "ham"
+
+
+@pytest.mark.parametrize(
+    ("initial", "override", "expected_state"),
+    [
+        ("spam", "ham", "archived"),
+        ("suspect", "ham", "archived"),
+        ("ham", "spam", "quarantined"),
+        ("ham", "suspect", "quarantined"),
+        ("spam", "suspect", "quarantined"),
+        ("suspect", "spam", "quarantined"),
+    ],
+)
+def test_manual_override_six_case_matrix(
+    config_file: Path, initial: str, override: str, expected_state: str
+) -> None:
+    config = load_config(config_file)
+    raw = f"From: a\r\n\r\n{initial}-{override}".encode()
+    initial_value = cast(Classification, initial)
+    override_value = cast(Classification, override)
+    pending = ingest_bytes(config, raw, "test").canonical_message
+    before = apply_classification(
+        config, pending, ClassificationResult(initial_value, 1, "initial")
+    )
+    before_path, before_archive = before.local_path, before.archived_at
+    after = apply_classification(
+        config, before, ClassificationResult(override_value, 2, "operator", "manual"), manual=True
+    )
+    assert (after.id, after.sha256, after.local_path.read_bytes()) == (
+        pending.id,
+        pending.sha256,
+        raw,
+    )
+    assert after.storage_state == expected_state
+    if initial in {"spam", "suspect"} and override == "ham":
+        assert after.archived_at is not None
+    if initial == "ham" and override != "ham":
+        assert after.archived_at == before_archive
+    if initial in {"spam", "suspect"} and override in {"spam", "suspect"}:
+        assert after.local_path == before_path
+    with connect(config.database.path) as db:
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM classifications WHERE canonical_message_id=?", (pending.id,)
+            ).fetchone()[0]
+            == 2
+        )
 
 
 def test_reconcile_pending_is_local_and_preserves_exact_bytes(config_file: Path) -> None:
