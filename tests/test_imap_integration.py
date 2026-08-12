@@ -181,7 +181,10 @@ def _imap_snapshot(port: int) -> tuple[int, dict[int, tuple[tuple[bytes, ...], b
             assert status == "OK"
             metadata, raw = fetched[0]
             assert isinstance(metadata, bytes) and isinstance(raw, bytes)
-            flags = tuple(sorted(imaplib.ParseFlags(metadata)))
+            # \Recent is session-scoped state and naturally changes when another client opens INBOX.
+            flags = tuple(
+                flag for flag in sorted(imaplib.ParseFlags(metadata)) if flag != b"\\Recent"
+            )
             snapshot[int(uid)] = (flags, raw)
         return uidvalidity, snapshot
     finally:
