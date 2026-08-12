@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 import requests
 import yaml
+from google.auth.exceptions import RefreshError
 
 from mailarchive.config import load_config
 from mailarchive.db import connect, initialize
@@ -24,6 +25,7 @@ from mailarchive.gmail import (
     GmailResponseError,
     GmailTransientError,
     GmailWatcher,
+    _ManagedGmailSession,  # pyright: ignore[reportPrivateUsage]
     decode_raw,
     load_credentials,
 )
@@ -187,6 +189,75 @@ def test_http_retry_exhaustion_and_auth_categories() -> None:
         with pytest.raises(error):
             GmailApiClient(session, sleeper=typed_sleeps.append).profile()
         assert session.calls == (3 if status in {429, 500} else 1)
+
+
+@pytest.mark.parametrize("retry_after", ["-1", "-inf", "nan", "nonsense"])
+def test_invalid_retry_after_uses_bounded_exponential_delay(retry_after: str) -> None:
+    delays: list[float] = []
+
+    class Response:
+        status_code = 429
+        headers = {"Retry-After": retry_after}
+
+        def json(self) -> object:
+            return {}
+
+    class Session:
+        def get(self, *args: object, **kwargs: object) -> Response:
+            return Response()
+
+    with pytest.raises(GmailTransientError):
+        GmailApiClient(Session(), sleeper=delays.append).profile()
+    assert delays == [0.25, 0.5]
+
+
+def test_managed_request_time_refresh_persists_and_rejects_refresh_error(tmp_path: Path) -> None:
+    token = tmp_path / "token.json"
+
+    class Credentials:
+        def __init__(self, fail: bool = False) -> None:
+            self.valid, self.token, self.fail, self.refreshes = False, "old", fail, 0
+
+        def refresh(self, _request: object) -> None:
+            self.refreshes += 1
+            if self.fail:
+                raise RefreshError("REFRESH_SECRET_MARKER")
+            self.valid, self.token = True, "new"
+
+        def to_json(self) -> str:
+            return json.dumps(
+                {
+                    "token": "ACCESS_SECRET_MARKER",
+                    "refresh_token": "REFRESH_SECRET_MARKER",
+                    "client_secret": "CLIENT_SECRET_MARKER",
+                    "scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+                }
+            )
+
+    class Response:
+        status_code = 200
+
+    class Session:
+        def __init__(self) -> None:
+            self.headers: list[dict[str, str]] = []
+
+        def get(self, _url: str, **kwargs: object) -> Response:
+            self.headers.append(cast(dict[str, str], kwargs["headers"]))
+            return Response()
+
+    credentials, session = Credentials(), Session()
+    response = _ManagedGmailSession(credentials, token, session).get("https://gmail.invalid")  # type: ignore[arg-type]
+    assert (
+        response.status_code == 200
+        and credentials.refreshes == 1
+        and token.stat().st_mode & 0o777 == 0o600
+    )
+    assert session.headers == [{"Authorization": "Bearer new"}]
+    with pytest.raises(GmailAuthError) as error:
+        _ManagedGmailSession(Credentials(True), tmp_path / "bad.json", Session()).get(  # type: ignore[arg-type]
+            "https://gmail.invalid"
+        )  # type: ignore[arg-type]
+    assert "REFRESH_SECRET_MARKER" not in str(error.value)
 
 
 def test_full_list_failure_and_cyclic_token_fail_closed(tmp_path: Path) -> None:

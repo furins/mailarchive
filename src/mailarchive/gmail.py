@@ -14,13 +14,13 @@ import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from math import isfinite
 from pathlib import Path
 from threading import Event
 from typing import Any, Protocol, cast
 
 import requests
 from google.auth.exceptions import RefreshError
-from google.auth.transport.requests import AuthorizedSession
 from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -145,7 +145,12 @@ class GmailApiClient:
                 break
             retry_after = current.headers.get("Retry-After")
             try:
-                delay = min(float(retry_after), 5.0) if retry_after else 0.25 * (2**attempt)
+                parsed_delay = float(retry_after) if retry_after else None
+                delay = (
+                    min(parsed_delay, 5.0)
+                    if parsed_delay is not None and isfinite(parsed_delay) and parsed_delay >= 0
+                    else 0.25 * (2**attempt)
+                )
             except TypeError, ValueError:
                 delay = 0.25 * (2**attempt)
             self._sleeper(delay)
@@ -234,6 +239,41 @@ def _serialized_readonly_credentials(credentials: Credentials) -> str:
     return serialized
 
 
+class _ManagedGmailSession:
+    """GET transport that prevents google-auth request-time refresh bypasses."""
+
+    def __init__(
+        self, credentials: Credentials, token_path: Path, session: requests.Session | None = None
+    ) -> None:
+        self.credentials, self.token_path, self.session = (
+            credentials,
+            token_path,
+            session or requests.Session(),
+        )
+
+    def _refresh(self) -> None:
+        try:
+            self.credentials.refresh(GoogleRequest())
+        except RefreshError as error:
+            raise GmailAuthError("Gmail OAuth refresh failed") from error
+        _write_token(self.token_path, _serialized_readonly_credentials(self.credentials))
+
+    def get(self, url: str, **kwargs: object) -> requests.Response:
+        if not self.credentials.valid:
+            self._refresh()
+        token = self.credentials.token
+        if not isinstance(token, str) or not token:
+            raise GmailAuthError("Gmail OAuth access token is unavailable")
+        headers = dict(cast(dict[str, str] | None, kwargs.pop("headers", None)) or {})
+        headers["Authorization"] = f"Bearer {token}"
+        response = self.session.get(url, headers=headers, **cast(Any, kwargs))
+        if response.status_code in {401, 403}:
+            self._refresh()
+            headers["Authorization"] = f"Bearer {self.credentials.token}"
+            response = self.session.get(url, headers=headers, **cast(Any, kwargs))
+        return response
+
+
 def load_credentials(account: AccountConfig) -> Credentials:
     path = _token_path(account)
     _safe_token_file(path)
@@ -284,13 +324,14 @@ def authorize(
     )
     if not credentials.refresh_token:
         raise GmailAuthError("OAuth authorization did not provide a refresh token")
-    serialized = _serialized_readonly_credentials(credentials)
-    client = (client_factory or (lambda c: GmailApiClient(AuthorizedSession(c))))(credentials)
+    client = (
+        client_factory or (lambda c: GmailApiClient(_ManagedGmailSession(c, _token_path(account))))
+    )(credentials)
     profile = client.profile()
     actual = _valid_id(profile.get("emailAddress"), "profile email")
     if actual.casefold() != account.gmail.account_email.casefold():
         raise GmailAuthError("authenticated Gmail profile does not match configured account")
-    _write_token(_token_path(account), serialized)
+    _write_token(_token_path(account), _serialized_readonly_credentials(credentials))
     return actual
 
 
@@ -367,15 +408,7 @@ class GmailAdapter:
 
     def _authorized_client(self, account: AccountConfig) -> GmailApiClient:
         credentials = load_credentials(account)
-        if not credentials.valid:
-            try:
-                credentials.refresh(GoogleRequest())
-            except RefreshError as error:
-                raise GmailAuthError("Gmail OAuth refresh failed") from error
-            # Re-validate before persistence; never let a refresh broaden mailbox privilege.
-            serialized = _serialized_readonly_credentials(credentials)
-            _write_token(_token_path(account), serialized)
-        return GmailApiClient(AuthorizedSession(credentials))
+        return GmailApiClient(_ManagedGmailSession(credentials, _token_path(account)))
 
     def _verify(self, client: GmailApiClient, account: AccountConfig) -> None:
         assert account.gmail is not None
@@ -707,7 +740,7 @@ class GmailAdapter:
             _audit(self.config, account.name, "gmail.sync.partial.started", "started", {})
         while True:
             page = client.history(start, token)
-            end = page.get("historyId", end)
+            page_history = page.get("historyId")
             histories = page.get("history", [])
             if not isinstance(histories, list):
                 raise GmailResponseError("Gmail history malformed")
@@ -729,7 +762,12 @@ class GmailAdapter:
                             deleted.add(mid)
             token = page.get("nextPageToken")
             if token is None:
+                if page_history is None:
+                    raise GmailResponseError("Gmail terminal history response lacks historyId")
+                end = page_history
                 break
+            if page_history is not None:
+                _history(page_history)
             token = _valid_id(token, "page token")
             if token in tokens:
                 raise GmailResponseError("Gmail history pagination token repeated")
