@@ -12,7 +12,7 @@ from typing import NoReturn
 
 from mailarchive.config import ConfigError, display_config, load_config
 from mailarchive.db import connect, initialize
-from mailarchive.imap import ImapError, ImapMbsyncAdapter
+from mailarchive.imap import ImapAdapter, ImapError
 from mailarchive.ingest import IngestError, ingest_file
 from mailarchive.notmuch import NotmuchAdapter, NotmuchError, search_canonical_messages
 
@@ -142,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
             _emit([result.as_dict() for result in results], args.json)
             return 0
         if args.command == "imap":
-            results = ImapMbsyncAdapter(config).sync(args.account, args.folder)
+            results = ImapAdapter(config).sync(args.account, args.folder)
             _emit({"account": args.account, "folder": args.folder, "seen": len(results),
                    "imported": sum(result.created for result in results)}, args.json)
             return 0

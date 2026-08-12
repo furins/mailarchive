@@ -1,24 +1,24 @@
 from __future__ import annotations
 
-import shutil
-import subprocess
+import imaplib
+import ssl
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import yaml
 
-import mailarchive.imap as imap_module
 from mailarchive.config import ConfigError, load_config
+from mailarchive.db import connect
 from mailarchive.imap import (
+    ImapAdapter,
     ImapError,
-    ImapMbsyncAdapter,
-    managed_config_text,
-    managed_layout,
-    parse_mbsync_state,
-    sanitize_mbsync_diagnostic,
-    validate_managed_config,
-    write_managed_config,
+    folder_lock,
+    parse_fetch_response,
+    register_remote_link,
 )
+from mailarchive.ingest import ingest_file
+from mailarchive.models import AccountConfig
 
 
 def _configure_imap(config_file: Path, **overrides: object) -> None:
@@ -35,198 +35,228 @@ def _configure_imap(config_file: Path, **overrides: object) -> None:
     config_file.write_text(yaml.safe_dump(values), encoding="utf-8")
 
 
-def test_managed_config_is_deterministic_and_pull_only(config_file: Path) -> None:
-    _configure_imap(config_file)
-    config = load_config(config_file)
-    account = config.accounts[0]
-    text = managed_config_text(config, account, "INBOX")
-    layout = write_managed_config(config, account, "INBOX")
-    assert layout.config_path.read_text(encoding="utf-8") == text
-    assert layout.mirror_mailbox.is_relative_to(config.archive.root / "staging" / "mbsync")
-    assert not layout.mirror_mailbox.is_relative_to(config.archive.root / "mail")
-    for directive in (
-        "Sync Pull New", "Create Near", "Remove None", "Expunge None",
-        "MaxSize 0", "FSync yes", "SyncState *", "CopyArrivalDate yes", "AltMap no",
-    ):
-        assert directive in text
-    assert "Patterns" not in text
-    assert "SSLType None" in text
-    assert "TLSType" not in text
-    maildir_section = text.split("MaildirStore", 1)[1].split("Channel", 1)[0]
-    assert "InfoDelimiter :" in maildir_section
-    assert "InfoDelimiter :" not in text.split("MaildirStore", 1)[0]
-    assert "fixture-secret-value" not in text
-    assert oct(layout.config_path.stat().st_mode & 0o777) == "0o600"
+def test_plaintext_non_loopback_is_rejected(config_file: Path) -> None:
+    _configure_imap(config_file, host="imap.example.test")
+    with pytest.raises(ConfigError, match="loopback"):
+        load_config(config_file)
 
 
-@pytest.mark.parametrize(
-    "unsafe",
-    ["Sync Push", "Sync Gone", "Sync Flags", "Sync Full", "Trash anything", "MaxMessages 10"],
-)
-def test_semantic_validator_rejects_far_side_or_unsafe_behavior(unsafe: str) -> None:
-    safe = "\n".join(imap_module.REQUIRED_DIRECTIVES)
-    with pytest.raises(ImapError, match="unsafe"):
-        validate_managed_config(safe + "\n" + unsafe)
+def test_direct_fetch_parser_requires_one_matching_uid() -> None:
+    response = [(b"1 (UID 123 BODY[] {4}", b"body"), b")"]
+    assert parse_fetch_response(123, response).raw_bytes == b"body"
+    with pytest.raises(ImapError, match="unexpected UID"):
+        parse_fetch_response(124, response)
+    with pytest.raises(ImapError, match="lacks UID"):
+        parse_fetch_response(123, [(b"1 (BODY[] {4}", b"body")])
+    with pytest.raises(ImapError, match="BODY"):
+        parse_fetch_response(123, [(b"1 (UID 123 FLAGS (\\Seen)", b"body")])
+    with pytest.raises(ImapError, match="missing or duplicated"):
+        parse_fetch_response(123, [response[0], response[0]])
+    with pytest.raises(ImapError, match="malformed"):
+        parse_fetch_response(123, [(b"UID 123", "not-bytes")])
+    with pytest.raises(ImapError, match="unexpected IMAP FETCH response fragment"):
+        parse_fetch_response(123, [response[0], b"unexpected"])
+    with pytest.raises(ImapError, match="lacks UID"):
+        parse_fetch_response(123, [(b"1 (UID 123 UID 124 BODY[] {4}", b"body")])
 
 
-def test_semantic_validator_rejects_all_accounts_command(config_file: Path) -> None:
-    _configure_imap(config_file)
-    config = load_config(config_file)
-    text = managed_config_text(config, config.accounts[0], "INBOX")
-    with pytest.raises(ImapError, match="explicit channel"):
-        validate_managed_config(text, ["mbsync", "-a"])
+class _ReadOnlyClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+
+    def login(self, username: str, password: str) -> tuple[str, list[bytes]]:
+        self.calls.append(("login", (username, password), {}))
+        return "OK", [b"logged in"]
+
+    def select(self, mailbox: str, readonly: bool = False) -> tuple[str, list[bytes]]:
+        self.calls.append(("select", (mailbox,), {"readonly": readonly}))
+        return "OK", [b"1"]
+
+    def response(self, code: str) -> tuple[str, list[bytes]]:
+        self.calls.append(("response", (code,), {}))
+        return "UIDVALIDITY", [b"9"]
+
+    def uid(self, command: str, *args: str) -> tuple[str, list[object]]:
+        self.calls.append(("uid", (command, *args), {}))
+        if command == "search":
+            return "OK", [b"1"]
+        if command == "fetch":
+            return "OK", [(b"1 (UID 1 BODY[] {4}", b"body"), b")"]
+        raise AssertionError(f"unexpected UID operation: {command}")
+
+    def logout(self) -> tuple[str, list[bytes]]:
+        self.calls.append(("logout", (), {}))
+        return "BYE", [b"bye"]
+
+    def __getattr__(self, name: str) -> object:
+        if name.lower() in {
+            "store",
+            "copy",
+            "move",
+            "expunge",
+            "append",
+            "delete",
+            "create",
+            "rename",
+            "close",
+        }:
+            raise AssertionError(f"unexpected mutating IMAP method: {name}")
+        raise AttributeError(name)
 
 
-@pytest.mark.parametrize("folder", ["INBOX", "Sent Items", "Archive/2025", "Trash"])
-def test_remote_folder_is_quoted_not_a_filesystem_identifier(
-    config_file: Path, folder: str
+def test_sync_uses_only_read_only_uid_operations(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _configure_imap(config_file, folders=[folder])
+    _configure_imap(config_file)
     config = load_config(config_file)
-    text = managed_config_text(config, config.accounts[0], folder)
-    layout = managed_layout(config, config.accounts[0], folder)
-    assert f'Far ":far-store-test-9f86d081884c:{folder}"' in text
-    assert layout.mirror_mailbox.name.startswith("folder-")
-    assert len(layout.mirror_mailbox.name.rsplit("-", 1)[1]) == 12
-    validate_managed_config(text)
+    client = _ReadOnlyClient()
+    monkeypatch.setenv("MAILARCHIVE_TEST_SECRET", "fixture")
+
+    def fake_open(_adapter: ImapAdapter, _account: AccountConfig) -> _ReadOnlyClient:
+        return client
+
+    monkeypatch.setattr(ImapAdapter, "_open", fake_open)
+    results = ImapAdapter(config).sync("test", "INBOX")
+    assert len(results) == 1
+    assert ("select", ("INBOX",), {"readonly": True}) in client.calls
+    assert ("uid", ("search", "ALL"), {}) in client.calls
+    assert ("uid", ("fetch", "1", "(UID BODY.PEEK[])"), {}) in client.calls
+    assert all(
+        call[0]
+        not in {"store", "copy", "move", "expunge", "append", "delete", "create", "rename", "close"}
+        for call in client.calls
+    )
 
 
-def test_missing_credential_and_binary_fail_without_exposing_secret(
+def test_tls_connections_use_verifying_default_context(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_imap(config_file, tls_mode="IMAPS")
+    config = load_config(config_file)
+    context = ssl.create_default_context()
+    seen: dict[str, object] = {}
+
+    class _SslClient:
+        pass
+
+    def fake_ssl(*args: object, **kwargs: object) -> _SslClient:
+        seen["ssl"] = (args, kwargs)
+        return _SslClient()
+
+    monkeypatch.setattr("mailarchive.imap.ssl.create_default_context", lambda: context)
+    monkeypatch.setattr(imaplib, "IMAP4_SSL", fake_ssl)
+    ssl_client = ImapAdapter(config)._open(config.accounts[0])  # pyright: ignore[reportPrivateUsage]
+    assert isinstance(ssl_client, _SslClient)
+    _, ssl_kwargs = cast(tuple[tuple[object, ...], dict[str, object]], seen["ssl"])
+    assert ssl_kwargs["ssl_context"] is context
+    assert context.check_hostname and context.verify_mode is ssl.CERT_REQUIRED
+
+    _configure_imap(config_file, tls_mode="STARTTLS")
+    starttls_config = load_config(config_file)
+
+    class _StartTlsClient:
+        def starttls(self, *, ssl_context: ssl.SSLContext) -> tuple[str, list[bytes]]:
+            seen["starttls"] = ssl_context
+            return "OK", []
+
+    def fake_imap4(*_args: object, **_kwargs: object) -> _StartTlsClient:
+        return _StartTlsClient()
+
+    monkeypatch.setattr(imaplib, "IMAP4", fake_imap4)
+    starttls_client = ImapAdapter(starttls_config)._open(  # pyright: ignore[reportPrivateUsage]
+        starttls_config.accounts[0]
+    )
+    assert isinstance(starttls_client, _StartTlsClient)
+    assert seen["starttls"] is context
+
+
+def test_missing_credential_and_unconfigured_folder_fail_closed(
     config_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _configure_imap(config_file)
     config = load_config(config_file)
     monkeypatch.delenv("MAILARCHIVE_TEST_SECRET", raising=False)
     with pytest.raises(ImapError, match="MAILARCHIVE_TEST_SECRET"):
-        ImapMbsyncAdapter(config).sync("test", "INBOX")
-    monkeypatch.setenv("MAILARCHIVE_TEST_SECRET", "actual-secret-value")
-    with pytest.raises(ImapError, match="isync") as error:
-        ImapMbsyncAdapter(config, executable="mbsync-not-present").sync("test", "INBOX")
-    assert "actual-secret-value" not in str(error.value)
+        ImapAdapter(config).sync("test", "INBOX")
+    monkeypatch.setenv("MAILARCHIVE_TEST_SECRET", "fixture")
+    with pytest.raises(ImapError, match="not configured"):
+        ImapAdapter(config).sync("test", "Sent Items")
 
 
-def test_mbsync_stderr_redacts_configured_credentials(
+@pytest.mark.parametrize("folder", ["INBOX", "Sent Items", "Archive/2025", "Trash"])
+def test_remote_folder_name_is_preserved_in_sqlite(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch, folder: str
+) -> None:
+    _configure_imap(config_file, folders=[folder])
+    config = load_config(config_file)
+    client = _ReadOnlyClient()
+    monkeypatch.setenv("MAILARCHIVE_TEST_SECRET", "fixture")
+
+    def fake_open(_adapter: ImapAdapter, _account: AccountConfig) -> _ReadOnlyClient:
+        return client
+
+    monkeypatch.setattr(ImapAdapter, "_open", fake_open)
+    ImapAdapter(config).sync("test", folder)
+    with connect(config.database.path) as connection:
+        stored = connection.execute("SELECT remote_folder FROM remote_messages").fetchone()
+    assert stored is not None and str(stored[0]) == folder
+
+
+def test_remote_identity_cannot_link_to_two_canonical_messages(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _configure_imap(config_file)
+    config = load_config(config_file)
+    client = _ReadOnlyClient()
+    monkeypatch.setenv("MAILARCHIVE_TEST_SECRET", "fixture")
+
+    def fake_open(_adapter: ImapAdapter, _account: AccountConfig) -> _ReadOnlyClient:
+        return client
+
+    monkeypatch.setattr(ImapAdapter, "_open", fake_open)
+    first = ImapAdapter(config).sync("test", "INBOX")[0].canonical_message
+    alternate = tmp_path / "alternate.eml"
+    alternate.write_bytes(b"From: alternate@example.test\r\n\r\nalternate\r\n")
+    second = ingest_file(config, alternate, "test").canonical_message
+    with pytest.raises(ImapError, match="conflicts"):
+        register_remote_link(config, "test", "INBOX", 9, 1, second)
+    with connect(config.database.path) as connection:
+        links = connection.execute(
+            "SELECT canonical_message_id FROM remote_canonical_links"
+        ).fetchall()
+        failure = connection.execute(
+            "SELECT result FROM audit_events WHERE event_type='imap.remote_link.failed'"
+        ).fetchone()
+    assert [str(row[0]) for row in links] == [first.id]
+    assert failure is not None and str(failure[0]) == "conflict"
+
+
+def test_uidvalidity_change_creates_a_new_remote_identity(
     config_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _configure_imap(config_file)
     config = load_config(config_file)
-    monkeypatch.setenv("MAILARCHIVE_TEST_SECRET", "do-not-print-this")
-    text = sanitize_mbsync_diagnostic("authentication failed: do-not-print-this", config)
-    assert text == "authentication failed: <redacted>"
+    client = _ReadOnlyClient()
+    monkeypatch.setenv("MAILARCHIVE_TEST_SECRET", "fixture")
 
-    def failed(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(command, 1, "", "error do-not-print-this")
+    def fake_open(_adapter: ImapAdapter, _account: AccountConfig) -> _ReadOnlyClient:
+        return client
 
-    monkeypatch.setattr(imap_module.subprocess, "run", failed)
-    with pytest.raises(ImapError, match="<redacted>") as error:
-        ImapMbsyncAdapter(config).sync("test", "INBOX")
-    assert "do-not-print-this" not in str(error.value)
-
-
-def test_plaintext_non_loopback_is_rejected(config_file: Path) -> None:
-    _configure_imap(config_file, host="imap.example.test", tls_mode="INSECURE_LOOPBACK")
-    with pytest.raises(ConfigError, match="loopback"):
-        load_config(config_file)
+    monkeypatch.setattr(ImapAdapter, "_open", fake_open)
+    canonical = ImapAdapter(config).sync("test", "INBOX")[0].canonical_message
+    register_remote_link(config, "test", "INBOX", 10, 1, canonical)
+    with connect(config.database.path) as connection:
+        identities = connection.execute(
+            "SELECT uidvalidity FROM remote_messages WHERE remote_uid=1 ORDER BY uidvalidity"
+        ).fetchall()
+    assert [int(row[0]) for row in identities] == [9, 10]
 
 
-def test_state_parser_requires_uidvalidity_and_parses_uid_pairs(tmp_path: Path) -> None:
-    state = tmp_path / ".mbsyncstate"
-    state.write_text("FarUidValidity 99\n1 11 0\n2 12 0\n", encoding="ascii")
-    parsed = parse_mbsync_state(state)
-    assert parsed.far_uidvalidity == 99
-    assert parsed.far_to_near == {1: 11, 2: 12}
-    state.write_text("1 11 0\n", encoding="ascii")
-    with pytest.raises(ImapError, match="FarUidValidity"):
-        parse_mbsync_state(state)
-
-
-@pytest.mark.parametrize(
-    ("filename", "expected_uid"),
-    [("message,U=123:2,S", 123), ("message,U=7:2,", 7), ("message:2,S", None)],
-)
-def test_native_maildir_filename_uid_parser(filename: str, expected_uid: int | None) -> None:
-    assert imap_module._near_uid(Path(filename)) == expected_uid  # pyright: ignore[reportPrivateUsage]
-
-
-def test_only_explicit_channel_is_invoked(
-    config_file: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_account_folder_lock_rejects_overlap(config_file: Path) -> None:
     _configure_imap(config_file)
-    monkeypatch.setenv("MAILARCHIVE_TEST_SECRET", "fixture-secret")
     config = load_config(config_file)
-    commands: list[list[str]] = []
-
-    def complete(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        commands.append(command)
-        layout = managed_layout(config, config.accounts[0], "INBOX")
-        state_path = layout.mirror_mailbox / "INBOX" / ".mbsyncstate"
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        state_path.write_text("FarUidValidity 1\n", encoding="ascii")
-        return subprocess.CompletedProcess(command, 0, "", "")
-
-    monkeypatch.setattr(imap_module.subprocess, "run", complete)
-    assert ImapMbsyncAdapter(config).sync("test", "INBOX") == []
-    layout = managed_layout(config, config.accounts[0], "INBOX")
-    assert commands == [["mbsync", "-c", str(layout.config_path), layout.channel]]
-
-
-@pytest.mark.skipif(shutil.which("mbsync") is None, reason="requires installed isync/mbsync")
-def test_state_parser_accepts_state_produced_by_installed_mbsync(tmp_path: Path) -> None:
-    """Exercise the native state adapter against the CI mbsync version without a network server."""
-    far = tmp_path / "far"
-    near = tmp_path / "near"
-    for root in (far, near):
-        for part in ("INBOX/cur", "INBOX/new", "INBOX/tmp"):
-            (root / part).mkdir(parents=True)
-        for directory in (
-            root,
-            root / "INBOX",
-            root / "INBOX" / "cur",
-            root / "INBOX" / "new",
-            root / "INBOX" / "tmp",
-        ):
-            directory.chmod(0o777)
-    (far / "INBOX" / "new" / "fixture").write_bytes(
-        b"Message-ID: <native@example.test>\r\n\r\nbody\r\n"
-    )
-    config = tmp_path / "mbsyncrc"
-    config.write_text(
-        "\n".join(
-            (
-                "FSync yes",
-                "MaildirStore far",
-                f"Path {far}/",
-                f"Inbox {far}/INBOX",
-                "AltMap no",
-                "",
-                "MaildirStore near",
-                f"Path {near}/",
-                f"Inbox {near}/INBOX",
-                "AltMap no",
-                "",
-                "Channel native",
-                "Far :far:INBOX",
-                "Near :near:INBOX",
-                "Sync Pull New",
-                "Create Near",
-                "Remove None",
-                "Expunge None",
-                "MaxSize 0",
-                "CopyArrivalDate yes",
-                "SyncState *",
-                "",
-            )
-        ),
-        encoding="utf-8",
-    )
-    # The sandbox executes mbsync with a restricted UID; this test config has no credentials.
-    config.chmod(0o644)
-    completed = subprocess.run(
-        ["mbsync", "-c", str(config), "native"], check=False, capture_output=True, text=True
-    )
-    if "Cannot open config file" in completed.stderr and "Permission denied" in completed.stderr:
-        pytest.skip("execution sandbox denies mbsync access to pytest temporary directories")
-    assert completed.returncode == 0, completed.stderr
-    parsed = parse_mbsync_state(near / "INBOX" / ".mbsyncstate")
-    assert parsed.far_uidvalidity > 0
-    assert parsed.far_to_near
+    account = config.accounts[0]
+    with folder_lock(config, account, "INBOX"):
+        with pytest.raises(ImapError, match="already running"):
+            with folder_lock(config, account, "INBOX"):
+                pass

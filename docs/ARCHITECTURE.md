@@ -72,7 +72,7 @@ Provider-specific adapters SHALL isolate protocol/tool behavior.
 Initial conceptual adapters:
 
 ```text
-ImapMbsyncAdapter
+ImapAdapter
 GmailAdapter
 Pop3GetmailAdapter
 ```
@@ -154,12 +154,11 @@ Recommended:
 
 Exact system paths SHALL be configurable.
 
-For M3 IMAP, mbsync owns a persistent non-canonical mirror at
-`staging/mbsync/<account>/<safe-folder-id>/`. The adapter imports its downloaded bytes into
-`mail/<account>/` only after a successful pull-only sync; mbsync never receives the canonical
-Maildir as its Near store. Each requested folder has one explicit channel and process lock.
-M3 deliberately does not use mbsync dry-run as a safety argument because Maildir dry-run
-side-effects have been reported; safety is the generated pull-only config plus explicit channel.
+For M3 IMAP, the adapter selects one explicitly configured remote folder read-only, uses UID
+SEARCH and UID FETCH with BODY.PEEK[], and sends the returned literal directly to canonical
+ingest. There is no Maildir mirror or mbsync state. Each requested folder has one process lock.
+The adapter never issues a mutating IMAP command; UID plus UIDVALIDITY is the remote identity.
+ADR-015 records why mbsync was rejected: its Maildir output did not preserve IMAP literal bytes.
 
 notmuch configuration and database files are derived state and live outside `mail/`.
 MailArchive always supplies its managed configuration explicitly; it disables Maildir flag
@@ -223,7 +222,7 @@ Fallback:
 short periodic INBOX poll, approximately every 1–2 minutes
 ```
 
-A full `mbsync -a` MUST NOT be triggered for every incoming message.
+M3 has no watcher or automatic IMAP polling; every network acquisition is an explicit command.
 
 ### Gmail
 

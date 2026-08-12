@@ -1,4 +1,4 @@
-"""Disposable loopback Dovecot + real mbsync acquisition integration coverage."""
+"""Disposable loopback Dovecot coverage for direct read-only IMAP acquisition."""
 
 from __future__ import annotations
 
@@ -6,20 +6,19 @@ import hashlib
 import imaplib
 import os
 import pwd
-import shutil
 import socket
 import subprocess
-import tempfile
 import time
 from collections.abc import Generator
 from pathlib import Path
+from typing import cast
 
 import pytest
 import yaml
 
 from mailarchive.config import load_config
 from mailarchive.db import connect
-from mailarchive.imap import ImapError, ImapMbsyncAdapter, managed_layout
+from mailarchive.imap import ImapAdapter
 from mailarchive.notmuch import NotmuchAdapter, search_canonical_messages
 
 
@@ -29,65 +28,62 @@ def _free_port() -> int:
         return int(listener.getsockname()[1])
 
 
-def _raw(message_id: str, subject: str) -> bytes:
+def _raw(identifier: str, subject: str, body: str = "body") -> bytes:
     return (
         f"From: source@example.test\r\nTo: archive@example.test\r\nSubject: {subject}\r\n"
-        f"Message-ID: {message_id}\r\nDate: Wed, 1 Jan 2020 12:00:00 +0000\r\n\r\n"
-        f"body for {subject}\r\n"
+        f"Message-ID: {identifier}\r\n\r\n{body}\r\n"
     ).encode()
 
 
-def _safe_dovecot_log(path: Path) -> str:
-    """Attach bounded server diagnostics without password material on test failure."""
-    if not path.exists():
-        return "no Dovecot log available"
-    return path.read_text(encoding="utf-8", errors="replace").replace(
-        "fixture-password", "<redacted>"
-    )[-2_000:]
-
-
-@pytest.fixture
-def mbsync_visible_root() -> Generator[Path, None, None]:
-    """The sandbox runs mbsync under a restricted UID, unlike normal CI runners."""
-    root = Path(tempfile.mkdtemp(prefix="mailarchive-mbsync-", dir="/tmp"))
-    root.chmod(0o777)
+def _safe_dovecot_diagnostic(log: Path, process: subprocess.Popen[str]) -> str:
+    """Return bounded fixture diagnostics without exposing its test password."""
     try:
-        yield root
-    finally:
-        shutil.rmtree(root)
+        stdout, stderr = process.communicate(timeout=1)
+    except subprocess.TimeoutExpired:
+        stdout, stderr = "", ""
+    contents = "\n".join(
+        part
+        for part in (
+            log.read_text(encoding="utf-8", errors="replace") if log.exists() else "",
+            stdout,
+            stderr,
+        )
+        if part
+    )
+    return contents.replace("fixture-password", "<redacted>")[-2_000:] or "no Dovecot log available"
 
 
 @pytest.fixture
-def dovecot_loopback(
-    tmp_path: Path,
-) -> Generator[tuple[int, Path, Path, subprocess.Popen[str]], None, None]:
-    """Start an empty, plaintext-only-on-loopback Dovecot instance for tests."""
+def dovecot_loopback(tmp_path: Path) -> Generator[tuple[int, Path, Path], None, None]:
     root = tmp_path / "dovecot"
-    local_user = pwd.getpwuid(os.getuid()).pw_name
+    mail = root / "mail"
+    user = pwd.getpwuid(os.getuid()).pw_name
     version = subprocess.run(
         ["dovecot", "--version"], check=True, capture_output=True, text=True
     ).stdout.strip()
     dovecot_24 = version.startswith("2.4.")
-    mail = root / "mail"
     for part in ("cur", "new", "tmp"):
         (mail / part).mkdir(parents=True)
     port = _free_port()
-    password_file = root / "passwd"
-    password_file.write_text("fixture:{PLAIN}fixture-password\n", encoding="utf-8")
+    password = root / "passwd"
+    password.write_text("fixture:{PLAIN}fixture-password\n")
+    log = root / "dovecot.log"
     config = root / "dovecot.conf"
-    log_path = root / "dovecot.log"
-    auth_configuration = (
+    version_settings = (
+        ("dovecot_config_version = 2.4.0", "dovecot_storage_version = 2.4.0") if dovecot_24 else ()
+    )
+    auth_settings = (
         (
             "passdb passwd-file {",
-            f"  passwd_file_path = {password_file}",
+            f"passwd_file_path = {password}",
             "}",
             "userdb static {",
-            "  static_allow_all_users = yes",
-            "  userdb_fields {",
-            f"    uid = {os.getuid()}",
-            f"    gid = {os.getgid()}",
-            f"    home = {root}",
-            "  }",
+            "static_allow_all_users = yes",
+            "userdb_fields {",
+            f"uid = {os.getuid()}",
+            f"gid = {os.getgid()}",
+            f"home = {root}",
+            "}",
             "}",
         )
         if dovecot_24
@@ -95,54 +91,48 @@ def dovecot_loopback(
             "disable_plaintext_auth = no",
             f"mail_location = maildir:{mail}",
             "passdb {",
-            "  driver = passwd-file",
-            f"  args = scheme=PLAIN username_format=%u {password_file}",
+            "driver = passwd-file",
+            f"args = scheme=PLAIN username_format=%u {password}",
             "}",
             "userdb {",
-            "  driver = static",
-            f"  args = uid={os.getuid()} gid={os.getgid()} home={root}",
+            "driver = static",
+            f"args = uid={os.getuid()} gid={os.getgid()} home={root}",
             "}",
         )
-    )
-    version_configuration = (
-        ("dovecot_config_version = 2.4.0", "dovecot_storage_version = 2.4.0")
-        if dovecot_24
-        else ()
     )
     config.write_text(
         "\n".join(
             (
-                *version_configuration,
-                f"default_internal_user = {local_user}",
-                f"default_internal_group = {local_user}",
-                f"default_login_user = {local_user}",
+                *version_settings,
+                f"default_internal_user = {user}",
+                f"default_internal_group = {user}",
+                f"default_login_user = {user}",
                 "protocols = imap",
                 "listen = 127.0.0.1",
                 f"base_dir = {root / 'run'}",
                 f"state_dir = {root / 'state'}",
-                f"log_path = {log_path}",
+                f"log_path = {log}",
                 "ssl = no",
                 "auth_mechanisms = plain",
                 *(("mail_driver = maildir", f"mail_path = {mail}") if dovecot_24 else ()),
-                *auth_configuration,
+                *auth_settings,
                 "service imap-login {",
-                f"  user = {local_user}",
-                "  chroot =",
-                "  inet_listener imap {",
-                f"    port = {port}",
-                "  }",
+                f"user = {user}",
+                "chroot =",
+                "inet_listener imap {",
+                f"port = {port}",
+                "}",
                 "}",
                 "service imap {",
-                f"  user = {local_user}",
-                "  chroot =",
+                f"user = {user}",
+                "chroot =",
                 "}",
                 "service anvil {",
-                "  chroot =",
+                "chroot =",
                 "}",
                 "",
             )
-        ),
-        encoding="utf-8",
+        )
     )
     process = subprocess.Popen(
         ["dovecot", "-F", "-c", str(config)],
@@ -150,99 +140,64 @@ def dovecot_loopback(
         stderr=subprocess.PIPE,
         text=True,
     )
-    deadline = time.monotonic() + 10
-    while True:
+    for _ in range(100):
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+            with socket.create_connection(("127.0.0.1", port), 0.1):
                 break
         except OSError:
-            if time.monotonic() >= deadline:
-                stdout, stderr = process.communicate(timeout=1)
-                raise RuntimeError(f"Dovecot did not start: {stdout}\n{stderr}") from None
             time.sleep(0.05)
+    else:
+        raise RuntimeError(f"Dovecot did not start: {_safe_dovecot_diagnostic(log, process)}")
     try:
-        yield port, mail, log_path, process
+        yield port, mail, log
     finally:
         process.terminate()
         process.wait(timeout=10)
 
 
-def _imap_snapshot(port: int) -> tuple[int, dict[int, tuple[tuple[bytes, ...], bytes]]]:
+def _snapshot(port: int) -> tuple[int, dict[int, tuple[tuple[bytes, ...], bytes]]]:
     client = imaplib.IMAP4("127.0.0.1", port)
     try:
         assert client.login("fixture", "fixture-password")[0] == "OK"
         assert client.select("INBOX", readonly=True)[0] == "OK"
         uidvalidity = int(client.response("UIDVALIDITY")[1][0])
-        status, data = client.uid("search", "ALL")
+        status, values = client.uid("search", "ALL")
         assert status == "OK"
-        snapshot: dict[int, tuple[tuple[bytes, ...], bytes]] = {}
-        for uid in data[0].split():
-            status, fetched = client.uid("fetch", uid, "(FLAGS BODY.PEEK[])")
+        result: dict[int, tuple[tuple[bytes, ...], bytes]] = {}
+        for uid in values[0].split():
+            status, data = client.uid("fetch", uid, "(UID FLAGS BODY.PEEK[])")
             assert status == "OK"
-            metadata, raw = fetched[0]
-            assert isinstance(metadata, bytes) and isinstance(raw, bytes)
-            # \Recent is session-scoped state and naturally changes when another client opens INBOX.
-            flags = tuple(
-                flag for flag in sorted(imaplib.ParseFlags(metadata)) if flag != b"\\Recent"
-            )
-            snapshot[int(uid)] = (flags, raw)
-        return uidvalidity, snapshot
+            metadata, raw = cast(tuple[bytes, bytes], data[0])
+            flags = tuple(flag for flag in imaplib.ParseFlags(metadata) if flag != b"\\Recent")
+            result[int(uid)] = (flags, raw)
+        return uidvalidity, result
     finally:
         client.logout()
 
 
-@pytest.mark.skipif(not Path("/usr/sbin/dovecot").exists(), reason="requires dovecot-imapd")
-def test_loopback_dovecot_mbsync_preserves_server_and_canonical_bytes(
-    config_file: Path,
-    dovecot_loopback: tuple[int, Path, Path, subprocess.Popen[str]],
-    mbsync_visible_root: Path,
-    monkeypatch: pytest.MonkeyPatch,
+def test_direct_loopback_acquisition_preserves_server_bytes(
+    config_file: Path, dovecot_loopback: tuple[int, Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    port, mail, log_path, _ = dovecot_loopback
-    first = _raw("<loopback-one@example.test>", "loopback one")
-    (mail / "new" / "seed-one").write_bytes(first)
-    uidvalidity, before = _imap_snapshot(port)
-    values = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    port, mail, _ = dovecot_loopback
+    first = _raw("<same@example.test>", "loopback one")
+    (mail / "new" / "one").write_bytes(first)
+    uidvalidity, before = _snapshot(port)
+    values = yaml.safe_load(config_file.read_text())
     values["accounts"]["test"]["imap"] = {
-        "host": "127.0.0.1", "port": port, "username": "fixture",
-        "tls_mode": "INSECURE_LOOPBACK", "folders": ["INBOX"],
+        "host": "127.0.0.1",
+        "port": port,
+        "username": "fixture",
+        "tls_mode": "INSECURE_LOOPBACK",
+        "folders": ["INBOX"],
     }
-    values["archive"]["root"] = str(mbsync_visible_root / "archive")
-    values["database"]["path"] = str(mbsync_visible_root / "state" / "mailarchive.sqlite3")
-    config_file.write_text(yaml.safe_dump(values), encoding="utf-8")
+    config_file.write_text(yaml.safe_dump(values))
     monkeypatch.setenv("MAILARCHIVE_TEST_SECRET", "fixture-password")
     config = load_config(config_file)
-    try:
-        results = ImapMbsyncAdapter(config).sync("test", "INBOX")
-    except ImapError as error:
-        if "Cannot open config file" in str(error) and "Permission denied" in str(error):
-            if os.environ.get("GITHUB_ACTIONS") != "true":
-                pytest.skip(
-                    "local sandbox prevents mbsync from reading its required 0600 managed config"
-                )
-        diagnostic = _safe_dovecot_log(log_path)
-        raise AssertionError(f"loopback acquisition failed; Dovecot log:\n{diagnostic}") from error
-    except Exception as error:
-        diagnostic = _safe_dovecot_log(log_path)
-        raise AssertionError(f"loopback acquisition failed; Dovecot log:\n{diagnostic}") from error
-    assert len(results) == len(before) == 1
-    assert _imap_snapshot(port) == (uidvalidity, before)
-    layout = managed_layout(config, config.accounts[0], "INBOX")
-    assert oct(layout.config_path.stat().st_mode & 0o777) == "0o600"
-    mirror_files = [
-        item
-        for directory in (
-            layout.mirror_mailbox / "INBOX" / "cur",
-            layout.mirror_mailbox / "INBOX" / "new",
-        )
-        if directory.is_dir()
-        for item in directory.iterdir()
-        if item.is_file()
-    ]
-    assert len(mirror_files) == 1
-    mirror = mirror_files[0]
-    assert mirror.read_bytes() == first == results[0].canonical_message.local_path.read_bytes()
-    assert results[0].canonical_message.sha256 == hashlib.sha256(first).hexdigest()
+    results = ImapAdapter(config).sync("test", "INBOX")
+    assert len(results) == 1 and _snapshot(port) == (uidvalidity, before)
+    canonical = results[0].canonical_message
+    assert canonical.local_path.read_bytes() == first
+    assert canonical.sha256 == hashlib.sha256(first).hexdigest()
     with connect(config.database.path) as connection:
         remote = connection.execute(
             "SELECT uidvalidity, remote_uid FROM remote_messages"
@@ -251,13 +206,13 @@ def test_loopback_dovecot_mbsync_preserves_server_and_canonical_bytes(
             "SELECT canonical_message_id FROM remote_canonical_links"
         ).fetchone()
     assert tuple(remote) == (uidvalidity, next(iter(before)))
-    assert str(link[0]) == results[0].canonical_message.id
-    assert ImapMbsyncAdapter(config).sync("test", "INBOX")[0].created is False
-    second = _raw("<loopback-two@example.test>", "loopback two")
-    (mail / "new" / "seed-two").write_bytes(second)
-    _, after_add = _imap_snapshot(port)
-    next_results = ImapMbsyncAdapter(config).sync("test", "INBOX")
-    assert sum(item.created for item in next_results) == 1
-    assert _imap_snapshot(port)[1] == after_add
+    assert str(link[0]) == canonical.id
+    assert ImapAdapter(config).sync("test", "INBOX") == []
+    (mail / "new" / "two").write_bytes(
+        _raw("<same@example.test>", "loopback two", "different bytes")
+    )
+    _, after = _snapshot(port)
+    next_results = ImapAdapter(config).sync("test", "INBOX")
+    assert len(next_results) == 1 and _snapshot(port)[1] == after
     NotmuchAdapter(config).refresh()
     assert search_canonical_messages(config, "loopback two")

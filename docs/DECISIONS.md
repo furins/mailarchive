@@ -86,3 +86,12 @@ Gmail labels must not be naively equated with independent canonical folders/mess
 Status: accepted.
 
 Prefer IMAP where available.
+
+## ADR-015 — Direct IMAP literals are canonical acquisition bytes
+
+Status: accepted.
+
+The M3 Dovecot loopback fidelity test rejected isync/mbsync as a canonical acquisition
+path: isync 1.4.4 converted CRLF to LF and injected `X-TUID` into its Maildir copy.
+MailArchive now fetches each new UID with read-only `BODY.PEEK[]`; the returned literal is
+written unchanged to canonical Maildir. mbsync is not a production dependency.

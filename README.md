@@ -4,7 +4,7 @@ Local-first, searchable and verifiable email archiving for multiple Gmail, IMAP 
 
 ## Status
 
-M3 adds explicit ordinary-IMAP acquisition through isync/mbsync. SQLite inventory and exact
+M3 adds explicit ordinary-IMAP acquisition through direct read-only IMAP. SQLite inventory and exact
 RFC822/MIME bytes remain authoritative. Gmail, POP3, retention, and all remote mutation remain
 out of scope.
 
@@ -18,31 +18,23 @@ export MAILARCHIVE_PERSONAL_IMAP_PASSWORD='...'
 uv run mailarchive imap sync --account personal --folder INBOX --config ./your-config.yaml --json
 ```
 
-Use a disposable/local test account first. Never run `mbsync -a`, and do not rely on mbsync
-dry-run (`-y`): MailArchive does not expose it because Maildir dry-run side effects have been
-reported upstream. Instead, every run writes a managed config and invokes exactly one generated
-channel with `mbsync -c <managed-config> <channel>`.
-
-The persistent mbsync-owned mirror is
-`<archive.root>/staging/mbsync/<account>/<safe-folder-id>/INBOX`; it is deliberately outside
-the immutable canonical archive at `<archive.root>/mail/<account>`. Mirror files are never
-hard-linked into canonical storage and remain for mbsync's synchronization state. The generated
-channel is `Sync Pull New`, `Create Near`, `Remove None`, `Expunge None`, `ExpungeSolo None`,
-`MaxSize 0`, `FSync yes`, `SyncState *`, and `CopyArrivalDate yes`; its Maildir store uses
-`AltMap no`. It contains no Push, Gone, flag synchronization, Trash, Patterns, or max-message
-setting.
+Use a disposable/local test account first. The adapter selects exactly the requested configured
+folder read-only, discovers UIDs using `UID SEARCH`, and obtains each unseen message using
+`UID FETCH (UID BODY.PEEK[])`. The returned IMAP literal is written unchanged to canonical
+Maildir; there is no mbsync mirror or generated mbsync configuration. It never issues STORE,
+COPY, MOVE, EXPUNGE, APPEND, DELETE, CREATE, RENAME, or CLOSE.
 
 IMAP credentials are only `config_ref: env:VARIABLE_NAME`; the secret value is not written to
-the mbsync config, SQLite, audit events, normal errors, or JSON output. Production settings must
-use `IMAPS` or `STARTTLS` with normal certificate verification. `INSECURE_LOOPBACK` exists only
-for disposable loopback tests. Each configured folder gets a hashed safe local/channel name while
+SQLite, audit events, normal errors, or JSON output. Production settings use `IMAPS` or
+`STARTTLS` with normal certificate and hostname verification. `INSECURE_LOOPBACK` exists only
+for disposable loopback tests. Each configured folder gets a hashed safe process lock while
 SQLite retains the original remote folder name. Remote identity is UID plus UIDVALIDITY, never
-Message-ID alone; failed state mapping preserves the canonical message but leaves linkage visibly
-unresolved.
+Message-ID alone.
 
-The development environment tested is isync/mbsync 1.5.1. A real-server byte-fidelity integration
-test remains required before using this on production mail: canonical bytes are intentionally not
-rewritten to accommodate a differing mbsync result.
+The former mbsync experiment was deliberately rejected: its Dovecot integration test showed
+isync 1.4.4 converting CRLF to LF and injecting `X-TUID`. See ADR-015. The direct-IMAP loopback
+integration test proves server-to-canonical byte equality; canonical bytes are never normalized
+or rewritten.
 
 ## M2 quick start
 
@@ -108,7 +100,7 @@ canonical paths. Recoll remains planned for later attachment-content searching.
 - Metadata/inventory: SQLite.
 - Email search: notmuch.
 - Attachment-content search: Recoll.
-- IMAP acquisition: mbsync/isync adapter.
+- IMAP acquisition: direct read-only IMAP adapter.
 - Gmail: Gmail-aware adapter, initially selected during implementation validation.
 - POP3 fallback: getmail6 adapter.
 - Spam classification: local classifier adapter, quarantine-first.
