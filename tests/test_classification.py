@@ -134,6 +134,22 @@ def test_reconcile_pending_fails_closed_for_missing_or_corrupt_bytes(
         )
 
 
+def test_reconcile_pending_continues_after_one_corrupt_object(config_file: Path) -> None:
+    config = load_config(config_file)
+    first = ingest_bytes(config, b"From: a\r\n\r\nfirst", "test").canonical_message
+    broken = ingest_bytes(config, b"From: a\r\n\r\nbroken", "test").canonical_message
+    third = ingest_bytes(config, b"From: a\r\n\r\nthird", "test").canonical_message
+    broken.local_path.unlink()
+    completed = reconcile_pending(config, adapter=_Adapter(ClassificationResult("ham", 0, "clean")))
+    assert set(completed) == {first.id, third.id}
+    with connect(config.database.path) as db:
+        states = {
+            str(row[0]): str(row[1])
+            for row in db.execute("SELECT id,storage_state FROM canonical_messages")
+        }
+    assert states == {first.id: "archived", broken.id: "pending", third.id: "archived"}
+
+
 def test_transition_audit_matches_actual_state_change(config_file: Path) -> None:
     config = load_config(config_file)
     pending = ingest_bytes(config, b"From: a\r\n\r\nx", "test").canonical_message

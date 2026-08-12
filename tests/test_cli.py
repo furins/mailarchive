@@ -9,9 +9,11 @@ import yaml
 
 import mailarchive.cli as cli_module
 import mailarchive.gmail as gmail_module
+from mailarchive.classification import ClassificationResult, apply_classification
 from mailarchive.cli import build_parser, main
 from mailarchive.config import load_config
 from mailarchive.db import account_id, connect, initialize
+from mailarchive.ingest import ingest_bytes
 
 
 def test_cli_help_works(capsys: pytest.CaptureFixture[str]) -> None:
@@ -56,6 +58,44 @@ def test_search_scope_is_forwarded_without_lifecycle_query_parsing(
         == 0
     )
     assert seen == {"query": "tag:quarantine", "scope": "quarantine"}
+
+
+def test_status_and_quarantine_list_are_local_and_use_effective_counts(
+    config_file: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(config_file)
+    pending = ingest_bytes(config, b"From: a\r\n\r\npending", "test").canonical_message
+    spam = apply_classification(
+        config,
+        ingest_bytes(config, b"From: a\r\n\r\nspam", "test").canonical_message,
+        ClassificationResult("spam", 9, "classifier-timeout"),
+    )
+    apply_classification(
+        config, spam, ClassificationResult("suspect", 5, "operator", "manual"), manual=True
+    )
+    def no_notmuch(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("notmuch")
+
+    monkeypatch.setattr(cli_module, "NotmuchAdapter", no_notmuch)
+    assert main(["status", "--config", str(config_file), "--json"]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["lifecycle_counts"] == {"pending": 1, "quarantined": 1}
+    assert status["quarantine_counts"] == {"suspect": 1}
+    assert status["classifier_failure_event_count"] == 1
+    assert main(["quarantine", "list", "--config", str(config_file), "--json"]) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert rows == [
+        {
+            "account": "test",
+            "canonical_id": spam.id,
+            "classification": "suspect",
+            "classified_at": rows[0]["classified_at"],
+            "local_path": str(spam.local_path),
+            "quarantined_at": rows[0]["quarantined_at"],
+            "score": 5.0,
+        }
+    ]
+    assert pending.id != spam.id
 
 
 def test_gmail_status_uninitialized_is_local_and_not_started(

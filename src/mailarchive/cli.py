@@ -186,9 +186,12 @@ def main(argv: list[str] | None = None) -> int:
                                 WHERE c.storage_state='quarantined' GROUP BY x.classification"""
                             )
                         }
-                        classifier_failure_count = int(connection.execute(
-                            "SELECT COUNT(*) FROM audit_events WHERE event_type='classification.failed'"
-                        ).fetchone()[0])
+                        classifier_failure_count = int(
+                            connection.execute(
+                                "SELECT COUNT(*) FROM audit_events "
+                                "WHERE event_type='classification.failed' AND result='fail-safe'"
+                            ).fetchone()[0]
+                        )
             health = [record.__dict__ for record in fast_path_status(config)] if initialized else []
             gmail_status: list[dict[str, object]] = [
                 {
@@ -325,7 +328,7 @@ def main(argv: list[str] | None = None) -> int:
                 rows = connection.execute("""SELECT c.id AS canonical_id,a.name AS account,c.local_path,c.quarantined_at,x.classification,x.score,x.classified_at
                     FROM canonical_messages c JOIN accounts a ON a.id=c.account_id
                     LEFT JOIN classifications x ON x.id=(SELECT id FROM classifications WHERE canonical_message_id=c.id ORDER BY manual_override DESC,id DESC LIMIT 1)
-                    WHERE c.storage_state='quarantined' ORDER BY c.quarantined_at DESC""").fetchall()
+                    WHERE c.storage_state='quarantined' ORDER BY c.quarantined_at DESC,c.id""").fetchall()
             _emit([dict(row) for row in rows], args.json)
             return 0
         if args.command == "classify":
