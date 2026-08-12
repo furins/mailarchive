@@ -25,11 +25,13 @@ from mailarchive.gmail import (
     GmailHistoryExpired,
     GmailIdentityConflict,
     GmailResponseError,
+    GmailSyncResult,
     GmailTransientError,
     GmailWatcher,
     _ManagedGmailSession,  # pyright: ignore[reportPrivateUsage]
     authorize,
     decode_raw,
+    gmail_lock,
     load_credentials,
 )
 from mailarchive.ingest import ingest_bytes
@@ -917,3 +919,85 @@ def test_same_provider_id_conflict_preserves_existing_link(tmp_path: Path) -> No
             db.execute("SELECT canonical_message_id FROM remote_canonical_links").fetchone()[0]
             == before
         )
+        assert db.execute("SELECT COUNT(*) FROM remote_canonical_links").fetchone()[0] == 1
+        assert (
+            db.execute("SELECT sha256 FROM canonical_messages WHERE id=?", (before,)).fetchone()[0]
+            == hashlib.sha256(b"Message-ID: <a>\r\n\r\nA").hexdigest()
+        )
+
+
+class _WatcherEvent:
+    def __init__(self, cycles: int) -> None:
+        self.cycles, self.calls = cycles, 0
+
+    def is_set(self) -> bool:
+        return self.calls >= self.cycles
+
+    def wait(self, _seconds: float) -> bool:
+        self.calls += 1
+        return self.is_set()
+
+
+def test_watcher_run_loop_degrades_recovers_and_releases_lock(tmp_path: Path) -> None:
+    config = load_config(_gmail_config(tmp_path))
+
+    class Adapter:
+        def __init__(self) -> None:
+            self.values: list[object] = [
+                GmailTransientError("x"),
+                GmailTransientError("x"),
+                GmailSyncResult("partial"),
+            ]
+
+        def _account(self, _name: str) -> object:
+            return config.accounts[0]
+
+        def sync(self, _name: str) -> GmailSyncResult:
+            value = self.values.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return cast(GmailSyncResult, value)
+
+    watcher = GmailWatcher(
+        config,
+        "gmail",
+        cast(threading.Event, _WatcherEvent(3)),
+        adapter=cast(GmailAdapter, Adapter()),
+        refresh=lambda: None,
+    )
+    watcher.run()
+    with connect(config.database.path) as db:
+        assert tuple(
+            db.execute("SELECT mode,consecutive_failures FROM fast_path_health").fetchone()
+        ) == ("stopped", 0)
+    with gmail_lock(config, config.accounts[0], "watch"):
+        with gmail_lock(config, config.accounts[0], "sync"):
+            pass
+
+
+def test_watcher_auth_failure_stops_after_one_poll(tmp_path: Path) -> None:
+    config = load_config(_gmail_config(tmp_path))
+
+    class Adapter:
+        calls = 0
+
+        def _account(self, _name: str) -> object:
+            return config.accounts[0]
+
+        def sync(self, _name: str) -> GmailSyncResult:
+            self.calls += 1
+            raise GmailAuthError("safe")
+
+    adapter = Adapter()
+    watcher = GmailWatcher(
+        config,
+        "gmail",
+        cast(threading.Event, _WatcherEvent(5)),
+        adapter=cast(GmailAdapter, adapter),
+    )
+    watcher.run()
+    with connect(config.database.path) as db:
+        assert tuple(
+            db.execute("SELECT mode,last_error_kind FROM fast_path_health").fetchone()
+        ) == ("stopped", "authentication")
+    assert adapter.calls == 1
