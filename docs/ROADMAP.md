@@ -155,6 +155,10 @@ Deliver:
 
 Canonical email remains unchanged.
 
+Implemented local-only with decoded-MIME SHA-256 blobs under `attachments/sha256`, a
+v9 SQLite relationship catalog, explicit extraction reconciliation, and a managed,
+rebuildable Recoll index. Attachment query visibility is lifecycle-filtered by SQLite.
+
 ## M9 — Borg backup and verification
 
 Deliver:

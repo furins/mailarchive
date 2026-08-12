@@ -133,3 +133,20 @@ canonical paths. Recoll remains planned for later attachment-content searching.
 Remote deletion is a separate, late-stage capability and is impossible unless all deletion-safety predicates pass.
 
 See `docs/SAFETY.md`.
+
+## M8 attachment content search
+
+Run the local slow worker separately from acquisition:
+
+```bash
+uv run mailarchive attachments extract --config ./your-config.yaml --json
+uv run mailarchive attachments index refresh --config ./your-config.yaml --json
+uv run mailarchive attachments search 'invoice-token' --scope archived --config ./your-config.yaml --json
+```
+
+The worker reads canonical bytes but never modifies them. It stores decoded MIME attachment
+payloads globally at `<archive.root>/attachments/sha256/<prefix>/<sha256>` and treats filenames as
+untrusted metadata. Recoll indexes only that store with its managed config at
+`state/recoll/config`; its database at `state/recoll/db` can be rebuilt. Search defaults to
+archived relationships and SQLite authoritatively enforces `archived`, `quarantine`, or `all`
+scope. No M8 command contacts a mail provider or performs remote mutation.

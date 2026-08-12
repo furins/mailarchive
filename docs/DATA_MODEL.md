@@ -141,10 +141,13 @@ Represents attachment content identity.
 id
 sha256
 size_bytes
-mime_type
 content_path
 first_seen_at
 ```
+
+`id` and `sha256` are the SHA-256 of the decoded MIME part payload. There is no
+authoritative content-level declared MIME type: the same bytes can be presented with
+different MIME declarations by different messages.
 
 ## 9. message_attachments
 
@@ -154,9 +157,16 @@ attachment_id
 part_index
 filename_original
 content_disposition
+declared_mime_type
 ```
 
 Extraction failure SHALL not damage the canonical message.
+
+## 9. attachment_extractions (M8)
+
+This per-canonical reconciliation marker distinguishes a message successfully scanned
+with zero attachments from one never processed. `failed` stores only a bounded error
+category; `source_sha256` ties the derivation to the immutable canonical input.
 
 ## 10. backup_repositories
 
