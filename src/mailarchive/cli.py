@@ -163,6 +163,15 @@ def main(argv: list[str] | None = None) -> int:
                                 (aid, aid),
                             ).fetchone()
                         )
+                        watcher = (
+                            None
+                            if aid is None
+                            else connection.execute(
+                                "SELECT mode,last_heartbeat_at,last_index_succeeded_at,index_pending,last_error_kind "
+                                "FROM fast_path_health WHERE account_id=? AND remote_folder='__GMAIL__'",
+                                (aid,),
+                            ).fetchone()
+                        )
                         gmail_status.append(
                             {
                                 "account": account.name,
@@ -183,9 +192,25 @@ def main(argv: list[str] | None = None) -> int:
                                 "known_provider_messages": int(counts[0] or 0),
                                 "remote_present_provider_messages": int(counts[1] or 0),
                                 "known_labels": int(counts[2] or 0),
+                                "watcher_mode": None if watcher is None else watcher["mode"],
+                                "last_heartbeat": None
+                                if watcher is None
+                                else watcher["last_heartbeat_at"],
+                                "last_successful_index": None
+                                if watcher is None
+                                else watcher["last_index_succeeded_at"],
+                                "index_pending": False
+                                if watcher is None
+                                else bool(watcher["index_pending"]),
                                 "last_safe_error_category": None
-                                if state is None
-                                else state["last_error_kind"],
+                                if state is None and watcher is None
+                                else (
+                                    state["last_error_kind"]
+                                    if state is not None and state["last_error_kind"]
+                                    else watcher["last_error_kind"]
+                                    if watcher is not None
+                                    else None
+                                ),
                             }
                         )
             _emit(

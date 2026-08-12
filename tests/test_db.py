@@ -61,6 +61,57 @@ def test_m3_schema_v4_upgrades_to_v5_without_changing_remote_links(
         )
 
 
+def test_real_v5_to_v6_preserves_imap_identity_links_and_health(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(config_file)
+    original = database.MIGRATIONS
+    monkeypatch.setattr(database, "MIGRATIONS", original[:5])
+    initialize(config.database.path, config.accounts)
+    now = utc_now()
+    with connect(config.database.path) as db:
+        aid = int(db.execute("SELECT id FROM accounts WHERE name='test'").fetchone()[0])
+        db.execute(
+            "INSERT INTO canonical_messages VALUES (?, ?, ?, ?, 1, NULL, NULL, ?, ?, 'verified', ?, ?)",
+            ("canonical", aid, "a" * 64, "/tmp/a.eml", now, now, now, now),
+        )
+        db.execute(
+            "INSERT INTO remote_messages VALUES (?, ?, 'INBOX', 9, 7, NULL, ?, ?, 1, 'proven')",
+            ("unchanged-id", aid, now, now),
+        )
+        db.execute(
+            "INSERT INTO remote_canonical_links VALUES (?, 'canonical', 'imap-uid-body-peek', ?)",
+            ("unchanged-id", now),
+        )
+        db.execute(
+            "INSERT INTO fast_path_health(account_id,remote_folder,mode,consecutive_failures,reconnect_count,index_pending,updated_at) VALUES (?, 'INBOX', 'idle', 2, 3, 1, ?)",
+            (aid, now),
+        )
+        db.commit()
+    monkeypatch.setattr(database, "MIGRATIONS", original)
+    initialize(config.database.path, config.accounts)
+    initialize(config.database.path, config.accounts)
+    with connect(config.database.path) as db:
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 6
+        assert tuple(
+            db.execute(
+                "SELECT id,provider_kind,remote_folder,uidvalidity,remote_uid FROM remote_messages"
+            ).fetchone()
+        ) == ("unchanged-id", "imap", "INBOX", 9, 7)
+        assert tuple(
+            db.execute(
+                "SELECT remote_message_id,canonical_message_id FROM remote_canonical_links"
+            ).fetchone()
+        ) == ("unchanged-id", "canonical")
+        assert tuple(
+            db.execute(
+                "SELECT mode,consecutive_failures,reconnect_count,index_pending FROM fast_path_health"
+            ).fetchone()
+        ) == ("idle", 2, 3, 1)
+        assert db.execute("SELECT name FROM sqlite_master WHERE name='gmail_labels'").fetchone()
+        assert not db.execute("PRAGMA foreign_key_check").fetchall()
+
+
 def test_foreign_keys_are_enabled(config_file: Path) -> None:
     config = load_config(config_file)
     initialize(config.database.path)

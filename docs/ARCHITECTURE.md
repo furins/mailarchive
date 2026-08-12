@@ -241,6 +241,11 @@ It polls history every 90 seconds by default and refreshes notmuch after watcher
 RAW endpoint bytes pass unchanged to canonical ingest. Gmail IMAP, Pub/Sub, and mailbox mutation
 are not implemented.
 
+Full Gmail reconciliation obtains a pre-scan history anchor from a recent `messages.get` Message
+resource (never from `messages.list`), scans all pages, then replays history from that anchor
+before it marks absence or commits the durable checkpoint. An empty mailbox has no invented
+checkpoint and remains full-sync-required. `__GMAIL__` is the local-only fast-path health scope.
+
 ## 5. Slow-path scheduling
 
 Initial scheduling proposal:

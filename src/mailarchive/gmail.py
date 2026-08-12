@@ -19,7 +19,9 @@ from threading import Event
 from typing import Any, Protocol, cast
 
 import requests
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import AuthorizedSession
+from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
@@ -30,10 +32,10 @@ from mailarchive.models import AccountConfig, AppConfig
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 _WRITE_SCOPES = (
     "https://mail.google.com/",
-    "gmail.modify",
-    "gmail.compose",
-    "gmail.send",
-    "gmail.insert",
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/gmail.compose",
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.insert",
 )
 _BASE_URL = "https://gmail.googleapis.com/gmail/v1"
 
@@ -161,8 +163,8 @@ class GmailApiClient:
     def labels(self) -> dict[str, Any]:
         return self._get("labels.list", "labels")
 
-    def messages(self, page_token: str | None = None) -> dict[str, Any]:
-        params = {"maxResults": "500", "includeSpamTrash": "true"}
+    def messages(self, page_token: str | None = None, *, max_results: int = 500) -> dict[str, Any]:
+        params = {"maxResults": str(max_results), "includeSpamTrash": "true"}
         if page_token:
             params["pageToken"] = page_token
         return self._get("messages.list", "messages", params)
@@ -200,10 +202,28 @@ def _safe_token_file(path: Path, *, required: bool = True) -> None:
 def load_credentials(account: AccountConfig) -> Credentials:
     path = _token_path(account)
     _safe_token_file(path)
-    credentials = Credentials.from_authorized_user_file(str(path), scopes=[GMAIL_READONLY_SCOPE])
-    scopes = credentials.scopes or []
-    if GMAIL_READONLY_SCOPE not in scopes or any(scope in _WRITE_SCOPES for scope in scopes):
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise GmailAuthError("Gmail authorized-user token file is invalid") from error
+    if not isinstance(payload, dict):
+        raise GmailAuthError("Gmail authorized-user token file is invalid")
+    stored_scopes = payload.get("scopes")
+    if not isinstance(stored_scopes, list) or not all(
+        isinstance(item, str) for item in stored_scopes
+    ):
+        raise GmailAuthError("Gmail authorized-user token scopes cannot be proven readonly")
+    gmail_scopes = {
+        scope
+        for scope in stored_scopes
+        if scope.startswith("https://www.googleapis.com/auth/gmail")
+        or scope == "https://mail.google.com/"
+    }
+    if gmail_scopes != {GMAIL_READONLY_SCOPE} or any(
+        scope in _WRITE_SCOPES for scope in gmail_scopes
+    ):
         raise GmailAuthError("stored Gmail credential scope is not readonly")
+    credentials = Credentials.from_authorized_user_file(str(path))
     return credentials
 
 
@@ -317,7 +337,24 @@ class GmailAdapter:
         return account
 
     def _authorized_client(self, account: AccountConfig) -> GmailApiClient:
-        return GmailApiClient(AuthorizedSession(load_credentials(account)))
+        credentials = load_credentials(account)
+        if not credentials.valid:
+            try:
+                credentials.refresh(GoogleRequest())
+            except RefreshError as error:
+                raise GmailAuthError("Gmail OAuth refresh failed") from error
+            # Re-validate before persistence; never let a refresh broaden mailbox privilege.
+            serialized = credentials.to_json()
+            try:
+                scopes = json.loads(serialized).get("scopes")
+            except AttributeError, json.JSONDecodeError:
+                raise GmailAuthError(
+                    "refreshed Gmail credentials cannot prove readonly scope"
+                ) from None
+            if not isinstance(scopes, list) or set(scopes) != {GMAIL_READONLY_SCOPE}:
+                raise GmailAuthError("refreshed Gmail credentials are not readonly")
+            _write_token(_token_path(account), serialized)
+        return GmailApiClient(AuthorizedSession(credentials))
 
     def _verify(self, client: GmailApiClient, account: AccountConfig) -> None:
         assert account.gmail is not None
@@ -457,15 +494,46 @@ class GmailAdapter:
                 account.name,
                 source_kind="gmail-api-raw",
             )
-        _, updated = self._register(aid, response, result, labels)
+        try:
+            _, updated = self._register(aid, response, result, labels)
+        except GmailResponseError as error:
+            if "unknown label" not in str(error):
+                raise
+            # A history event may race labels.list. Refresh once; never invent a label.
+            labels.clear()
+            labels.update(self._labels(client, aid))
+            _, updated = self._register(aid, response, result, labels)
         return (0 if known else 1, int(result.created) if result else 0, updated)
+
+    def _pre_scan_anchor(self, client: GmailApiClient) -> str | None:
+        """Get a usable historyId only from a Message resource, never messages.list."""
+        page = client.messages(max_results=1)
+        entries = page.get("messages", [])
+        if not isinstance(entries, list):
+            raise GmailResponseError("Gmail messages list malformed")
+        if not entries:
+            return None
+        first = entries[0]
+        if not isinstance(first, dict):
+            raise GmailResponseError("Gmail message list item malformed")
+        message = client.message(_valid_id(first.get("id"), "message id"), "minimal")
+        return _history(message.get("historyId"))
+
+    def _record_failure(self, aid: int, error: Exception) -> None:
+        kind = "authentication" if isinstance(error, GmailAuthError) else "provider"
+        with connect(self.config.database.path) as db:
+            db.execute(
+                "UPDATE gmail_sync_state SET full_sync_required=1,last_error_at=?,last_error_kind=?,updated_at=? WHERE account_id=?",
+                (utc_now(), kind, utc_now(), aid),
+            )
+            db.commit()
 
     def sync(self, account_name: str) -> GmailSyncResult:
         account = self._account(account_name)
         initialize(self.config.database.path, self.config.accounts)
         with gmail_lock(self.config, account, "sync"):
             client = self.client_factory(account)
-            self._verify(client, account)
+            labels: set[str] = set()
             with connect(self.config.database.path) as db:
                 aid = account_id(db, account_name)
                 assert aid is not None
@@ -477,28 +545,45 @@ class GmailAdapter:
                     "INSERT OR IGNORE INTO gmail_sync_state(account_id,updated_at) VALUES(?,?)",
                     (aid, utc_now()),
                 )
+                db.execute(
+                    "UPDATE gmail_sync_state SET last_sync_started_at=?,updated_at=? WHERE account_id=?",
+                    (utc_now(), utc_now(), aid),
+                )
                 db.commit()
-            labels = self._labels(client, aid)
-            if state is None or bool(state[1]) or state[0] is None:
-                return self._full(client, account, aid, labels)
             try:
+                self._verify(client, account)
+                labels = self._labels(client, aid)
+                if state is None or bool(state[1]) or state[0] is None:
+                    return self._full(client, account, aid, labels)
                 return self._partial(client, account, aid, labels, str(state[0]))
             except GmailHistoryExpired:
                 _audit(self.config, account_name, "gmail.history.expired", "safe-resync", {})
                 return self._full(client, account, aid, labels)
+            except GmailError as error:
+                self._record_failure(aid, error)
+                _audit(
+                    self.config,
+                    account_name,
+                    "gmail.sync.failed",
+                    "failed",
+                    {"error_kind": type(error).__name__},
+                )
+                raise
 
     def _full(
         self, client: GmailApiClient, account: AccountConfig, aid: int, labels: set[str]
     ) -> GmailSyncResult:
         _audit(self.config, account.name, "gmail.sync.full.started", "started", {})
+        anchor = self._pre_scan_anchor(client)
+        if anchor is None:
+            # Gmail does not provide a documented synthetic empty-mailbox history checkpoint.
+            return GmailSyncResult("full")
         seen: set[str] = set()
         token = None
         tokens: set[str] = set()
         fetched = created = updated = 0
-        anchor = None
         while True:
             page = client.messages(token)
-            anchor = page.get("historyId", anchor)
             entries = page.get("messages", [])
             if not isinstance(entries, list):
                 raise GmailResponseError("Gmail messages list malformed")
@@ -518,8 +603,8 @@ class GmailAdapter:
             if token in tokens:
                 raise GmailResponseError("Gmail messages pagination token repeated")
             tokens.add(token)
-        if anchor is not None:
-            anchor = _history(anchor)
+        # Catch up *before* inventory absence/checkpoint commit, closing list/history races.
+        catchup = self._partial(client, account, aid, labels, anchor, commit=False, audit=False)
         with connect(self.config.database.path) as db:
             db.execute("BEGIN IMMEDIATE")
             try:
@@ -534,7 +619,7 @@ class GmailAdapter:
                 )
                 db.execute(
                     "UPDATE gmail_sync_state SET history_id=?,full_sync_required=?,last_sync_succeeded_at=?,last_full_sync_succeeded_at=?,updated_at=? WHERE account_id=?",
-                    (anchor, 0 if anchor else 1, utc_now(), utc_now(), utc_now(), aid),
+                    (catchup.history_to, 0, utc_now(), utc_now(), utc_now(), aid),
                 )
             except BaseException:
                 db.rollback()
@@ -542,20 +627,38 @@ class GmailAdapter:
             else:
                 db.commit()
         result = GmailSyncResult(
-            "full", len(seen), fetched, 0, created, fetched - created, updated, absent, None, anchor
+            "full",
+            len(seen),
+            fetched + catchup.fetched_raw,
+            0,
+            created + catchup.imported,
+            fetched - created + catchup.canonical_reused,
+            updated + catchup.labels_updated,
+            absent + catchup.remote_marked_absent,
+            anchor,
+            catchup.history_to,
         )
         _audit(self.config, account.name, "gmail.sync.full.succeeded", "success", asdict(result))
         return result
 
     def _partial(
-        self, client: GmailApiClient, account: AccountConfig, aid: int, labels: set[str], start: str
+        self,
+        client: GmailApiClient,
+        account: AccountConfig,
+        aid: int,
+        labels: set[str],
+        start: str,
+        *,
+        commit: bool = True,
+        audit: bool = True,
     ) -> GmailSyncResult:
         affected: set[str] = set()
         deleted: set[str] = set()
         token = None
         tokens: set[str] = set()
         end = None
-        _audit(self.config, account.name, "gmail.sync.partial.started", "started", {})
+        if audit:
+            _audit(self.config, account.name, "gmail.sync.partial.started", "started", {})
         while True:
             page = client.history(start, token)
             end = page.get("historyId", end)
@@ -565,19 +668,19 @@ class GmailAdapter:
             for record in histories:
                 if not isinstance(record, dict):
                     raise GmailResponseError("Gmail history item malformed")
-                for key in ("messagesAdded", "labelsAdded", "labelsRemoved"):
-                    for change in record.get(key, []):
+                for key in ("messagesAdded", "labelsAdded", "labelsRemoved", "messagesDeleted"):
+                    changes = record.get(key, [])
+                    if not isinstance(changes, list):
+                        raise GmailResponseError("Gmail history collection is malformed")
+                    for change in changes:
                         if not isinstance(change, dict) or not isinstance(
                             change.get("message"), dict
                         ):
                             raise GmailResponseError("Gmail history change malformed")
-                        affected.add(_valid_id(change["message"].get("id"), "message id"))
-                for change in record.get("messagesDeleted", []):
-                    if not isinstance(change, dict) or not isinstance(change.get("message"), dict):
-                        raise GmailResponseError("Gmail deletion malformed")
-                    mid = _valid_id(change["message"].get("id"), "message id")
-                    affected.add(mid)
-                    deleted.add(mid)
+                        mid = _valid_id(change["message"].get("id"), "message id")
+                        affected.add(mid)
+                        if key == "messagesDeleted":
+                            deleted.add(mid)
             token = page.get("nextPageToken")
             if token is None:
                 break
@@ -601,12 +704,13 @@ class GmailAdapter:
             fetched += f
             created += c
             updated += u
-        with connect(self.config.database.path) as db:
-            db.execute(
-                "UPDATE gmail_sync_state SET history_id=?,full_sync_required=0,last_sync_succeeded_at=?,last_partial_sync_succeeded_at=?,updated_at=? WHERE account_id=?",
-                (end, utc_now(), utc_now(), utc_now(), aid),
-            )
-            db.commit()
+        if commit:
+            with connect(self.config.database.path) as db:
+                db.execute(
+                    "UPDATE gmail_sync_state SET history_id=?,full_sync_required=0,last_sync_succeeded_at=?,last_partial_sync_succeeded_at=?,updated_at=? WHERE account_id=?",
+                    (end, utc_now(), utc_now(), utc_now(), aid),
+                )
+                db.commit()
         result = GmailSyncResult(
             "partial",
             len(affected),
@@ -619,7 +723,10 @@ class GmailAdapter:
             start,
             end,
         )
-        _audit(self.config, account.name, "gmail.sync.partial.succeeded", "success", asdict(result))
+        if audit:
+            _audit(
+                self.config, account.name, "gmail.sync.partial.succeeded", "success", asdict(result)
+            )
         return result
 
 
@@ -640,14 +747,114 @@ class GmailWatcher:
         self.adapter = adapter or GmailAdapter(config)
         self.refresh = refresh
 
+    def _health(self, mode: str, **values: object) -> None:
+        allowed = {
+            "watcher_started_at",
+            "last_heartbeat_at",
+            "last_sync_started_at",
+            "last_sync_succeeded_at",
+            "last_index_succeeded_at",
+            "last_error_at",
+            "last_error_kind",
+            "consecutive_failures",
+            "index_pending",
+        }
+        updates = {key: value for key, value in values.items() if key in allowed}
+        initialize(self.config.database.path, self.config.accounts)
+        with connect(self.config.database.path) as db:
+            aid = account_id(db, self.account_name)
+            if aid is None:
+                raise GmailError("Gmail account is not active in local state")
+            columns = ["account_id", "remote_folder", "mode", "updated_at", *updates]
+            params = [aid, "__GMAIL__", mode, utc_now(), *updates.values()]
+            assignments = ", ".join(
+                f"{key}=excluded.{key}" for key in ["mode", "updated_at", *updates]
+            )
+            db.execute(
+                f"INSERT INTO fast_path_health ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)}) "
+                f"ON CONFLICT(account_id, remote_folder) DO UPDATE SET {assignments}",
+                params,
+            )
+            db.commit()
+
+    def _audit(self, event: str, result: str, details: dict[str, object]) -> None:
+        _audit(self.config, self.account_name, event, result, details)
+
+    def _index_pending(self) -> bool:
+        with connect(self.config.database.path) as db:
+            row = db.execute(
+                "SELECT index_pending FROM fast_path_health JOIN accounts ON accounts.id=fast_path_health.account_id WHERE accounts.name=? AND remote_folder='__GMAIL__'",
+                (self.account_name,),
+            ).fetchone()
+        return row is not None and bool(row[0])
+
+    def _refresh(self) -> bool:
+        if self.refresh is None:
+            return True
+        was_pending = self._index_pending()
+        try:
+            self.refresh()
+        except Exception:
+            self._health(
+                "degraded", index_pending=1, last_error_at=utc_now(), last_error_kind="indexing"
+            )
+            self._audit("gmail.fast_refresh.failed", "failed", {"error_kind": "indexing"})
+            return False
+        self._health(
+            "poll", index_pending=0, last_index_succeeded_at=utc_now(), consecutive_failures=0
+        )
+        if was_pending:
+            self._audit("gmail.fast_refresh.recovered", "success", {})
+        return True
+
     def run(self) -> None:
         account = self.adapter._account(self.account_name)
         with gmail_lock(self.config, account, "watch"):
-            while not self.stop_event.is_set():
-                try:
-                    self.adapter.sync(account.name)
-                    if self.refresh:
-                        self.refresh()
-                except GmailSyncBusyError:
-                    pass
-                self.stop_event.wait(account.gmail.poll_interval_seconds if account.gmail else 90)
+            self._health("poll", watcher_started_at=utc_now(), last_heartbeat_at=utc_now())
+            self._audit("gmail.watch.started", "started", {})
+            try:
+                while not self.stop_event.is_set():
+                    if self._index_pending():
+                        self._refresh()
+                    self._audit("gmail.watch.poll", "started", {})
+                    self._health("poll", last_sync_started_at=utc_now())
+                    try:
+                        result = self.adapter.sync(account.name)
+                    except GmailSyncBusyError:
+                        self._health("poll", last_error_at=utc_now(), last_error_kind="sync-busy")
+                    except GmailAuthError:
+                        self._health(
+                            "stopped", last_error_at=utc_now(), last_error_kind="authentication"
+                        )
+                        self._audit(
+                            "gmail.fast_sync.failed", "failed", {"error_kind": "authentication"}
+                        )
+                        return
+                    except GmailError:
+                        self._health(
+                            "degraded",
+                            last_error_at=utc_now(),
+                            last_error_kind="acquisition",
+                            consecutive_failures=1,
+                        )
+                        self._audit(
+                            "gmail.fast_sync.failed", "failed", {"error_kind": "acquisition"}
+                        )
+                    else:
+                        self._health(
+                            "poll",
+                            last_sync_succeeded_at=utc_now(),
+                            last_heartbeat_at=utc_now(),
+                            consecutive_failures=0,
+                        )
+                        self._audit("gmail.fast_sync.succeeded", "success", {"mode": result.mode})
+                        self._refresh()
+                    self._health(
+                        "degraded" if self._index_pending() else "poll", last_heartbeat_at=utc_now()
+                    )
+                    self.stop_event.wait(
+                        account.gmail.poll_interval_seconds if account.gmail else 90
+                    )
+            finally:
+                self._health("stopped", last_heartbeat_at=utc_now())
+                self._audit("gmail.watch.stopped", "stopped", {})

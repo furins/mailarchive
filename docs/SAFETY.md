@@ -149,6 +149,8 @@ Credentials and OAuth tokens SHALL:
 For M5 Gmail, OAuth token and client-secret files are absolute paths outside `archive.root`; token
 files must be 0600 and no token material is stored in SQLite or audit data. The production OAuth
 scope is `gmail.readonly` only.
+Stored authorized-user JSON must explicitly prove that Gmail scope; missing or Gmail write-capable
+scope metadata fails closed.
 
 ## 12. Testing destructive logic
 

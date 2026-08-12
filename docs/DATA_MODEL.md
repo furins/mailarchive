@@ -56,6 +56,7 @@ M5 generalizes this to `provider_kind`: IMAP retains folder+UIDVALIDITY+UID, Gma
 account+provider_message_id. `gmail_labels` is keyed by account+label_id and
 `gmail_message_labels` is a cross-account-safe relationship table. `gmail_sync_state` stores only
 opaque history checkpoints and local timestamps/error categories.
+The full-sync checkpoint is committed only after catch-up history replay succeeds.
 
 ## 4. canonical_messages
 
