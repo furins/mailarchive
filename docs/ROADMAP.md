@@ -140,6 +140,9 @@ Deliver:
 
 No automatic permanent deletion.
 
+M7 remains local-only: no provider mutation and no permanent deletion. It introduces staging,
+append-only classifications, fail-closed quarantine, manual local overrides, and rebuildable tags.
+
 ## M8 — Attachments and Recoll
 
 Deliver:

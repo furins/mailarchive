@@ -70,6 +70,8 @@ accounts:
 
 spam:
   enabled: true
+  classifier: rspamd
+  rspamd_endpoint: http://127.0.0.1:11333/checkv2
   suspect_quarantine_days: 365
   spam_quarantine_days: 180
   protect_known_contacts: true

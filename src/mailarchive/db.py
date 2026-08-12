@@ -1,4 +1,5 @@
 """SQLite connection and explicit M0 schema migrations."""
+# ruff: noqa: E501
 
 from __future__ import annotations
 
@@ -6,6 +7,7 @@ import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal, cast
 
 from mailarchive.models import AccountConfig, CanonicalMessage
 
@@ -365,6 +367,42 @@ def _migration_7(connection: sqlite3.Connection) -> None:
         WHERE provider_kind='pop3'""")
 
 
+def _migration_8(connection: sqlite3.Connection) -> None:
+    """M7 lifecycle state; pre-M7 rows were already admitted archive objects."""
+    connection.execute("""
+        CREATE TABLE canonical_messages_v8 (
+            id TEXT PRIMARY KEY, account_id INTEGER NOT NULL REFERENCES accounts(id),
+            sha256 TEXT NOT NULL CHECK(length(sha256)=64), local_path TEXT NOT NULL UNIQUE,
+            size_bytes INTEGER NOT NULL CHECK(size_bytes>=0), message_id_header TEXT,
+            message_date TEXT, downloaded_at TEXT NOT NULL, archived_at TEXT,
+            storage_state TEXT NOT NULL CHECK(storage_state IN ('pending','archived','quarantined')),
+            quarantined_at TEXT, integrity_status TEXT NOT NULL CHECK(integrity_status IN ('verified','failed')),
+            integrity_verified_at TEXT, created_at TEXT NOT NULL, UNIQUE(account_id, sha256),
+            CHECK(
+                (storage_state='pending' AND archived_at IS NULL AND quarantined_at IS NULL)
+                OR (storage_state='archived' AND archived_at IS NOT NULL)
+                OR (storage_state='quarantined' AND quarantined_at IS NOT NULL)
+            )
+        )""")
+    connection.execute("""INSERT INTO canonical_messages_v8(
+        id,account_id,sha256,local_path,size_bytes,message_id_header,message_date,downloaded_at,
+        archived_at,storage_state,quarantined_at,integrity_status,integrity_verified_at,created_at)
+        SELECT id,account_id,sha256,local_path,size_bytes,message_id_header,message_date,downloaded_at,
+        archived_at,'archived',NULL,integrity_status,integrity_verified_at,created_at FROM canonical_messages""")
+    connection.execute("DROP TABLE canonical_messages")
+    connection.execute("ALTER TABLE canonical_messages_v8 RENAME TO canonical_messages")
+    connection.execute("""CREATE TABLE classifications (
+        id INTEGER PRIMARY KEY, canonical_message_id TEXT NOT NULL REFERENCES canonical_messages(id),
+        classification TEXT NOT NULL CHECK(classification IN ('ham','suspect','spam')),
+        score REAL, reason TEXT NOT NULL CHECK(length(reason)<=256), classifier TEXT NOT NULL CHECK(length(classifier)<=128),
+        classifier_version TEXT, manual_override INTEGER NOT NULL DEFAULT 0 CHECK(manual_override IN (0,1)),
+        classified_at TEXT NOT NULL)""")
+    connection.execute(
+        "CREATE INDEX classifications_effective ON classifications(canonical_message_id, manual_override, id DESC)"
+    )
+    connection.execute("CREATE INDEX canonical_messages_state ON canonical_messages(storage_state)")
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _migration_1),
     (2, _migration_2),
@@ -373,6 +411,7 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (5, _migration_5),
     (6, _migration_6),
     (7, _migration_7),
+    (8, _migration_8),
 )
 
 
@@ -392,8 +431,13 @@ def connect(path: Path) -> sqlite3.Connection:
 
 def _apply_migration(connection: sqlite3.Connection, version: int, migration: Migration) -> None:
     """Apply one migration and its version record as one SQLite transaction."""
-    connection.execute("BEGIN IMMEDIATE")
+    # M7 rebuilds canonical_messages to make archived_at nullable.  SQLite cannot
+    # drop a referenced table with FK enforcement enabled, even inside a transaction.
+    rebuilds_canonical = version == 8
     try:
+        if rebuilds_canonical:
+            connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("BEGIN IMMEDIATE")
         migration(connection)
         connection.execute(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
@@ -404,6 +448,9 @@ def _apply_migration(connection: sqlite3.Connection, version: int, migration: Mi
         raise
     else:
         connection.commit()
+    finally:
+        if rebuilds_canonical:
+            connection.execute("PRAGMA foreign_keys = ON")
 
 
 def initialize(path: Path, accounts: tuple[AccountConfig, ...] = ()) -> None:
@@ -481,7 +528,7 @@ def canonical_message_by_account_and_sha256(
     row = connection.execute(
         """
         SELECT id, account_id, sha256, local_path, size_bytes, message_id_header, message_date,
-               downloaded_at, archived_at, integrity_status, integrity_verified_at, created_at
+               downloaded_at, archived_at, storage_state, quarantined_at, integrity_status, integrity_verified_at, created_at
         FROM canonical_messages WHERE account_id = ? AND sha256 = ?
         """,
         (account_id, sha256),
@@ -499,11 +546,47 @@ def canonical_message_by_account_and_sha256(
         ),
         message_date=None if row["message_date"] is None else str(row["message_date"]),
         downloaded_at=str(row["downloaded_at"]),
-        archived_at=str(row["archived_at"]),
+        archived_at=None if row["archived_at"] is None else str(row["archived_at"]),
+        storage_state=cast(Literal["pending", "archived", "quarantined"], row["storage_state"]),
+        quarantined_at=None if row["quarantined_at"] is None else str(row["quarantined_at"]),
         integrity_status=str(row["integrity_status"]),
         integrity_verified_at=(
             None if row["integrity_verified_at"] is None else str(row["integrity_verified_at"])
         ),
+        created_at=str(row["created_at"]),
+    )
+
+
+def canonical_message_by_id(
+    connection: sqlite3.Connection, identifier: str
+) -> CanonicalMessage | None:
+    """Resolve one authoritative canonical row for local-only lifecycle workers."""
+    row = connection.execute(
+        """SELECT id, account_id, sha256, local_path, size_bytes, message_id_header, message_date,
+        downloaded_at, archived_at, storage_state, quarantined_at, integrity_status,
+        integrity_verified_at, created_at FROM canonical_messages WHERE id=?""",
+        (identifier,),
+    ).fetchone()
+    if row is None:
+        return None
+    return CanonicalMessage(
+        id=str(row["id"]),
+        account_id=int(row["account_id"]),
+        sha256=str(row["sha256"]),
+        local_path=Path(str(row["local_path"])),
+        size_bytes=int(row["size_bytes"]),
+        message_id_header=None
+        if row["message_id_header"] is None
+        else str(row["message_id_header"]),
+        message_date=None if row["message_date"] is None else str(row["message_date"]),
+        downloaded_at=str(row["downloaded_at"]),
+        archived_at=None if row["archived_at"] is None else str(row["archived_at"]),
+        storage_state=cast(Literal["pending", "archived", "quarantined"], row["storage_state"]),
+        quarantined_at=None if row["quarantined_at"] is None else str(row["quarantined_at"]),
+        integrity_status=str(row["integrity_status"]),
+        integrity_verified_at=None
+        if row["integrity_verified_at"] is None
+        else str(row["integrity_verified_at"]),
         created_at=str(row["created_at"]),
     )
 
@@ -528,9 +611,9 @@ def register_canonical_message(
                     """
                     INSERT INTO canonical_messages(
                         id, account_id, sha256, local_path, size_bytes, message_id_header,
-                        message_date, downloaded_at, archived_at, integrity_status,
+                        message_date, downloaded_at, archived_at, storage_state, quarantined_at, integrity_status,
                         integrity_verified_at, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         message.id,
@@ -542,6 +625,8 @@ def register_canonical_message(
                         message.message_date,
                         message.downloaded_at,
                         message.archived_at,
+                        message.storage_state,
+                        message.quarantined_at,
                         message.integrity_status,
                         message.integrity_verified_at,
                         message.created_at,

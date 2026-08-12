@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -12,13 +13,14 @@ import yaml
 import mailarchive.notmuch as notmuch_module
 from mailarchive.config import load_config
 from mailarchive.db import connect
-from mailarchive.ingest import ingest_file, verify_canonical_message
+from mailarchive.ingest import ingest_bytes, ingest_file, verify_canonical_message
 from mailarchive.models import AppConfig
 from mailarchive.notmuch import (
     COMMAND_TIMEOUT_SECONDS,
     REFRESH_TIMEOUT_SECONDS,
     NotmuchAdapter,
     NotmuchError,
+    SearchScope,
     isolated_notmuch_environment,
     managed_config_text,
     managed_layout,
@@ -53,8 +55,10 @@ def _add_account(config_file: Path, name: str) -> None:
     config_file.write_text(yaml.safe_dump(values), encoding="utf-8")
 
 
-def _result_ids(config: AppConfig, query: str) -> list[str]:
-    return [item.canonical_message.id for item in search_canonical_messages(config, query)]
+def _result_ids(config: AppConfig, query: str, *, scope: SearchScope = "archived") -> list[str]:
+    return [
+        item.canonical_message.id for item in search_canonical_messages(config, query, scope=scope)
+    ]
 
 
 def test_managed_configuration_is_deterministic_and_separate(config_file: Path) -> None:
@@ -62,8 +66,10 @@ def test_managed_configuration_is_deterministic_and_separate(config_file: Path) 
     layout = write_managed_config(config)
     contents = layout.config_path.read_text(encoding="utf-8")
     assert layout.mail_root == config.archive.root.resolve() / "mail"
-    assert layout.database_path == config.archive.root.resolve() / "state" / "notmuch" / "db"
+    assert layout.database_path == config.archive.root.resolve() / "state" / "notmuch" / "archive"
     assert not layout.database_path.is_relative_to(layout.mail_root)
+    assert "ignore=state;attachments;metadata;logs" in contents
+    assert "exclude_tags=quarantine" not in contents
     assert f"mail_root={layout.mail_root}" in contents
     assert f"path={layout.database_path}" in contents
     assert f"hook_dir={layout.hook_directory}" in contents
@@ -71,6 +77,11 @@ def test_managed_configuration_is_deterministic_and_separate(config_file: Path) 
     assert "decrypt=false" in contents
     assert "tags=archive" in contents
     assert "inbox" not in contents
+    quarantine_layout = managed_layout(config, "quarantine")
+    assert layout.config_path != quarantine_layout.config_path
+    assert layout.database_path != quarantine_layout.database_path
+    assert layout.hook_directory != quarantine_layout.hook_directory
+    assert "mail_root=" + str(quarantine_layout.mail_root) in managed_config_text(quarantine_layout)
     assert "unread" not in contents
     assert contents == managed_config_text(layout)
 
@@ -331,3 +342,201 @@ def test_duplicate_message_ids_and_accounts_remain_canonical(
     assert shared_other.canonical_message.local_path.read_bytes() == shared_bytes
     with connect(config.database.path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM canonical_messages").fetchone()[0] == 4
+
+
+@pytest.mark.skipif(shutil.which("notmuch") is None, reason="requires locally installed notmuch")
+def test_collision_lifecycle_visibility_is_filtered_by_sqlite(
+    config_file: Path, tmp_path: Path
+) -> None:
+    """A shared Message-ID has aggregate tags but independent canonical visibility."""
+    config = load_config(config_file)
+    ham = tmp_path / "ham.eml"
+    spam = tmp_path / "spam.eml"
+    _write_message(
+        ham,
+        message_id="<collision@example.test>",
+        subject="collision",
+        body="ham-token",
+        sender="c@example.test",
+    )
+    _write_message(
+        spam,
+        message_id="<collision@example.test>",
+        subject="collision",
+        body="spam-token",
+        sender="c@example.test",
+    )
+    first = ingest_file(config, ham, "test").canonical_message
+    from mailarchive.classification import ClassificationResult, apply_classification
+
+    second_pending = ingest_bytes(config, spam.read_bytes(), "test").canonical_message
+    second = apply_classification(
+        config, second_pending, ClassificationResult("spam", 9, "test-spam")
+    )
+    assert first.id != second.id and first.sha256 != second.sha256
+    adapter = NotmuchAdapter(config)
+    adapter.refresh()
+    assert _result_ids(config, "collision") == [first.id]
+    assert _result_ids(config, "collision", scope="quarantine") == [second.id]
+    assert set(_result_ids(config, "collision", scope="all")) == {first.id, second.id}
+    tags = adapter._run(  # pyright: ignore[reportPrivateUsage]
+        ["search", "--exclude=false", "--output=tags", "--", "id:collision@example.test"]
+    )
+    assert {"ham"}.issubset(set(tags.stdout.split()))
+    quarantine_tags = NotmuchAdapter(config, kind="quarantine")._run(  # pyright: ignore[reportPrivateUsage]
+        ["search", "--exclude=false", "--output=tags", "--", "id:collision@example.test"]
+    )
+    assert {"quarantine", "spam"}.issubset(set(quarantine_tags.stdout.split()))
+    shutil.rmtree(managed_layout(config, "archive").database_path)
+    shutil.rmtree(managed_layout(config, "quarantine").database_path)
+    adapter.refresh()
+    NotmuchAdapter(config, kind="quarantine").refresh()
+    assert _result_ids(config, "collision") == [first.id]
+    assert _result_ids(config, "collision", scope="quarantine") == [second.id]
+
+
+@pytest.mark.skipif(shutil.which("notmuch") is None, reason="requires locally installed notmuch")
+def test_split_indexes_isolate_collision_query_terms(config_file: Path, tmp_path: Path) -> None:
+    """Notmuch emits duplicate filenames for one matching Message-ID group."""
+    config = load_config(config_file)
+    ham = tmp_path / "ham.eml"
+    spam = tmp_path / "spam.eml"
+    _write_message(
+        ham,
+        message_id="<query-collision@example.test>",
+        subject="same",
+        body="ham-only-token",
+        sender="c@example.test",
+    )
+    _write_message(
+        spam,
+        message_id="<query-collision@example.test>",
+        subject="same",
+        body="spam-only-token",
+        sender="c@example.test",
+    )
+    first = ingest_file(config, ham, "test").canonical_message
+    from mailarchive.classification import ClassificationResult, apply_classification
+
+    second = apply_classification(
+        config,
+        ingest_bytes(config, spam.read_bytes(), "test").canonical_message,
+        ClassificationResult("spam", 9, "test"),
+    )
+    NotmuchAdapter(config, kind="archive").refresh()
+    NotmuchAdapter(config, kind="quarantine").refresh()
+    assert _result_ids(config, "body:ham-only-token") == [first.id]
+    assert _result_ids(config, "body:ham-only-token", scope="quarantine") == []
+    assert _result_ids(config, "body:spam-only-token") == []
+    assert _result_ids(config, "body:spam-only-token", scope="quarantine") == [second.id]
+    assert _result_ids(config, "body:spam-only-token", scope="all") == [second.id]
+
+
+@pytest.mark.skipif(shutil.which("notmuch") is None, reason="requires locally installed notmuch")
+def test_no_message_id_uses_characterized_notmuch_sha1_id(
+    config_file: Path, tmp_path: Path
+) -> None:
+    config = load_config(config_file)
+    raw = b"From: no-id@example.test\r\nSubject: no id\r\n\r\nno-id-token\r\n"
+    source = tmp_path / "no-id.eml"
+    source.write_bytes(raw)
+    ham = ingest_file(config, source, "test").canonical_message
+    adapter = NotmuchAdapter(config, kind="archive")
+    adapter.refresh()
+    expected = "notmuch-sha1-" + hashlib.sha1(raw, usedforsecurity=False).hexdigest()
+    output = adapter._run(  # pyright: ignore[reportPrivateUsage]
+        ["search", "--exclude=false", "--output=messages", "--format=json", "--", "no-id-token"]
+    )
+    identifiers = json.loads(output.stdout)
+    assert identifiers == [expected]
+    assert adapter.search_files(f"id:{expected}") == [ham.local_path.resolve()]
+    tags = adapter._run(["search", "--output=tags", "--", f"id:{expected}"])  # pyright: ignore[reportPrivateUsage]
+    assert {"archive", "ham"}.issubset(set(tags.stdout.split()))
+    assert ham.local_path.read_bytes() == raw
+    from mailarchive.classification import ClassificationResult, apply_classification
+
+    spam_raw = b"From: no-id@example.test\r\nSubject: spam no id\r\n\r\nspam-no-id-token\r\n"
+    spam = apply_classification(
+        config,
+        ingest_bytes(config, spam_raw, "test").canonical_message,
+        ClassificationResult("spam", 9, "test"),
+    )
+    quarantine = NotmuchAdapter(config, kind="quarantine")
+    quarantine.refresh()
+    spam_id = "notmuch-sha1-" + hashlib.sha1(spam_raw, usedforsecurity=False).hexdigest()
+    assert quarantine.search_files(f"id:{spam_id}") == [spam.local_path.resolve()]
+    spam_tags = quarantine._run(["search", "--output=tags", "--", f"id:{spam_id}"])  # pyright: ignore[reportPrivateUsage]
+    assert {"archive", "quarantine", "spam"}.issubset(set(spam_tags.stdout.split()))
+    assert spam.local_path.read_bytes() == spam_raw
+    shutil.rmtree(managed_layout(config, "archive").database_path)
+    shutil.rmtree(managed_layout(config, "quarantine").database_path)
+    adapter.refresh()
+    quarantine.refresh()
+    assert adapter.search_files(f"id:{expected}") == [ham.local_path.resolve()]
+    assert quarantine.search_files(f"id:{spam_id}") == [spam.local_path.resolve()]
+    rebuilt_ham_tags = adapter._run(["search", "--output=tags", "--", f"id:{expected}"])  # pyright: ignore[reportPrivateUsage]
+    rebuilt_spam_tags = quarantine._run(["search", "--output=tags", "--", f"id:{spam_id}"])  # pyright: ignore[reportPrivateUsage]
+    assert {"archive", "ham"}.issubset(set(rebuilt_ham_tags.stdout.split()))
+    assert {"archive", "quarantine", "spam"}.issubset(set(rebuilt_spam_tags.stdout.split()))
+    assert ham.local_path.read_bytes() == raw and spam.local_path.read_bytes() == spam_raw
+
+
+@pytest.mark.skipif(shutil.which("notmuch") is None, reason="requires locally installed notmuch")
+def test_manual_override_moves_between_split_indexes_and_rebuilds(
+    config_file: Path, tmp_path: Path
+) -> None:
+    """Both derived indexes follow authoritative manual state after a rebuild."""
+    config = load_config(config_file)
+    raw = _write_message(
+        tmp_path / "override.eml",
+        message_id="<override@example.test>",
+        subject="override",
+        body="override-token",
+        sender="override@example.test",
+    )
+    from mailarchive.classification import ClassificationResult, apply_classification
+
+    spam = apply_classification(
+        config,
+        ingest_bytes(config, raw, "test").canonical_message,
+        ClassificationResult("spam", 9.0, "automatic"),
+    )
+    archive, quarantine = (
+        NotmuchAdapter(config, kind="archive"),
+        NotmuchAdapter(config, kind="quarantine"),
+    )
+    archive.refresh()
+    quarantine.refresh()
+    assert _result_ids(config, "override-token") == []
+    assert _result_ids(config, "override-token", scope="quarantine") == [spam.id]
+    ham = apply_classification(
+        config, spam, ClassificationResult("ham", 0.0, "operator"), manual=True
+    )
+    archive.refresh()
+    quarantine.refresh()
+    assert ham.id == spam.id and ham.sha256 == spam.sha256 and ham.local_path.read_bytes() == raw
+    assert _result_ids(config, "override-token") == [ham.id]
+    assert _result_ids(config, "override-token", scope="quarantine") == []
+    archive_tags = archive._run(  # pyright: ignore[reportPrivateUsage]
+        ["search", "--output=tags", "--", "id:override@example.test"]
+    )
+    assert {"archive", "ham"}.issubset(set(archive_tags.stdout.split()))
+    spam_again = apply_classification(
+        config, ham, ClassificationResult("spam", 9.0, "operator"), manual=True
+    )
+    archive.refresh()
+    quarantine.refresh()
+    assert spam_again.id == ham.id and spam_again.sha256 == ham.sha256
+    assert spam_again.local_path.read_bytes() == raw
+    assert _result_ids(config, "override-token") == []
+    assert _result_ids(config, "override-token", scope="quarantine") == [spam_again.id]
+    quarantine_tags = quarantine._run(  # pyright: ignore[reportPrivateUsage]
+        ["search", "--output=tags", "--", "id:override@example.test"]
+    )
+    assert {"archive", "quarantine", "spam"}.issubset(set(quarantine_tags.stdout.split()))
+    shutil.rmtree(managed_layout(config, "archive").database_path)
+    shutil.rmtree(managed_layout(config, "quarantine").database_path)
+    archive.refresh()
+    quarantine.refresh()
+    assert _result_ids(config, "override-token") == []
+    assert _result_ids(config, "override-token", scope="quarantine") == [spam_again.id]

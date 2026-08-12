@@ -93,7 +93,9 @@ class CanonicalMessage:
     message_id_header: str | None
     message_date: str | None
     downloaded_at: str
-    archived_at: str
+    archived_at: str | None
     integrity_status: str
     integrity_verified_at: str | None
     created_at: str
+    storage_state: Literal["pending", "archived", "quarantined"] = "archived"
+    quarantined_at: str | None = None

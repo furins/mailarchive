@@ -274,6 +274,9 @@ class FastPathWatcher:
         was_pending = self._index_pending()
         try:
             self.index_adapter.refresh()
+            # M7 keeps independent derived indexes; classification failure can
+            # safely quarantine a just-acquired message.
+            NotmuchAdapter(self.config, kind="quarantine").refresh()
         except Exception:
             self._health(
                 "degraded", index_pending=1, last_error_at=utc_now(), last_error_kind="indexing"

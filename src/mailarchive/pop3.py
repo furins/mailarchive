@@ -241,6 +241,9 @@ class Pop3Adapter:
         if not password:
             raise Pop3Error("missing POP3 credential environment variable")
         initialize(self.config.database.path, self.config.accounts)
+        from mailarchive.classification import reconcile_pending
+
+        reconcile_pending(self.config, account_name=account_name)
         client = _Pop3Wire(account.pop3)
         imported = reused = 0
         try:
@@ -270,6 +273,10 @@ class Pop3Adapter:
                     self.config, client.retr(number), account_name, source_kind="pop3-retr"
                 )
                 register_pop3_link(self.config, account_name, uidl, result.canonical_message)
+                if result.created:
+                    from mailarchive.classification import classify_pending
+
+                    classify_pending(self.config, result.canonical_message)
                 imported += int(result.created)
                 reused += int(not result.created)
             if "DELE" in client.commands:

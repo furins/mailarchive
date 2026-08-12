@@ -198,6 +198,38 @@ def test_sync_busy_stays_pending_but_index_failure_does_not_refetch(config_file:
     assert index.calls >= 2
 
 
+def test_split_index_failures_are_degraded_and_locally_recoverable(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure(config_file)
+    stop, log = threading.Event(), []
+    archive, quarantine = _Index(log), _Index(log, [RuntimeError(), None])
+    watcher = _watcher(config_file, [], log, stop, index=archive)
+    monkeypatch.setattr("mailarchive.fastpath.NotmuchAdapter", lambda *_a, **_k: quarantine)
+    watcher._health("idle")  # pyright: ignore[reportPrivateUsage]
+    assert not watcher._refresh_index("idle")  # pyright: ignore[reportPrivateUsage]
+    status = fast_path_status(load_config(config_file))[0]
+    assert status.index_pending and status.last_error_kind == "indexing"
+    assert watcher._refresh_index("idle")  # pyright: ignore[reportPrivateUsage]
+    status = fast_path_status(load_config(config_file))[0]
+    assert not status.index_pending and status.last_index_succeeded_at is not None
+
+
+def test_archive_index_failure_does_not_attempt_quarantine_or_sync(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure(config_file)
+    stop, log = threading.Event(), []
+    archive, quarantine = _Index(log, [RuntimeError()]), _Index(log)
+    watcher = _watcher(config_file, [], log, stop, index=archive)
+    monkeypatch.setattr("mailarchive.fastpath.NotmuchAdapter", lambda *_a, **_k: quarantine)
+    watcher._health("idle")  # pyright: ignore[reportPrivateUsage]
+    assert not watcher._refresh_index("idle")  # pyright: ignore[reportPrivateUsage]
+    assert archive.calls == 1 and quarantine.calls == 0
+    status = fast_path_status(load_config(config_file))[0]
+    assert status.index_pending and status.last_error_kind == "indexing"
+
+
 def test_status_is_local_and_stale_heartbeat_wins(
     config_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -76,12 +76,15 @@ message_id_header
 message_date
 downloaded_at
 archived_at
+storage_state             # pending | archived | quarantined
+quarantined_at
 integrity_status
 integrity_verified_at
 created_at
 ```
 
-`sha256` MAY be unique for canonical byte identity.
+`sha256` is account-scoped canonical byte identity. In M7, `archived_at` is nullable and is set
+only at first HAM promotion; a quarantined never-HAM object has no archive-admission timestamp.
 
 Multiple remote identities may map to one canonical object only where the mapping is proven safe.
 
@@ -111,6 +114,12 @@ classified_at
 ```
 
 The current effective classification may be calculated from latest/manual rules.
+The latest valid manual override wins; otherwise the latest automatic verdict wins. History is never
+rewritten for an override.
+
+notmuch classification tags are derived hints in independently indexed archive/quarantine domains.
+They are not a per-canonical classification, identity, retention, or deletion input; SQLite is the
+authoritative source for those facts.
 
 ## 7. protections
 

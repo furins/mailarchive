@@ -21,7 +21,12 @@ from mailarchive.config import load_config
 from mailarchive.db import connect
 from mailarchive.fastpath import FastPathWatcher, fast_path_status
 from mailarchive.imap import ImapAdapter, encode_mailbox_name
-from mailarchive.notmuch import NotmuchAdapter, NotmuchError, search_canonical_messages
+from mailarchive.notmuch import (
+    NotmuchAdapter,
+    NotmuchError,
+    SearchResult,
+    search_canonical_messages,
+)
 
 
 def _free_port() -> int:
@@ -244,7 +249,7 @@ def test_direct_loopback_acquisition_preserves_server_bytes(
     next_results = ImapAdapter(config).sync("test", "INBOX")
     assert len(next_results) == 1 and _snapshot(port)[1] == after
     NotmuchAdapter(config).refresh()
-    assert search_canonical_messages(config, "loopback two")
+    assert search_canonical_messages(config, "loopback two", scope="all")
 
 
 def _wait_until(predicate: Callable[[], bool], timeout: float = 10) -> None:
@@ -306,7 +311,7 @@ def test_dovecot_idle_fast_path_acquires_and_indexes_without_poll(
 
     def searchable() -> bool:
         try:
-            return bool(search_canonical_messages(config, "idle-distinctive-token"))
+            return bool(search_canonical_messages(config, "idle-distinctive-token", scope="all"))
         except NotmuchError:
             return False
 
@@ -317,7 +322,14 @@ def test_dovecot_idle_fast_path_acquires_and_indexes_without_poll(
     uidvalidity, snapshot = _snapshot(port)
     assert len(snapshot) == 1
     uid, (flags, server_raw) = next(iter(snapshot.items()))
-    found = search_canonical_messages(config, "idle-distinctive-token")
+    found: list[SearchResult] = []
+
+    def final_search() -> bool:
+        nonlocal found
+        found = search_canonical_messages(config, "idle-distinctive-token", scope="all")
+        return bool(found)
+
+    _wait_until(final_search)
     assert len(found) == 1
     canonical_path = found[0].canonical_message.local_path
     assert canonical_path.read_bytes() == server_raw == raw

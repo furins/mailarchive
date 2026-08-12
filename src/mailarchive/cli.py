@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import NoReturn
 
+from mailarchive.classification import ClassificationResult, apply_classification
 from mailarchive.config import ConfigError, display_config, load_config
 from mailarchive.db import account_id, connect, initialize
 from mailarchive.fastpath import FAST_PATH_STALE_SECONDS, FastPathWatcher, fast_path_status
@@ -66,8 +67,24 @@ def build_parser() -> argparse.ArgumentParser:
     refresh.add_argument("--json", action="store_true", help="emit JSON")
     search = subcommands.add_parser("search", help="search the local notmuch index")
     search.add_argument("query", help="notmuch query")
+    search.add_argument("--scope", choices=("archived", "quarantine", "all"), default="archived")
     search.add_argument("--config", required=True, help="path to YAML configuration")
     search.add_argument("--json", action="store_true", help="emit JSON")
+    quarantine = subcommands.add_parser("quarantine", help="local-only quarantine operations")
+    quarantine_subcommands = quarantine.add_subparsers(dest="quarantine_command", required=True)
+    quarantine_list = quarantine_subcommands.add_parser(
+        "list", help="list locally quarantined messages"
+    )
+    quarantine_list.add_argument("--config", required=True)
+    quarantine_list.add_argument("--json", action="store_true")
+    classify = subcommands.add_parser("classify", help="local classification overrides")
+    classify_subcommands = classify.add_subparsers(dest="classify_command", required=True)
+    override = classify_subcommands.add_parser("override", help="append a manual local verdict")
+    override.add_argument("--canonical-id", required=True)
+    override.add_argument("--classification", choices=("ham", "suspect", "spam"), required=True)
+    override.add_argument("--reason", required=True)
+    override.add_argument("--config", required=True)
+    override.add_argument("--json", action="store_true")
     imap = subcommands.add_parser("imap", help="explicit read-only IMAP acquisition")
     imap_subcommands = imap.add_subparsers(dest="imap_command", required=True)
     sync = imap_subcommands.add_parser(
@@ -133,6 +150,9 @@ def main(argv: list[str] | None = None) -> int:
             account_count = 0
             canonical_message_count = 0
             schema_version = 0
+            lifecycle: dict[str, int] = {}
+            quarantine_counts: dict[str, int] = {}
+            classifier_failure_count = 0
             if initialized:
                 with connect(config.database.path) as connection:
                     version_row = connection.execute(
@@ -146,6 +166,32 @@ def main(argv: list[str] | None = None) -> int:
                             "SELECT COUNT(*) FROM canonical_messages"
                         ).fetchone()
                         canonical_message_count = int(count_row[0])
+                    lifecycle = (
+                        {
+                            str(row[0]): int(row[1])
+                            for row in connection.execute(
+                                "SELECT storage_state,COUNT(*) FROM canonical_messages GROUP BY storage_state"
+                            )
+                        }
+                        if schema_version >= 8
+                        else {}
+                    )
+                    if schema_version >= 8:
+                        quarantine_counts = {
+                            str(row[0]): int(row[1])
+                            for row in connection.execute(
+                                """SELECT x.classification,COUNT(*) FROM canonical_messages c
+                                JOIN classifications x ON x.id=(SELECT id FROM classifications
+                                WHERE canonical_message_id=c.id ORDER BY manual_override DESC,id DESC LIMIT 1)
+                                WHERE c.storage_state='quarantined' GROUP BY x.classification"""
+                            )
+                        }
+                        classifier_failure_count = int(
+                            connection.execute(
+                                "SELECT COUNT(*) FROM audit_events "
+                                "WHERE event_type='classification.failed' AND result='fail-safe'"
+                            ).fetchone()[0]
+                        )
             health = [record.__dict__ for record in fast_path_status(config)] if initialized else []
             gmail_status: list[dict[str, object]] = [
                 {
@@ -264,9 +310,57 @@ def main(argv: list[str] | None = None) -> int:
                     "schema_version": schema_version,
                     "account_count": account_count,
                     "canonical_message_count": canonical_message_count,
+                    "lifecycle_counts": lifecycle if initialized else {},
+                    "quarantine_counts": quarantine_counts if initialized else {},
+                    "classifier_failure_event_count": classifier_failure_count,
                     "remote_mutation_supported": False,
                     "fast_path": health,
                     "gmail": gmail_status,
+                },
+                args.json,
+            )
+            return 0
+        if args.command == "quarantine":
+            if not config.database.path.exists():
+                _emit([], args.json)
+                return 0
+            with connect(config.database.path) as connection:
+                rows = connection.execute("""SELECT c.id AS canonical_id,a.name AS account,c.local_path,c.quarantined_at,x.classification,x.score,x.classified_at
+                    FROM canonical_messages c JOIN accounts a ON a.id=c.account_id
+                    LEFT JOIN classifications x ON x.id=(SELECT id FROM classifications WHERE canonical_message_id=c.id ORDER BY manual_override DESC,id DESC LIMIT 1)
+                    WHERE c.storage_state='quarantined' ORDER BY c.quarantined_at DESC,c.id""").fetchall()
+            _emit([dict(row) for row in rows], args.json)
+            return 0
+        if args.command == "classify":
+            if not args.reason.strip():
+                _error("--reason must be non-empty")
+            from mailarchive.db import canonical_message_by_account_and_sha256
+
+            with connect(config.database.path) as connection:
+                row = connection.execute(
+                    "SELECT account_id,sha256 FROM canonical_messages WHERE id=?",
+                    (args.canonical_id,),
+                ).fetchone()
+                if row is None:
+                    _error("unknown canonical ID")
+                message = canonical_message_by_account_and_sha256(
+                    connection, int(row["account_id"]), str(row["sha256"])
+                )
+                assert message is not None
+            stored = apply_classification(
+                config,
+                message,
+                ClassificationResult(
+                    args.classification, None, args.reason.strip()[:256], "manual"
+                ),
+                manual=True,
+            )
+            _emit(
+                {
+                    "canonical_message_id": stored.id,
+                    "classification": args.classification,
+                    "storage_state": stored.storage_state,
+                    "local_path": str(stored.local_path),
                 },
                 args.json,
             )
@@ -286,12 +380,13 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if args.command == "index":
-            adapter = NotmuchAdapter(config)
-            adapter.refresh()
-            _emit({"refreshed": True, "notmuch_version": adapter.version()}, args.json)
+            archive_adapter = NotmuchAdapter(config, kind="archive")
+            archive_adapter.refresh()
+            NotmuchAdapter(config, kind="quarantine").refresh()
+            _emit({"refreshed": True, "notmuch_version": archive_adapter.version()}, args.json)
             return 0
         if args.command == "search":
-            results = search_canonical_messages(config, args.query)
+            results = search_canonical_messages(config, args.query, scope=args.scope)
             _emit([result.as_dict() for result in results], args.json)
             return 0
         if args.command == "imap":

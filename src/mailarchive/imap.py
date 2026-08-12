@@ -294,6 +294,9 @@ class ImapAdapter:
         if not password:
             raise ImapError(f"missing credential environment variable: {variable}")
         initialize(self.config.database.path, self.config.accounts)
+        from mailarchive.classification import reconcile_pending
+
+        reconcile_pending(self.config, account_name=account_name)
         with folder_lock(self.config, account, folder):
             _audit(self.config, account_name, "imap.sync.started", "started", {"folder": folder})
             client: imaplib.IMAP4 | None = None
@@ -339,6 +342,12 @@ class ImapAdapter:
                         result.canonical_message,
                         observed_at,
                     )
+                    if result.created:
+                        from mailarchive.classification import classify_pending
+
+                        result = IngestResult(
+                            classify_pending(self.config, result.canonical_message), True
+                        )
                     results.append(result)
                     if result.created:
                         _audit(

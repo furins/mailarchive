@@ -572,6 +572,10 @@ class GmailAdapter:
             labels.clear()
             labels.update(self._labels(client, aid))
             _, updated = self._register(aid, response, result, labels)
+        if result is not None and result.created:
+            from mailarchive.classification import classify_pending
+
+            classify_pending(self.config, result.canonical_message)
         return (0 if known else 1, int(result.created) if result else 0, updated)
 
     def _pre_scan_anchor(self, client: GmailApiClient) -> str | None:
@@ -601,6 +605,9 @@ class GmailAdapter:
     def sync(self, account_name: str) -> GmailSyncResult:
         account = self._account(account_name)
         initialize(self.config.database.path, self.config.accounts)
+        from mailarchive.classification import reconcile_pending
+
+        reconcile_pending(self.config, account_name=account_name)
         with gmail_lock(self.config, account, "sync"):
             client = self.client_factory(account)
             labels: set[str] = set()

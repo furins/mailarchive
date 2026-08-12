@@ -62,7 +62,7 @@ def test_identical_bytes_are_idempotent_across_source_names(
     assert second.canonical_message.id == first.canonical_message.id
     with connect(config.database.path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM canonical_messages").fetchone()[0] == 1
-        assert connection.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == 2
+        assert connection.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == 3
 
 
 def test_identical_bytes_are_preserved_per_account(config_file: Path, tmp_path: Path) -> None:
@@ -212,7 +212,7 @@ def test_database_failure_file_is_retryable(
     with pytest.raises(sqlite3.OperationalError, match="simulated"):
         ingest_file(config, source, "test")
     filename = f"{hashlib.sha256(raw_bytes).hexdigest()}.eml"
-    canonical_path = config.archive.root / "mail" / "test" / "cur" / filename
+    canonical_path = config.archive.root / "staging" / "test" / "cur" / filename
     assert canonical_path.read_bytes() == raw_bytes
     monkeypatch.setattr(ingest_module, "register_canonical_message", real_register)
     result = ingest_file(config, source, "test")
