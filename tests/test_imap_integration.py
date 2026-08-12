@@ -8,8 +8,9 @@ import os
 import pwd
 import socket
 import subprocess
+import threading
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from pathlib import Path
 from typing import cast
 
@@ -18,8 +19,9 @@ import yaml
 
 from mailarchive.config import load_config
 from mailarchive.db import connect
+from mailarchive.fastpath import FastPathWatcher, fast_path_status
 from mailarchive.imap import ImapAdapter, encode_mailbox_name
-from mailarchive.notmuch import NotmuchAdapter, search_canonical_messages
+from mailarchive.notmuch import NotmuchAdapter, NotmuchError, search_canonical_messages
 
 
 def _free_port() -> int:
@@ -243,3 +245,92 @@ def test_direct_loopback_acquisition_preserves_server_bytes(
     assert len(next_results) == 1 and _snapshot(port)[1] == after
     NotmuchAdapter(config).refresh()
     assert search_canonical_messages(config, "loopback two")
+
+
+def _wait_until(predicate: Callable[[], bool], timeout: float = 10) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.02)
+    raise AssertionError("timed out waiting for bounded Dovecot IDLE acceptance condition")
+
+
+def test_dovecot_idle_fast_path_acquires_and_indexes_without_poll(
+    config_file: Path, dovecot_loopback: tuple[int, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real Python 3.14 IDLE -> M3 BODY.PEEK[] -> notmuch acceptance coverage."""
+    port, _, _ = dovecot_loopback
+    values = yaml.safe_load(config_file.read_text())
+    values["accounts"]["test"]["imap"] = {
+        "host": "127.0.0.1", "port": port, "username": "fixture",
+        "tls_mode": "INSECURE_LOOPBACK", "folders": ["INBOX"],
+        "fast_path": {
+            "idle_enabled": True, "poll_interval_seconds": 120,
+            "reconcile_interval_seconds": 1740,
+        },
+    }
+    config_file.write_text(yaml.safe_dump(values))
+    monkeypatch.setenv("MAILARCHIVE_TEST_SECRET", "fixture-password")
+    config = load_config(config_file)
+    stop = threading.Event()
+    watcher = FastPathWatcher(config, "test", stop, idle_window_seconds=0.25)
+    thread = threading.Thread(target=watcher.run, daemon=True)
+    thread.start()
+    _wait_until(lambda: fast_path_status(config)[0].effective_mode == "idle")
+    def initial_sync_complete() -> bool:
+        with connect(config.database.path) as connection:
+            return connection.execute(
+                "SELECT 1 FROM audit_events WHERE event_type='imap.fast_sync.succeeded'"
+            ).fetchone() is not None
+
+    _wait_until(initial_sync_complete)
+    # The initial arm-before-sync catch-up is complete; append into a subsequent genuine IDLE wait.
+    time.sleep(0.05)
+    raw = _raw("<idle-acceptance@example.test>", "idle acceptance", "idle-distinctive-token")
+    append_started = time.monotonic()
+    client = imaplib.IMAP4("127.0.0.1", port)
+    try:
+        assert client.login("fixture", "fixture-password")[0] == "OK"
+        assert client.append(encode_mailbox_name("INBOX"), None, None, raw)[0] == "OK"
+    finally:
+        client.logout()
+    def searchable() -> bool:
+        try:
+            return bool(search_canonical_messages(config, "idle-distinctive-token"))
+        except NotmuchError:
+            return False
+
+    _wait_until(searchable)
+    latency = time.monotonic() - append_started
+    print(f"Dovecot IDLE APPEND-to-searchable latency: {latency:.3f}s")
+    assert latency <= 10, f"APPEND-to-searchable latency was {latency:.3f}s"
+    uidvalidity, snapshot = _snapshot(port)
+    assert len(snapshot) == 1
+    uid, (flags, server_raw) = next(iter(snapshot.items()))
+    found = search_canonical_messages(config, "idle-distinctive-token")
+    assert len(found) == 1
+    canonical_path = found[0].canonical_message.local_path
+    assert canonical_path.read_bytes() == server_raw == raw
+    digest = hashlib.sha256(server_raw).hexdigest()
+    print(f"Dovecot IDLE server/canonical SHA-256: {digest}")
+    assert found[0].canonical_message.sha256 == digest
+    assert _snapshot(port)[1][uid][0] == flags
+    with connect(config.database.path) as connection:
+        remote = connection.execute(
+            "SELECT uidvalidity, remote_uid FROM remote_messages WHERE remote_folder='INBOX'"
+        ).fetchone()
+        events = connection.execute(
+            "SELECT event_type, details_json FROM audit_events ORDER BY id"
+        ).fetchall()
+    assert tuple(remote) == (uidvalidity, uid)
+    event_types = [str(row[0]) for row in events]
+    assert "imap.watch.event" in event_types
+    assert "imap.watch.poll" not in event_types
+    event_index = event_types.index("imap.watch.event")
+    assert event_index < event_types.index("imap.fast_sync.succeeded", event_index)
+    assert any("EXISTS" in str(row[1]) for row in events if row[0] == "imap.watch.event")
+    stop.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert fast_path_status(config)[0].effective_mode == "stopped"

@@ -189,12 +189,16 @@ class FastPathWatcher:
         except Exception:
             self._health("degraded", last_error_at=utc_now(), last_error_kind="acquisition", consecutive_failures=1)
             self._audit("imap.fast_sync.failed", "failed", {"folder": "INBOX", "error_kind": "acquisition"})
-            return True
+            # Acquisition failures do not create guessed identities.  A later reconciliation retries.
+            return False
         self._health(mode, last_sync_succeeded_at=utc_now(), consecutive_failures=0)
         self._audit("imap.fast_sync.succeeded", "success", {"folder": "INBOX", "remote_seen": len(results), "fetched": len(results), "imported": sum(item.created for item in results)})
-        return self._refresh_index(mode)
+        self._refresh_index(mode)
+        # Indexing is independent local derived state; never re-fetch bodies to repair it.
+        return True
 
     def _refresh_index(self, mode: str) -> bool:
+        was_pending = self._index_pending()
         try:
             self.index_adapter.refresh()
         except Exception:
@@ -202,6 +206,8 @@ class FastPathWatcher:
             self._audit("notmuch.fast_refresh.failed", "failed", {"folder": "INBOX", "error_kind": "indexing"})
             return False
         self._health(mode, index_pending=0, last_index_succeeded_at=utc_now(), consecutive_failures=0)
+        if was_pending:
+            self._audit("notmuch.fast_refresh.recovered", "success", {"folder": "INBOX"})
         return True
 
     def _run_poll(self) -> None:
@@ -269,8 +275,9 @@ class FastPathWatcher:
                             self._run_poll()
                             return
                         if failures:
-                            self._health("idle", reconnect_count=failures)
+                            self._health("idle", reconnect_count=failures, consecutive_failures=0)
                             self._audit("imap.watch.reconnected", "success", {"folder": "INBOX", "reconnect_count": failures})
+                            failures = 0
                         self._run_idle(connection)
                         return
                     except FastPathError:
