@@ -9,7 +9,7 @@ import pytest
 
 import mailarchive.db as database
 from mailarchive.config import load_config
-from mailarchive.db import connect, initialize, insert_audit_event, utc_now
+from mailarchive.db import account_id, connect, initialize, insert_audit_event, utc_now
 
 
 def test_database_initializes_idempotently(config_file: Path) -> None:
@@ -180,6 +180,43 @@ def test_foreign_keys_are_enabled(config_file: Path) -> None:
     initialize(config.database.path)
     with connect(config.database.path) as connection:
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+def test_v8_lifecycle_constraints_reject_impossible_timestamp_combinations(
+    config_file: Path,
+) -> None:
+    config = load_config(config_file)
+    initialize(config.database.path, config.accounts)
+    now = utc_now()
+    with connect(config.database.path) as db:
+        aid = account_id(db, "test")
+        assert aid is not None
+        for state, archived_at, quarantined_at in (
+            ("pending", now, None),
+            ("pending", None, now),
+            ("archived", None, None),
+            ("quarantined", None, None),
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                db.execute(
+                    """INSERT INTO canonical_messages(id,account_id,sha256,local_path,size_bytes,
+                    downloaded_at,archived_at,storage_state,quarantined_at,integrity_status,created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        f"{state}-{archived_at}-{quarantined_at}",
+                        aid,
+                        "f" * 64,
+                        f"/tmp/{state}-{archived_at}-{quarantined_at}",
+                        1,
+                        now,
+                        archived_at,
+                        state,
+                        quarantined_at,
+                        "verified",
+                        now,
+                    ),
+                )
+        assert not db.execute("PRAGMA foreign_key_check").fetchall()
 
 
 def test_audit_insert_works(config_file: Path) -> None:

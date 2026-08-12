@@ -62,7 +62,7 @@ def test_identical_bytes_are_idempotent_across_source_names(
     assert second.canonical_message.id == first.canonical_message.id
     with connect(config.database.path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM canonical_messages").fetchone()[0] == 1
-        assert connection.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == 4
+        assert connection.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == 3
 
 
 def test_identical_bytes_are_preserved_per_account(config_file: Path, tmp_path: Path) -> None:

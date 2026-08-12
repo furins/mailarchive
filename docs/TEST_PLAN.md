@@ -83,6 +83,8 @@ Production accounts are never test fixtures.
   responses fail closed to SUSPECT; no response body is canonical content;
 - index rebuild reapplies tags from SQLite, excludes quarantine by default, and permits explicit
   `tag:quarantine` searches; status and quarantine listing remain local-only.
+- a linked pending message can be reconciled locally without provider RAW/RETR/BODY.PEEK refetch;
+  missing or hash-mismatched pending files fail closed and remain pending.
 
 ## 4. Deletion predicate tests
 

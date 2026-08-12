@@ -605,6 +605,9 @@ class GmailAdapter:
     def sync(self, account_name: str) -> GmailSyncResult:
         account = self._account(account_name)
         initialize(self.config.database.path, self.config.accounts)
+        from mailarchive.classification import reconcile_pending
+
+        reconcile_pending(self.config, account_name=account_name)
         with gmail_lock(self.config, account, "sync"):
             client = self.client_factory(account)
             labels: set[str] = set()

@@ -241,6 +241,9 @@ class Pop3Adapter:
         if not password:
             raise Pop3Error("missing POP3 credential environment variable")
         initialize(self.config.database.path, self.config.accounts)
+        from mailarchive.classification import reconcile_pending
+
+        reconcile_pending(self.config, account_name=account_name)
         client = _Pop3Wire(account.pop3)
         imported = reused = 0
         try:

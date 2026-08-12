@@ -378,7 +378,11 @@ def _migration_8(connection: sqlite3.Connection) -> None:
             storage_state TEXT NOT NULL CHECK(storage_state IN ('pending','archived','quarantined')),
             quarantined_at TEXT, integrity_status TEXT NOT NULL CHECK(integrity_status IN ('verified','failed')),
             integrity_verified_at TEXT, created_at TEXT NOT NULL, UNIQUE(account_id, sha256),
-            CHECK((storage_state='archived' AND archived_at IS NOT NULL) OR storage_state!='archived')
+            CHECK(
+                (storage_state='pending' AND archived_at IS NULL AND quarantined_at IS NULL)
+                OR (storage_state='archived' AND archived_at IS NOT NULL)
+                OR (storage_state='quarantined' AND quarantined_at IS NOT NULL)
+            )
         )""")
     connection.execute("""INSERT INTO canonical_messages_v8(
         id,account_id,sha256,local_path,size_bytes,message_id_header,message_date,downloaded_at,
@@ -430,10 +434,10 @@ def _apply_migration(connection: sqlite3.Connection, version: int, migration: Mi
     # M7 rebuilds canonical_messages to make archived_at nullable.  SQLite cannot
     # drop a referenced table with FK enforcement enabled, even inside a transaction.
     rebuilds_canonical = version == 8
-    if rebuilds_canonical:
-        connection.execute("PRAGMA foreign_keys = OFF")
-    connection.execute("BEGIN IMMEDIATE")
     try:
+        if rebuilds_canonical:
+            connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("BEGIN IMMEDIATE")
         migration(connection)
         connection.execute(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
@@ -444,6 +448,7 @@ def _apply_migration(connection: sqlite3.Connection, version: int, migration: Mi
         raise
     else:
         connection.commit()
+    finally:
         if rebuilds_canonical:
             connection.execute("PRAGMA foreign_keys = ON")
 
@@ -548,6 +553,40 @@ def canonical_message_by_account_and_sha256(
         integrity_verified_at=(
             None if row["integrity_verified_at"] is None else str(row["integrity_verified_at"])
         ),
+        created_at=str(row["created_at"]),
+    )
+
+
+def canonical_message_by_id(
+    connection: sqlite3.Connection, identifier: str
+) -> CanonicalMessage | None:
+    """Resolve one authoritative canonical row for local-only lifecycle workers."""
+    row = connection.execute(
+        """SELECT id, account_id, sha256, local_path, size_bytes, message_id_header, message_date,
+        downloaded_at, archived_at, storage_state, quarantined_at, integrity_status,
+        integrity_verified_at, created_at FROM canonical_messages WHERE id=?""",
+        (identifier,),
+    ).fetchone()
+    if row is None:
+        return None
+    return CanonicalMessage(
+        id=str(row["id"]),
+        account_id=int(row["account_id"]),
+        sha256=str(row["sha256"]),
+        local_path=Path(str(row["local_path"])),
+        size_bytes=int(row["size_bytes"]),
+        message_id_header=None
+        if row["message_id_header"] is None
+        else str(row["message_id_header"]),
+        message_date=None if row["message_date"] is None else str(row["message_date"]),
+        downloaded_at=str(row["downloaded_at"]),
+        archived_at=None if row["archived_at"] is None else str(row["archived_at"]),
+        storage_state=cast(Literal["pending", "archived", "quarantined"], row["storage_state"]),
+        quarantined_at=None if row["quarantined_at"] is None else str(row["quarantined_at"]),
+        integrity_status=str(row["integrity_status"]),
+        integrity_verified_at=None
+        if row["integrity_verified_at"] is None
+        else str(row["integrity_verified_at"]),
         created_at=str(row["created_at"]),
     )
 

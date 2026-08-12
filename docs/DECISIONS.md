@@ -190,3 +190,9 @@ manual SUSPECT/SPAM quarantines it while retaining any historical `archived_at`.
 notmuch indexes `archive.root`, ignoring staging and state roots. Quarantine receives explicit
 derived tags and is excluded from ordinary searches through `exclude_tags=quarantine`; tags can be
 reapplied solely from SQLite after rebuilding the index.
+
+Pending state is locally recoverable: every provider sync reconciles account-scoped pending rows
+from SQLite before provider acquisition. This verifies the stored SHA and classifies only the local
+exact bytes; it neither re-downloads a known provider message nor mutates a provider. File moves
+install the destination without overwrite (hard-link where possible; fsynced temporary copy and
+link installation otherwise), then remove the source only after the durable destination exists.
