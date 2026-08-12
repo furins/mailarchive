@@ -50,6 +50,11 @@ def test_managed_config_is_deterministic_and_pull_only(config_file: Path) -> Non
     ):
         assert directive in text
     assert "Patterns" not in text
+    assert "SSLType None" in text
+    assert "TLSType" not in text
+    maildir_section = text.split("MaildirStore", 1)[1].split("Channel", 1)[0]
+    assert "InfoDelimiter :" in maildir_section
+    assert "InfoDelimiter :" not in text.split("MaildirStore", 1)[0]
     assert "fixture-secret-value" not in text
     assert oct(layout.config_path.stat().st_mode & 0o777) == "0o600"
 
@@ -133,6 +138,14 @@ def test_state_parser_requires_uidvalidity_and_parses_uid_pairs(tmp_path: Path) 
     state.write_text("1 11 0\n", encoding="ascii")
     with pytest.raises(ImapError, match="FarUidValidity"):
         parse_mbsync_state(state)
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected_uid"),
+    [("message,U=123:2,S", 123), ("message,U=7:2,", 7), ("message:2,S", None)],
+)
+def test_native_maildir_filename_uid_parser(filename: str, expected_uid: int | None) -> None:
+    assert imap_module._near_uid(Path(filename)) == expected_uid  # pyright: ignore[reportPrivateUsage]
 
 
 def test_only_explicit_channel_is_invoked(

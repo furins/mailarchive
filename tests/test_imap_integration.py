@@ -17,10 +17,9 @@ from pathlib import Path
 import pytest
 import yaml
 
-import mailarchive.imap as imap_module
 from mailarchive.config import load_config
 from mailarchive.db import connect
-from mailarchive.imap import ImapMbsyncAdapter, managed_layout
+from mailarchive.imap import ImapError, ImapMbsyncAdapter, managed_layout
 from mailarchive.notmuch import NotmuchAdapter, search_canonical_messages
 
 
@@ -137,6 +136,9 @@ def dovecot_loopback(
                 f"  user = {local_user}",
                 "  chroot =",
                 "}",
+                "service anvil {",
+                "  chroot =",
+                "}",
                 "",
             )
         ),
@@ -207,22 +209,23 @@ def test_loopback_dovecot_mbsync_preserves_server_and_canonical_bytes(
     config_file.write_text(yaml.safe_dump(values), encoding="utf-8")
     monkeypatch.setenv("MAILARCHIVE_TEST_SECRET", "fixture-password")
     config = load_config(config_file)
-    original_write = imap_module.write_managed_config
-
-    def sandbox_visible_config(*args: object) -> object:
-        layout = original_write(*args)  # type: ignore[arg-type]
-        layout.config_path.chmod(0o644)
-        return layout
-
-    monkeypatch.setattr(imap_module, "write_managed_config", sandbox_visible_config)
     try:
         results = ImapMbsyncAdapter(config).sync("test", "INBOX")
+    except ImapError as error:
+        if "Cannot open config file" in str(error) and "Permission denied" in str(error):
+            if os.environ.get("GITHUB_ACTIONS") != "true":
+                pytest.skip(
+                    "local sandbox prevents mbsync from reading its required 0600 managed config"
+                )
+        diagnostic = _safe_dovecot_log(log_path)
+        raise AssertionError(f"loopback acquisition failed; Dovecot log:\n{diagnostic}") from error
     except Exception as error:
         diagnostic = _safe_dovecot_log(log_path)
         raise AssertionError(f"loopback acquisition failed; Dovecot log:\n{diagnostic}") from error
     assert len(results) == len(before) == 1
     assert _imap_snapshot(port) == (uidvalidity, before)
     layout = managed_layout(config, config.accounts[0], "INBOX")
+    assert oct(layout.config_path.stat().st_mode & 0o777) == "0o600"
     mirror = next((layout.mirror_mailbox / "INBOX" / "cur").iterdir())
     assert mirror.read_bytes() == first == results[0].canonical_message.local_path.read_bytes()
     assert results[0].canonical_message.sha256 == hashlib.sha256(first).hexdigest()

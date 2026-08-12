@@ -114,16 +114,15 @@ def managed_config_text(config: AppConfig, account: AccountConfig, folder: str) 
     # The only shell fragment is fixed and contains the validated variable name, never its value.
     pass_command = f'printf %s "${{{variable}}}"'
     return "\n".join((
-        "# Managed by MailArchive; pull-only and never use with mbsync -a.",
-        "FSync yes", "InfoDelimiter :", "",
+        "# Managed by MailArchive; pull-only and never use with mbsync -a.", "FSync yes", "",
         f"IMAPAccount {_identifier(account.name, 'far-account')}",
         f"Host {_q(imap.host)}", f"Port {imap.port}", f"User {_q(imap.username)}",
-        f"PassCmd {_q(pass_command)}", f"TLSType {tls}",
+        f"PassCmd {_q(pass_command)}", f"SSLType {tls}",
         f"Timeout {imap.connection_timeout_seconds}", "",
         f"IMAPStore {far_store}", f"Account {_identifier(account.name, 'far-account')}", "",
         f"MaildirStore {near_store}",
         f"Path {_q(str(layout.mirror_mailbox) + '/')}",
-        f"Inbox {_q(str(layout.mirror_mailbox / 'INBOX'))}", "AltMap no", "",
+        f"Inbox {_q(str(layout.mirror_mailbox / 'INBOX'))}", "AltMap no", "InfoDelimiter :", "",
         f"Channel {layout.channel}",
         f"Far {_q(':' + far_store + ':' + folder)}",
         f"Near {_q(':' + near_store + ':INBOX')}",
