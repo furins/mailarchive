@@ -22,6 +22,8 @@ from mailarchive.gmail import (
     GmailAuthError,
     GmailHistoryExpired,
     GmailResponseError,
+    GmailTransientError,
+    GmailWatcher,
     decode_raw,
     load_credentials,
 )
@@ -155,6 +157,95 @@ def test_transient_get_retries_with_injected_sleeper(status: int) -> None:
     session = Session()
     GmailApiClient(session, sleeper=delays.append).profile()
     assert session.calls == 3 and delays == [1.0, 1.0]
+
+
+def test_http_retry_exhaustion_and_auth_categories() -> None:
+    class Response:
+        def __init__(self, status: int, retry: str | None = None) -> None:
+            self.status_code, self.headers = status, {} if retry is None else {"Retry-After": retry}
+
+        def json(self) -> object:
+            return {}
+
+    class Session:
+        def __init__(self, status: int) -> None:
+            self.status, self.calls = status, 0
+
+        def get(self, *args: object, **kwargs: object) -> Response:
+            self.calls += 1
+            return Response(self.status, "not-a-number")
+
+    for status, error in (
+        (429, GmailTransientError),
+        (500, GmailTransientError),
+        (401, GmailAuthError),
+        (403, GmailAuthError),
+        (418, GmailResponseError),
+    ):
+        session = Session(status)
+        typed_sleeps: list[float] = []
+        with pytest.raises(error):
+            GmailApiClient(session, sleeper=typed_sleeps.append).profile()
+        assert session.calls == (3 if status in {429, 500} else 1)
+
+
+def test_full_list_failure_and_cyclic_token_fail_closed(tmp_path: Path) -> None:
+    class Listing(FakeGmail):
+        def __init__(self, cyclic: bool) -> None:
+            super().__init__(b"Message-ID: <g1>\r\n\r\none")
+            self.cyclic = cyclic
+
+        def messages(
+            self, page_token: str | None = None, *, max_results: int = 500
+        ) -> dict[str, object]:
+            if max_results == 1:
+                return {"messages": [{"id": "G1"}]}
+            if page_token is None:
+                return {"messages": [{"id": "G1"}], "nextPageToken": "p2"}
+            if self.cyclic:
+                return {"messages": [], "nextPageToken": "p2"}
+            raise GmailResponseError("page two failed")
+
+        def message(self, message_id: str, format: str) -> dict[str, object]:
+            return {
+                "id": "G1",
+                "threadId": "T",
+                "historyId": "1",
+                "labelIds": ["INBOX"],
+                "raw": base64.urlsafe_b64encode(self.raw).decode().rstrip("="),
+            }
+
+    for cyclic in (False, True):
+        case = tmp_path / str(cyclic)
+        case.mkdir()
+        config = load_config(_gmail_config(case))
+        fake = Listing(cyclic)
+        with pytest.raises(GmailResponseError):
+            GmailAdapter(config, lambda _account, value=fake: value).sync("gmail")  # type: ignore[arg-type]
+        with connect(config.database.path) as db:
+            assert db.execute("SELECT full_sync_required FROM gmail_sync_state").fetchone()[0] == 1
+            assert db.execute("SELECT COUNT(*) FROM canonical_messages").fetchone()[0] == 1
+
+
+def test_notmuch_recovery_persists_target_mode_atomically(tmp_path: Path) -> None:
+    config = load_config(_gmail_config(tmp_path))
+    watcher = GmailWatcher(config, "gmail", threading.Event(), refresh=lambda: None)
+    watcher._health("degraded", index_pending=1)  # pyright: ignore[reportPrivateUsage]
+    assert watcher._refresh()  # pyright: ignore[reportPrivateUsage]
+    with connect(config.database.path) as db:
+        assert tuple(
+            db.execute(
+                "SELECT mode,index_pending,last_index_succeeded_at FROM fast_path_health"
+            ).fetchone()
+        )[:2] == ("poll", 0)
+    watcher.acquisition_degraded = True
+    watcher._health("degraded", index_pending=1)  # pyright: ignore[reportPrivateUsage]
+    assert watcher._refresh()  # pyright: ignore[reportPrivateUsage]
+    with connect(config.database.path) as db:
+        assert tuple(db.execute("SELECT mode,index_pending FROM fast_path_health").fetchone()) == (
+            "degraded",
+            0,
+        )
 
 
 def test_loopback_client_exercises_only_documented_get_routes() -> None:

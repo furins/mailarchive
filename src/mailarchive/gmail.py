@@ -30,13 +30,6 @@ from mailarchive.ingest import IngestResult, ingest_bytes
 from mailarchive.models import AccountConfig, AppConfig
 
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
-_WRITE_SCOPES = (
-    "https://mail.google.com/",
-    "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/gmail.compose",
-    "https://www.googleapis.com/auth/gmail.send",
-    "https://www.googleapis.com/auth/gmail.insert",
-)
 _BASE_URL = "https://gmail.googleapis.com/gmail/v1"
 
 
@@ -215,6 +208,32 @@ def _safe_token_file(path: Path, *, required: bool = True) -> None:
         raise GmailAuthError("Gmail token file must be a regular 0600 file")
 
 
+def _validate_readonly_scopes(scopes: object) -> None:
+    """Require one and only one Gmail mailbox privilege; identity scopes may coexist."""
+    if not isinstance(scopes, list) or not all(isinstance(scope, str) for scope in scopes):
+        raise GmailAuthError("Gmail credential scopes cannot be proven readonly")
+    gmail_scopes = {
+        scope
+        for scope in scopes
+        if scope.startswith("https://www.googleapis.com/auth/gmail")
+        or scope == "https://mail.google.com/"
+    }
+    if gmail_scopes != {GMAIL_READONLY_SCOPE}:
+        raise GmailAuthError("Gmail credential scope is not readonly")
+
+
+def _serialized_readonly_credentials(credentials: Credentials) -> str:
+    serialized = credentials.to_json()
+    try:
+        payload = json.loads(serialized)
+    except json.JSONDecodeError as error:
+        raise GmailAuthError("Gmail credentials cannot be safely persisted") from error
+    if not isinstance(payload, dict):
+        raise GmailAuthError("Gmail credentials cannot be safely persisted")
+    _validate_readonly_scopes(payload.get("scopes"))
+    return serialized
+
+
 def load_credentials(account: AccountConfig) -> Credentials:
     path = _token_path(account)
     _safe_token_file(path)
@@ -224,21 +243,7 @@ def load_credentials(account: AccountConfig) -> Credentials:
         raise GmailAuthError("Gmail authorized-user token file is invalid") from error
     if not isinstance(payload, dict):
         raise GmailAuthError("Gmail authorized-user token file is invalid")
-    stored_scopes = payload.get("scopes")
-    if not isinstance(stored_scopes, list) or not all(
-        isinstance(item, str) for item in stored_scopes
-    ):
-        raise GmailAuthError("Gmail authorized-user token scopes cannot be proven readonly")
-    gmail_scopes = {
-        scope
-        for scope in stored_scopes
-        if scope.startswith("https://www.googleapis.com/auth/gmail")
-        or scope == "https://mail.google.com/"
-    }
-    if gmail_scopes != {GMAIL_READONLY_SCOPE} or any(
-        scope in _WRITE_SCOPES for scope in gmail_scopes
-    ):
-        raise GmailAuthError("stored Gmail credential scope is not readonly")
+    _validate_readonly_scopes(payload.get("scopes"))
     credentials = Credentials.from_authorized_user_file(str(path))
     return credentials
 
@@ -279,12 +284,13 @@ def authorize(
     )
     if not credentials.refresh_token:
         raise GmailAuthError("OAuth authorization did not provide a refresh token")
+    serialized = _serialized_readonly_credentials(credentials)
     client = (client_factory or (lambda c: GmailApiClient(AuthorizedSession(c))))(credentials)
     profile = client.profile()
     actual = _valid_id(profile.get("emailAddress"), "profile email")
     if actual.casefold() != account.gmail.account_email.casefold():
         raise GmailAuthError("authenticated Gmail profile does not match configured account")
-    _write_token(_token_path(account), credentials.to_json())
+    _write_token(_token_path(account), serialized)
     return actual
 
 
@@ -367,15 +373,7 @@ class GmailAdapter:
             except RefreshError as error:
                 raise GmailAuthError("Gmail OAuth refresh failed") from error
             # Re-validate before persistence; never let a refresh broaden mailbox privilege.
-            serialized = credentials.to_json()
-            try:
-                scopes = json.loads(serialized).get("scopes")
-            except AttributeError, json.JSONDecodeError:
-                raise GmailAuthError(
-                    "refreshed Gmail credentials cannot prove readonly scope"
-                ) from None
-            if not isinstance(scopes, list) or set(scopes) != {GMAIL_READONLY_SCOPE}:
-                raise GmailAuthError("refreshed Gmail credentials are not readonly")
+            serialized = _serialized_readonly_credentials(credentials)
             _write_token(_token_path(account), serialized)
         return GmailApiClient(AuthorizedSession(credentials))
 
@@ -855,7 +853,12 @@ class GmailWatcher:
             )
             self._audit("gmail.fast_refresh.failed", "failed", {"error_kind": "indexing"})
             return False
-        self._health(self._effective_mode(), index_pending=0, last_index_succeeded_at=utc_now())
+        # _effective_mode reads the persisted pending flag, so decide using the target state instead.
+        self._health(
+            "degraded" if self.acquisition_degraded else "poll",
+            index_pending=0,
+            last_index_succeeded_at=utc_now(),
+        )
         if was_pending:
             self._audit("gmail.fast_refresh.recovered", "success", {})
         return True
