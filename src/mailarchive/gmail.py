@@ -743,12 +743,12 @@ class GmailAdapter:
         for mid in sorted(affected):
             if mid in deleted:
                 with connect(self.config.database.path) as db:
-                    db.execute(
-                        "UPDATE remote_messages SET remote_present=0 WHERE account_id=? AND provider_kind='gmail' AND provider_message_id=?",
+                    cursor = db.execute(
+                        "UPDATE remote_messages SET remote_present=0 WHERE account_id=? AND provider_kind='gmail' AND provider_message_id=? AND remote_present=1",
                         (aid, mid),
                     )
                     db.commit()
-                absent += 1
+                absent += cursor.rowcount
                 continue
             f, c, u = self._reconcile(client, account, aid, mid, labels)
             fetched += f

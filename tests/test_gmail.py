@@ -204,6 +204,166 @@ def test_loopback_client_exercises_only_documented_get_routes() -> None:
     assert requests_seen[2][2]["includeSpamTrash"] == ["true"]
 
 
+def test_loopback_full_and_partial_sync_acceptance(tmp_path: Path) -> None:
+    raw = {
+        "G1": b"Message-ID: <g1>\r\nX-Folded: one\r\n two\r\n\r\nbody-1",
+        "G2": b"Message-ID: <g2>\r\n\r\nbody-2",
+        "G3": b"Message-ID: <g3>\r\n\r\nbody-3",
+        "G4": b"Message-ID: <g4>\r\n\r\nbody-4",
+        "G6": b"Message-ID: <g6>\r\n\r\nbody-6",
+    }
+    state: dict[str, object] = {
+        "phase": "full",
+        "calls": [],
+        "raw_gets": [],
+        "labels": [
+            {"id": "INBOX", "name": "INBOX", "type": "system"},
+            {"id": "IMPORTANT", "name": "IMPORTANT", "type": "system"},
+            {"id": "SENT", "name": "SENT", "type": "system"},
+            {"id": "SPAM", "name": "SPAM", "type": "system"},
+            {"id": "TRASH", "name": "TRASH", "type": "system"},
+            {"id": "STARRED", "name": "STARRED", "type": "system"},
+            {"id": "Label_A", "name": "Project A", "type": "user"},
+        ],
+        "messages": {
+            "G1": ["INBOX", "IMPORTANT", "Label_A"],
+            "G2": ["SENT", "Label_A"],
+            "G3": ["SPAM"],
+            "G4": ["TRASH"],
+            "G6": ["STARRED", "Label_A"],
+        },
+    }
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            parsed, query = urlparse(self.path), parse_qs(urlparse(self.path).query)
+            cast(list[tuple[str, str, dict[str, list[str]]]], state["calls"]).append(
+                ("GET", parsed.path, query)
+            )
+            route = parsed.path.rsplit("/", 1)[-1]
+            if parsed.path.endswith("/profile"):
+                payload: dict[str, object] = {"emailAddress": "user@example.test"}
+            elif parsed.path.endswith("/labels"):
+                payload = {"labels": state["labels"]}
+            elif parsed.path.endswith("/history"):
+                start = query["startHistoryId"][0]
+                if state["phase"] == "full":
+                    assert start == "1"
+                    payload = {"historyId": "2", "history": []}
+                else:
+                    assert start == "2"
+                    payload = {
+                        "historyId": "3",
+                        "history": [
+                            {
+                                "messagesAdded": [{"message": {"id": "G6"}}],
+                                "labelsAdded": [
+                                    {"message": {"id": "G1"}},
+                                    {"message": {"id": "G1"}},
+                                ],
+                                "messagesDeleted": [{"message": {"id": "G2"}}],
+                            }
+                        ],
+                    }
+            elif parsed.path.endswith("/messages"):
+                if query.get("maxResults") == ["1"]:
+                    payload = {"messages": [{"id": "G4"}]}
+                elif query.get("pageToken") == ["p2"]:
+                    payload = {"messages": [{"id": "G3"}, {"id": "G4"}]}
+                else:
+                    payload = {"messages": [{"id": "G1"}, {"id": "G2"}], "nextPageToken": "p2"}
+            else:
+                mid, fmt = route, query["format"][0]
+                labels = cast(dict[str, list[str]], state["messages"])[mid]
+                payload = {
+                    "id": mid,
+                    "threadId": f"T{mid[-1]}",
+                    "historyId": "1" if state["phase"] == "full" else "3",
+                    "labelIds": labels,
+                }
+                if fmt == "raw":
+                    cast(list[str], state["raw_gets"]).append(mid)
+                    payload["raw"] = base64.urlsafe_b64encode(raw[mid]).decode().rstrip("=")
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *_args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    try:
+        config = load_config(_gmail_config(tmp_path))
+
+        def client(_account: object) -> GmailApiClient:
+            return GmailApiClient(
+                requests.Session(), base_url=f"http://127.0.0.1:{server.server_port}"
+            )
+
+        adapter = GmailAdapter(config, client)  # type: ignore[arg-type]
+        full = adapter.sync("gmail")
+        assert full.mode == "full" and full.history_to == "2"
+        state["phase"] = "partial"
+        state["labels"] = [
+            *cast(list[object], state["labels"])[:-1],
+            {"id": "Label_A", "name": "Archived Project A", "type": "user"},
+        ]
+        state["messages"] = {
+            **cast(dict[str, list[str]], state["messages"]),
+            "G1": ["INBOX", "Label_A"],
+        }
+        partial = adapter.sync("gmail")
+    finally:
+        server.shutdown()
+        thread.join()
+    assert partial.history_to == "3"
+    assert cast(list[str], state["raw_gets"]).count("G6") == 1
+    assert cast(list[str], state["raw_gets"]).count("G1") == 1
+    assert all(
+        method == "GET"
+        for method, _, _ in cast(list[tuple[str, str, dict[str, list[str]]]], state["calls"])
+    )
+    assert any(
+        query.get("includeSpamTrash") == ["true"]
+        for _, path, query in cast(list[tuple[str, str, dict[str, list[str]]]], state["calls"])
+        if path.endswith("/messages")
+    )
+    with connect(config.database.path) as db:
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM remote_messages WHERE provider_kind='gmail'"
+            ).fetchone()[0]
+            == 5
+        )
+        assert db.execute("SELECT COUNT(*) FROM canonical_messages").fetchone()[0] == 5
+        assert (
+            db.execute(
+                "SELECT remote_present FROM remote_messages WHERE provider_message_id='G2'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            db.execute("SELECT name FROM gmail_labels WHERE label_id='Label_A'").fetchone()[0]
+            == "Archived Project A"
+        )
+        assert db.execute("SELECT history_id FROM gmail_sync_state").fetchone()[0] == "3"
+        for mid, expected in raw.items():
+            if mid == "G2" or mid in {"G1", "G3", "G4", "G6"}:
+                row = db.execute(
+                    "SELECT local_path FROM canonical_messages JOIN remote_canonical_links "
+                    "ON canonical_messages.id=remote_canonical_links.canonical_message_id "
+                    "JOIN remote_messages ON remote_messages.id="
+                    "remote_canonical_links.remote_message_id "
+                    "WHERE provider_message_id=?",
+                    (mid,),
+                ).fetchone()
+                assert Path(str(row[0])).read_bytes() == expected
+
+
 def test_stored_gmail_scope_is_proven_before_credentials_are_constructed(tmp_path: Path) -> None:
     config = load_config(_gmail_config(tmp_path))
     token = tmp_path / "token.json"

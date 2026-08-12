@@ -110,6 +110,20 @@ def test_real_v5_to_v6_preserves_imap_identity_links_and_health(
         ) == ("idle", 2, 3, 1)
         assert db.execute("SELECT name FROM sqlite_master WHERE name='gmail_labels'").fetchone()
         assert not db.execute("PRAGMA foreign_key_check").fetchall()
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute(
+                "INSERT INTO remote_messages(id,account_id,provider_kind,remote_folder,uidvalidity,remote_uid,provider_message_id,provider_thread_id,message_id_header,first_seen_at,last_seen_at,remote_present,identity_confidence) VALUES ('imap-duplicate',?,'imap','INBOX',9,7,NULL,NULL,NULL,?, ?,1,'proven')",
+                (aid, now, now),
+            )
+        db.execute(
+            "INSERT INTO remote_messages(id,account_id,provider_kind,remote_folder,uidvalidity,remote_uid,provider_message_id,provider_thread_id,message_id_header,first_seen_at,last_seen_at,remote_present,identity_confidence) VALUES ('gmail-one',?,'gmail',NULL,NULL,NULL,'same',NULL,NULL,?, ?,1,'proven')",
+            (aid, now, now),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute(
+                "INSERT INTO remote_messages(id,account_id,provider_kind,remote_folder,uidvalidity,remote_uid,provider_message_id,provider_thread_id,message_id_header,first_seen_at,last_seen_at,remote_present,identity_confidence) VALUES ('gmail-two',?,'gmail',NULL,NULL,NULL,'same',NULL,NULL,?, ?,1,'proven')",
+                (aid, now, now),
+            )
 
 
 def test_foreign_keys_are_enabled(config_file: Path) -> None:

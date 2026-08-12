@@ -9,12 +9,13 @@ import signal
 import sqlite3
 import sys
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import NoReturn
 
 from mailarchive.config import ConfigError, display_config, load_config
 from mailarchive.db import account_id, connect, initialize
-from mailarchive.fastpath import FastPathWatcher, fast_path_status
+from mailarchive.fastpath import FAST_PATH_STALE_SECONDS, FastPathWatcher, fast_path_status
 from mailarchive.gmail import GmailAdapter, GmailError, GmailWatcher, authorize
 from mailarchive.imap import ImapAdapter, ImapError
 from mailarchive.ingest import IngestError, ingest_file
@@ -193,6 +194,20 @@ def main(argv: list[str] | None = None) -> int:
                                 "remote_present_provider_messages": int(counts[1] or 0),
                                 "known_labels": int(counts[2] or 0),
                                 "watcher_mode": None if watcher is None else watcher["mode"],
+                                "watcher_state": (
+                                    "not-started"
+                                    if watcher is None
+                                    else "stopped"
+                                    if watcher["mode"] == "stopped"
+                                    else "stale"
+                                    if not watcher["last_heartbeat_at"]
+                                    or (
+                                        datetime.now(UTC)
+                                        - datetime.fromisoformat(str(watcher["last_heartbeat_at"]))
+                                    ).total_seconds()
+                                    > FAST_PATH_STALE_SECONDS
+                                    else "active"
+                                ),
                                 "last_heartbeat": None
                                 if watcher is None
                                 else watcher["last_heartbeat_at"],
