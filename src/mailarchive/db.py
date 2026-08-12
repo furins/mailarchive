@@ -203,12 +203,110 @@ def _migration_5(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migration_6(connection: sqlite3.Connection) -> None:
+    """Generalize M3 identities for Gmail without changing M3 primary keys or links."""
+    connection.execute(
+        """
+        CREATE TABLE remote_messages_v6 (
+            id TEXT PRIMARY KEY,
+            account_id INTEGER NOT NULL REFERENCES accounts(id),
+            provider_kind TEXT NOT NULL CHECK (provider_kind IN ('imap', 'gmail')),
+            remote_folder TEXT,
+            uidvalidity INTEGER,
+            remote_uid INTEGER,
+            provider_message_id TEXT,
+            provider_thread_id TEXT,
+            message_id_header TEXT,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            remote_present INTEGER NOT NULL CHECK (remote_present IN (0, 1)),
+            identity_confidence TEXT NOT NULL CHECK (identity_confidence IN ('proven')),
+            CHECK ((provider_kind='imap' AND remote_folder IS NOT NULL AND uidvalidity > 0
+                   AND remote_uid > 0 AND provider_message_id IS NULL)
+                OR (provider_kind='gmail' AND provider_message_id IS NOT NULL
+                   AND remote_folder IS NULL AND uidvalidity IS NULL AND remote_uid IS NULL)),
+            UNIQUE(id, account_id)
+        )
+        """
+    )
+    connection.execute("""
+        INSERT INTO remote_messages_v6(
+            id, account_id, provider_kind, remote_folder, uidvalidity, remote_uid,
+            provider_message_id, provider_thread_id, message_id_header, first_seen_at,
+            last_seen_at, remote_present, identity_confidence
+        ) SELECT id, account_id, 'imap', remote_folder, uidvalidity, remote_uid,
+                 NULL, NULL, message_id_header, first_seen_at, last_seen_at,
+                 remote_present, identity_confidence FROM remote_messages
+    """)
+    connection.execute("""
+        CREATE TABLE remote_canonical_links_v6 (
+            remote_message_id TEXT PRIMARY KEY REFERENCES remote_messages_v6(id),
+            canonical_message_id TEXT NOT NULL REFERENCES canonical_messages(id),
+            link_reason TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(remote_message_id, canonical_message_id)
+        )
+    """)
+    connection.execute("INSERT INTO remote_canonical_links_v6 SELECT * FROM remote_canonical_links")
+    connection.execute("DROP TABLE remote_canonical_links")
+    connection.execute("DROP TABLE remote_messages")
+    connection.execute("ALTER TABLE remote_messages_v6 RENAME TO remote_messages")
+    connection.execute("ALTER TABLE remote_canonical_links_v6 RENAME TO remote_canonical_links")
+    connection.execute("""
+        CREATE UNIQUE INDEX remote_messages_imap_identity
+        ON remote_messages(account_id, remote_folder, uidvalidity, remote_uid)
+        WHERE provider_kind='imap'
+    """)
+    connection.execute("""
+        CREATE UNIQUE INDEX remote_messages_gmail_identity
+        ON remote_messages(account_id, provider_message_id)
+        WHERE provider_kind='gmail'
+    """)
+    connection.execute("""
+        CREATE TABLE gmail_labels (
+            account_id INTEGER NOT NULL REFERENCES accounts(id),
+            label_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            label_type TEXT NOT NULL CHECK (label_type IN ('system', 'user')),
+            remote_present INTEGER NOT NULL CHECK (remote_present IN (0, 1)),
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            PRIMARY KEY(account_id, label_id)
+        )
+    """)
+    connection.execute("""
+        CREATE TABLE gmail_message_labels (
+            remote_message_id TEXT NOT NULL,
+            account_id INTEGER NOT NULL,
+            label_id TEXT NOT NULL,
+            PRIMARY KEY(remote_message_id, label_id),
+            FOREIGN KEY(remote_message_id, account_id) REFERENCES remote_messages(id, account_id),
+            FOREIGN KEY(account_id, label_id) REFERENCES gmail_labels(account_id, label_id)
+        )
+    """)
+    connection.execute("""
+        CREATE TABLE gmail_sync_state (
+            account_id INTEGER PRIMARY KEY REFERENCES accounts(id),
+            history_id TEXT,
+            full_sync_required INTEGER NOT NULL DEFAULT 1 CHECK (full_sync_required IN (0, 1)),
+            last_sync_started_at TEXT,
+            last_sync_succeeded_at TEXT,
+            last_full_sync_succeeded_at TEXT,
+            last_partial_sync_succeeded_at TEXT,
+            last_error_at TEXT,
+            last_error_kind TEXT,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _migration_1),
     (2, _migration_2),
     (3, _migration_3),
     (4, _migration_4),
     (5, _migration_5),
+    (6, _migration_6),
 )
 
 

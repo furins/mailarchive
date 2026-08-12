@@ -8,7 +8,12 @@ version = "0.0.0"
 description = "Local-first email archive safety baseline"
 readme = "README.md"
 requires-python = ">=3.14"
-dependencies = ["PyYAML>=6.0.2"]
+dependencies = [
+  "PyYAML>=6.0.2",
+  "google-auth>=2.38",
+  "google-auth-oauthlib>=1.2",
+  "requests>=2.32",
+]
 
 [project.scripts]
 mailarchive = "mailarchive.cli:main"

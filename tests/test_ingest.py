@@ -119,9 +119,7 @@ def test_same_message_id_with_different_bytes_stays_distinct(
         assert connection.execute("SELECT COUNT(*) FROM canonical_messages").fetchone()[0] == 2
 
 
-def test_identical_bytes_reuse_first_metadata(
-    config_file: Path, tmp_path: Path
-) -> None:
+def test_identical_bytes_reuse_first_metadata(config_file: Path, tmp_path: Path) -> None:
     source = tmp_path / "first.eml"
     raw_bytes = _write_message(source, _message_headers("<first@example.test>"))
     copied_source = tmp_path / "second.eml"

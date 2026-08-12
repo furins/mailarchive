@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+# pyright: reportPrivateUsage=false
 import imaplib
 import threading
 from collections.abc import Generator
@@ -27,10 +28,16 @@ from mailarchive.imap import ImapSyncBusyError
 def _configure(config_file: Path, *, idle_enabled: bool = True) -> None:
     values = yaml.safe_load(config_file.read_text())
     values["accounts"]["test"]["imap"] = {
-        "host": "127.0.0.1", "port": 1993, "username": "fixture",
-        "tls_mode": "INSECURE_LOOPBACK", "folders": ["INBOX"],
-        "fast_path": {"idle_enabled": idle_enabled, "reconcile_interval_seconds": 600,
-                      "poll_interval_seconds": 90},
+        "host": "127.0.0.1",
+        "port": 1993,
+        "username": "fixture",
+        "tls_mode": "INSECURE_LOOPBACK",
+        "folders": ["INBOX"],
+        "fast_path": {
+            "idle_enabled": idle_enabled,
+            "reconcile_interval_seconds": 600,
+            "poll_interval_seconds": 90,
+        },
     }
     config_file.write_text(yaml.safe_dump(values))
 
@@ -48,7 +55,9 @@ class _Idler:
 
 
 class _Notification:
-    def __init__(self, batches: list[list[object]], log: list[str], stop: threading.Event, idle: bool = True) -> None:
+    def __init__(
+        self, batches: list[list[object]], log: list[str], stop: threading.Event, idle: bool = True
+    ) -> None:
         self.batches, self.log, self.stop, self.idle_supported = batches, log, stop, idle
 
     def open(self) -> bool:
@@ -67,7 +76,21 @@ class _Notification:
         self.log.append("logout")
 
     def __getattr__(self, name: str) -> object:
-        if name.lower() in {"fetch", "uid", "store", "copy", "move", "append", "expunge", "delete", "create", "rename", "close", "subscribe", "unsubscribe"}:
+        if name.lower() in {
+            "fetch",
+            "uid",
+            "store",
+            "copy",
+            "move",
+            "append",
+            "expunge",
+            "delete",
+            "create",
+            "rename",
+            "close",
+            "subscribe",
+            "unsubscribe",
+        }:
             raise AssertionError(f"forbidden notification method: {name}")
         raise AttributeError(name)
 
@@ -99,12 +122,25 @@ class _Index:
                 raise result
 
 
-def _watcher(config_file: Path, batches: list[list[object]], log: list[str], stop: threading.Event, **kwargs: object) -> FastPathWatcher:
+def _watcher(
+    config_file: Path,
+    batches: list[list[object]],
+    log: list[str],
+    stop: threading.Event,
+    **kwargs: object,
+) -> FastPathWatcher:
     config = load_config(config_file)
     notification = _Notification(batches, log, stop, kwargs.pop("idle", True))
-    return FastPathWatcher(config, "test", stop, notification_factory=lambda *_: notification,
-                           sync_adapter=kwargs.pop("sync", _Sync(log)), index_adapter=kwargs.pop("index", _Index(log)),
-                           idle_window_seconds=30, **kwargs)
+    return FastPathWatcher(
+        config,
+        "test",
+        stop,
+        notification_factory=lambda *_: notification,
+        sync_adapter=kwargs.pop("sync", _Sync(log)),
+        index_adapter=kwargs.pop("index", _Index(log)),
+        idle_window_seconds=30,
+        **kwargs,
+    )
 
 
 def test_startup_arms_public_idle_before_m3_sync(config_file: Path) -> None:
@@ -123,7 +159,10 @@ def test_burst_is_coalesced_and_never_uses_sequence_as_uid(config_file: Path) ->
     watcher.run()
     assert log.count("sync:INBOX") == 2  # startup + one event-triggered catch-up
     assert all(folder == "INBOX" for _, folder in watcher.sync_adapter.calls)  # type: ignore[attr-defined]
-    assert log.index("idle-exit") < log[log.index("sync:INBOX") + 1 :].index("sync:INBOX") + log.index("sync:INBOX") + 1
+    assert (
+        log.index("idle-exit")
+        < log[log.index("sync:INBOX") + 1 :].index("sync:INBOX") + log.index("sync:INBOX") + 1
+    )
 
 
 def test_empty_idle_window_does_not_sync_again(config_file: Path) -> None:
@@ -159,13 +198,17 @@ def test_sync_busy_stays_pending_but_index_failure_does_not_refetch(config_file:
     assert index.calls >= 2
 
 
-def test_status_is_local_and_stale_heartbeat_wins(config_file: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_status_is_local_and_stale_heartbeat_wins(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     _configure(config_file)
     config = load_config(config_file)
     stop, log = threading.Event(), []
     watcher = _watcher(config_file, [], log, stop)
     watcher._health("idle", last_heartbeat_at="2000-01-01T00:00:00+00:00")  # pyright: ignore[reportPrivateUsage]
-    monkeypatch.setattr("mailarchive.imap.imaplib.IMAP4", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr(
+        "mailarchive.imap.imaplib.IMAP4", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError())
+    )
     status = fast_path_status(config)[0]
     assert status.effective_mode == "idle" and status.state == "stale"
     watcher._health("stopped", last_heartbeat_at="2000-01-01T00:00:00+00:00")  # pyright: ignore[reportPrivateUsage]
@@ -181,7 +224,14 @@ def test_authentication_failure_stops_without_polling_or_sync(config_file: Path)
             raise FastPathPermanentError("IMAP authentication failed")
 
     config = load_config(config_file)
-    watcher = FastPathWatcher(config, "test", stop, notification_factory=lambda *_: _Rejected([], log, stop), sync_adapter=_Sync(log), index_adapter=_Index(log))  # pyright: ignore[reportArgumentType]
+    watcher = FastPathWatcher(
+        config,
+        "test",
+        stop,
+        notification_factory=lambda *_: _Rejected([], log, stop),
+        sync_adapter=_Sync(log),
+        index_adapter=_Index(log),
+    )  # pyright: ignore[reportArgumentType]
     with pytest.raises(FastPathPermanentError):
         watcher.run()
     assert "sync:INBOX" not in log and "poll" not in log
@@ -202,16 +252,23 @@ def test_real_imaplib_login_rejection_is_safe_permanent_failure(
         def logout(self) -> None:
             log.append("logout")
 
-    monkeypatch.setattr("mailarchive.fastpath.ImapAdapter.open_notification_connection", lambda *_: _Client())
-    watcher = FastPathWatcher(config, "test", stop, sync_adapter=_Sync(log), index_adapter=_Index(log))
+    monkeypatch.setattr(
+        "mailarchive.fastpath.ImapAdapter.open_notification_connection", lambda *_: _Client()
+    )
+    watcher = FastPathWatcher(
+        config, "test", stop, sync_adapter=_Sync(log), index_adapter=_Index(log)
+    )
     with pytest.raises(FastPathPermanentError):
         watcher.run()
     assert log == ["logout"]
     status = fast_path_status(config)[0]
     assert status.state == "stopped" and status.last_error_kind == "authentication"
     from mailarchive.db import connect
+
     with connect(config.database.path) as connection:
-        stored = str(connection.execute("SELECT group_concat(details_json) FROM audit_events").fetchone()[0])
+        stored = str(
+            connection.execute("SELECT group_concat(details_json) FROM audit_events").fetchone()[0]
+        )
     assert "fixture authentication rejected" not in stored and "secret-value" not in stored
     with watcher_lock(config, config.accounts[0]):
         pass
@@ -223,7 +280,9 @@ def test_acquisition_degradation_persists_until_success_in_idle_and_poll(config_
     sync = _Sync(log, [RuntimeError("acquire"), None, RuntimeError("acquire"), None])
     watcher = _watcher(config_file, [], log, stop, sync=sync)
     assert not watcher._sync_and_refresh("idle")  # pyright: ignore[reportPrivateUsage]
-    watcher._health(watcher._operational_mode("idle"), last_heartbeat_at="2026-01-01T00:00:00+00:00")  # pyright: ignore[reportPrivateUsage]
+    watcher._health(
+        watcher._operational_mode("idle"), last_heartbeat_at="2026-01-01T00:00:00+00:00"
+    )  # pyright: ignore[reportPrivateUsage]
     assert fast_path_status(load_config(config_file))[0].effective_mode == "degraded"
     assert watcher._sync_and_refresh("idle")  # pyright: ignore[reportPrivateUsage]
     watcher._health(watcher._operational_mode("idle"))  # pyright: ignore[reportPrivateUsage]
@@ -266,10 +325,19 @@ def test_reconnect_count_is_cumulative_and_backoff_resets(config_file: Path) -> 
         _Notification([[]], log, stop),
     ]
     config = load_config(config_file)
-    watcher = FastPathWatcher(config, "test", stop, notification_factory=lambda *_: connections.pop(0), sync_adapter=_Sync(log), index_adapter=_Index(log))  # pyright: ignore[reportArgumentType]
+    watcher = FastPathWatcher(
+        config,
+        "test",
+        stop,
+        notification_factory=lambda *_: connections.pop(0),
+        sync_adapter=_Sync(log),
+        index_adapter=_Index(log),
+    )  # pyright: ignore[reportArgumentType]
+
     def wait(delay: float) -> bool:
         waits.append(delay)
         return False
+
     stop.wait = wait  # type: ignore[method-assign]
     watcher.run()
     status = fast_path_status(config)[0]
@@ -289,10 +357,19 @@ def test_abort_uses_capped_consecutive_transport_backoff(config_file: Path) -> N
 
     config = load_config(config_file)
     connections = [_Abort([], log, stop) for _ in range(7)]
-    watcher = FastPathWatcher(config, "test", stop, notification_factory=lambda *_: connections.pop(0), sync_adapter=_Sync(log), index_adapter=_Index(log))  # pyright: ignore[reportArgumentType]
+    watcher = FastPathWatcher(
+        config,
+        "test",
+        stop,
+        notification_factory=lambda *_: connections.pop(0),
+        sync_adapter=_Sync(log),
+        index_adapter=_Index(log),
+    )  # pyright: ignore[reportArgumentType]
+
     def wait(delay: float) -> bool:
         waits.append(delay)
         return len(waits) == 7
+
     stop.wait = wait  # type: ignore[method-assign]
     watcher.run()
     assert waits == [1, 2, 5, 10, 30, 60, 60]
@@ -310,7 +387,15 @@ def test_watcher_lock_is_distinct_and_released(config_file: Path) -> None:
         pass
 
 
-@pytest.mark.parametrize("key,value", [("reconcile_interval_seconds", 59), ("reconcile_interval_seconds", 1741), ("poll_interval_seconds", 59), ("poll_interval_seconds", 121)])
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("reconcile_interval_seconds", 59),
+        ("reconcile_interval_seconds", 1741),
+        ("poll_interval_seconds", 59),
+        ("poll_interval_seconds", 121),
+    ],
+)
 def test_fast_path_timing_validation(config_file: Path, key: str, value: int) -> None:
     _configure(config_file)
     values = yaml.safe_load(config_file.read_text())

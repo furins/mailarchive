@@ -10,7 +10,7 @@ from mailarchive.config import ConfigError, display_config, load_config
 
 def test_valid_example_configuration() -> None:
     config = load_config(Path("config.example.yaml"))
-    assert len(config.accounts) == 2
+    assert len(config.accounts) == 3
 
 
 def test_invalid_account_kind_rejected(config_file: Path) -> None:

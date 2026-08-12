@@ -142,7 +142,7 @@ class ImapNotificationConnection:
         if self.client is not None:
             try:
                 self.client.logout()
-            except (OSError, imaplib.IMAP4.error):
+            except OSError, imaplib.IMAP4.error:
                 pass
             self.client = None
 
@@ -151,10 +151,18 @@ class FastPathWatcher:
     """Long-running INBOX watcher with arm-before-sync and bounded IDLE windows."""
 
     def __init__(
-        self, config: AppConfig, account_name: str, stop_event: threading.Event,
-        *, notification_factory: Callable[[AppConfig, AccountConfig], ImapNotificationConnection] = ImapNotificationConnection,
-        sync_adapter: ImapAdapter | None = None, index_adapter: NotmuchAdapter | None = None,
-        monotonic_clock: Callable[[], float] = monotonic, idle_window_seconds: float = IDLE_WINDOW_SECONDS,
+        self,
+        config: AppConfig,
+        account_name: str,
+        stop_event: threading.Event,
+        *,
+        notification_factory: Callable[
+            [AppConfig, AccountConfig], ImapNotificationConnection
+        ] = ImapNotificationConnection,
+        sync_adapter: ImapAdapter | None = None,
+        index_adapter: NotmuchAdapter | None = None,
+        monotonic_clock: Callable[[], float] = monotonic,
+        idle_window_seconds: float = IDLE_WINDOW_SECONDS,
     ) -> None:
         self.config, self.account_name, self.stop_event = config, account_name, stop_event
         self.notification_factory = notification_factory
@@ -171,9 +179,13 @@ class FastPathWatcher:
         return "degraded" if self.acquisition_degraded or self._index_pending() else normal_mode
 
     def _account(self) -> AccountConfig:
-        account = next((item for item in self.config.accounts if item.name == self.account_name), None)
+        account = next(
+            (item for item in self.config.accounts if item.name == self.account_name), None
+        )
         if account is None or not account.enabled or account.kind != "imap" or account.imap is None:
-            raise FastPathError("watch requires one enabled ordinary IMAP account with IMAP configuration")
+            raise FastPathError(
+                "watch requires one enabled ordinary IMAP account with IMAP configuration"
+            )
         if "INBOX" not in account.imap.folders:
             raise FastPathError("watch requires INBOX in the configured IMAP folder list")
         return account
@@ -181,7 +193,19 @@ class FastPathWatcher:
     def _health(self, mode: str, **values: object) -> None:
         initialize(self.config.database.path, self.config.accounts)
         now = utc_now()
-        allowed = {"watcher_started_at", "last_heartbeat_at", "last_event_at", "last_sync_started_at", "last_sync_succeeded_at", "last_index_succeeded_at", "last_error_at", "last_error_kind", "consecutive_failures", "reconnect_count", "index_pending"}
+        allowed = {
+            "watcher_started_at",
+            "last_heartbeat_at",
+            "last_event_at",
+            "last_sync_started_at",
+            "last_sync_succeeded_at",
+            "last_index_succeeded_at",
+            "last_error_at",
+            "last_error_kind",
+            "consecutive_failures",
+            "reconnect_count",
+            "index_pending",
+        }
         updates = {key: value for key, value in values.items() if key in allowed}
         with connect(self.config.database.path) as connection:
             aid = account_id(connection, self.account.name)
@@ -189,17 +213,26 @@ class FastPathWatcher:
                 raise FastPathError("account is not active in local state")
             columns = ["account_id", "remote_folder", "mode", "updated_at", *updates]
             params = [aid, "INBOX", mode, now, *updates.values()]
-            assignments = ", ".join(f"{key}=excluded.{key}" for key in ["mode", "updated_at", *updates])
+            assignments = ", ".join(
+                f"{key}=excluded.{key}" for key in ["mode", "updated_at", *updates]
+            )
             connection.execute(
                 f"INSERT INTO fast_path_health ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)}) "
-                f"ON CONFLICT(account_id, remote_folder) DO UPDATE SET {assignments}", params,
+                f"ON CONFLICT(account_id, remote_folder) DO UPDATE SET {assignments}",
+                params,
             )
             connection.commit()
 
     def _audit(self, event: str, result: str, details: dict[str, object]) -> None:
         with connect(self.config.database.path) as connection:
-            insert_audit_event(connection, actor="mailarchive.fastpath", event_type=event, result=result,
-                account_id=account_id(connection, self.account.name), details_json=json.dumps(details, sort_keys=True))
+            insert_audit_event(
+                connection,
+                actor="mailarchive.fastpath",
+                event_type=event,
+                result=result,
+                account_id=account_id(connection, self.account.name),
+                details_json=json.dumps(details, sort_keys=True),
+            )
             connection.commit()
 
     def _sync_and_refresh(self, mode: str) -> bool:
@@ -211,13 +244,28 @@ class FastPathWatcher:
             return False
         except Exception:
             self.acquisition_degraded = True
-            self._health("degraded", last_error_at=utc_now(), last_error_kind="acquisition", consecutive_failures=1)
-            self._audit("imap.fast_sync.failed", "failed", {"folder": "INBOX", "error_kind": "acquisition"})
+            self._health(
+                "degraded",
+                last_error_at=utc_now(),
+                last_error_kind="acquisition",
+                consecutive_failures=1,
+            )
+            self._audit(
+                "imap.fast_sync.failed", "failed", {"folder": "INBOX", "error_kind": "acquisition"}
+            )
             # Acquisition failures do not create guessed identities.  A later reconciliation retries.
             return False
         self._health(mode, last_sync_succeeded_at=utc_now(), consecutive_failures=0)
         self.acquisition_degraded = False
-        self._audit("imap.fast_sync.succeeded", "success", {"folder": "INBOX", "fetched": len(results), "imported": sum(item.created for item in results)})
+        self._audit(
+            "imap.fast_sync.succeeded",
+            "success",
+            {
+                "folder": "INBOX",
+                "fetched": len(results),
+                "imported": sum(item.created for item in results),
+            },
+        )
         self._refresh_index(mode)
         # Indexing is independent local derived state; never re-fetch bodies to repair it.
         return True
@@ -227,10 +275,18 @@ class FastPathWatcher:
         try:
             self.index_adapter.refresh()
         except Exception:
-            self._health("degraded", index_pending=1, last_error_at=utc_now(), last_error_kind="indexing")
-            self._audit("notmuch.fast_refresh.failed", "failed", {"folder": "INBOX", "error_kind": "indexing"})
+            self._health(
+                "degraded", index_pending=1, last_error_at=utc_now(), last_error_kind="indexing"
+            )
+            self._audit(
+                "notmuch.fast_refresh.failed",
+                "failed",
+                {"folder": "INBOX", "error_kind": "indexing"},
+            )
             return False
-        self._health(mode, index_pending=0, last_index_succeeded_at=utc_now(), consecutive_failures=0)
+        self._health(
+            mode, index_pending=0, last_index_succeeded_at=utc_now(), consecutive_failures=0
+        )
         if was_pending:
             self._audit("notmuch.fast_refresh.recovered", "success", {"folder": "INBOX"})
         return True
@@ -276,22 +332,32 @@ class FastPathWatcher:
                             "success",
                             {"folder": "INBOX", "reconnect_count": self._reconnect_count},
                         )
-            except (OSError, EOFError, TimeoutError, imaplib.IMAP4.abort):
+            except OSError, EOFError, TimeoutError, imaplib.IMAP4.abort:
                 raise
             except imaplib.IMAP4.error as error:
                 raise FastPathIdleRejectedError("IDLE command rejected") from error
-            relevant = next((kind for item in batch if (kind := _event_type(item)) in _RELEVANT_EVENTS), None)
+            relevant = next(
+                (kind for item in batch if (kind := _event_type(item)) in _RELEVANT_EVENTS), None
+            )
             if relevant is not None:
                 pending = True
                 self._health("idle", last_event_at=utc_now())
-                self._audit("imap.watch.event", "observed", {"folder": "INBOX", "event_type": relevant})
-            if self.clock() - last_reconcile >= self.account.imap.fast_path.reconcile_interval_seconds:
+                self._audit(
+                    "imap.watch.event", "observed", {"folder": "INBOX", "event_type": relevant}
+                )
+            if (
+                self.clock() - last_reconcile
+                >= self.account.imap.fast_path.reconcile_interval_seconds
+            ):
                 pending = True
             self._health(self._operational_mode("idle"), last_heartbeat_at=utc_now())
 
     def _index_pending(self) -> bool:
         with connect(self.config.database.path) as connection:
-            row = connection.execute("SELECT index_pending FROM fast_path_health JOIN accounts ON accounts.id=fast_path_health.account_id WHERE accounts.name=? AND remote_folder='INBOX'", (self.account.name,)).fetchone()
+            row = connection.execute(
+                "SELECT index_pending FROM fast_path_health JOIN accounts ON accounts.id=fast_path_health.account_id WHERE accounts.name=? AND remote_folder='INBOX'",
+                (self.account.name,),
+            ).fetchone()
         return row is not None and bool(row[0])
 
     def run(self) -> None:
@@ -309,25 +375,55 @@ class FastPathWatcher:
                         connection = self.notification_factory(self.config, self.account)
                         self._transport_recovered = False
                         if not connection.open():
-                            self._health("poll", last_error_at=utc_now(), last_error_kind="idle-unsupported")
-                            self._audit("imap.watch.mode", "poll", {"folder": "INBOX", "reason": "idle-unsupported"})
+                            self._health(
+                                "poll", last_error_at=utc_now(), last_error_kind="idle-unsupported"
+                            )
+                            self._audit(
+                                "imap.watch.mode",
+                                "poll",
+                                {"folder": "INBOX", "reason": "idle-unsupported"},
+                            )
                             self._run_poll()
                             return
                         self._run_idle(connection)
                         return
                     except FastPathIdleRejectedError:
-                        self._health("poll", last_error_at=utc_now(), last_error_kind="imap-protocol")
+                        self._health(
+                            "poll", last_error_at=utc_now(), last_error_kind="imap-protocol"
+                        )
                         self._run_poll()
                         return
                     except FastPathPermanentError:
-                        self._health("stopped", last_error_at=utc_now(), last_error_kind="authentication")
-                        self._audit("imap.watch.failed", "failed", {"folder": "INBOX", "error_kind": "authentication"})
+                        self._health(
+                            "stopped", last_error_at=utc_now(), last_error_kind="authentication"
+                        )
+                        self._audit(
+                            "imap.watch.failed",
+                            "failed",
+                            {"folder": "INBOX", "error_kind": "authentication"},
+                        )
                         raise
-                    except (OSError, EOFError, TimeoutError, imaplib.IMAP4.abort):
+                    except OSError, EOFError, TimeoutError, imaplib.IMAP4.abort:
                         self._consecutive_transport_failures += 1
-                        delay = _BACKOFF[min(self._consecutive_transport_failures - 1, len(_BACKOFF) - 1)]
-                        self._health("reconnecting", last_error_at=utc_now(), last_error_kind="network", consecutive_failures=self._consecutive_transport_failures, reconnect_count=self._reconnect_count)
-                        self._audit("imap.watch.reconnecting", "retrying", {"folder": "INBOX", "reconnect_count": self._reconnect_count, "error_kind": "network"})
+                        delay = _BACKOFF[
+                            min(self._consecutive_transport_failures - 1, len(_BACKOFF) - 1)
+                        ]
+                        self._health(
+                            "reconnecting",
+                            last_error_at=utc_now(),
+                            last_error_kind="network",
+                            consecutive_failures=self._consecutive_transport_failures,
+                            reconnect_count=self._reconnect_count,
+                        )
+                        self._audit(
+                            "imap.watch.reconnecting",
+                            "retrying",
+                            {
+                                "folder": "INBOX",
+                                "reconnect_count": self._reconnect_count,
+                                "error_kind": "network",
+                            },
+                        )
                         if self.stop_event.wait(delay):
                             return
                     finally:
@@ -342,17 +438,53 @@ class FastPathWatcher:
 def fast_path_status(config: AppConfig) -> list[HealthRecord]:
     """Local SQLite/configuration status only; deliberately performs no network I/O."""
     if not config.database.path.exists():
-        return [HealthRecord(account.name, "INBOX", "idle-preferred" if account.imap and account.imap.fast_path.idle_enabled else "poll-only", None, "not-started", None, None, None, None, 0, 0, False, None) for account in config.accounts if account.kind == "imap" and account.imap is not None and "INBOX" in account.imap.folders]
+        return [
+            HealthRecord(
+                account.name,
+                "INBOX",
+                "idle-preferred"
+                if account.imap and account.imap.fast_path.idle_enabled
+                else "poll-only",
+                None,
+                "not-started",
+                None,
+                None,
+                None,
+                None,
+                0,
+                0,
+                False,
+                None,
+            )
+            for account in config.accounts
+            if account.kind == "imap"
+            and account.imap is not None
+            and "INBOX" in account.imap.folders
+        ]
     now = datetime.now(UTC)
     records: list[HealthRecord] = []
     with connect(config.database.path) as connection:
-        health_exists = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='fast_path_health'"
-        ).fetchone() is not None
+        health_exists = (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='fast_path_health'"
+            ).fetchone()
+            is not None
+        )
         for account in config.accounts:
-            if account.kind != "imap" or account.imap is None or "INBOX" not in account.imap.folders:
+            if (
+                account.kind != "imap"
+                or account.imap is None
+                or "INBOX" not in account.imap.folders
+            ):
                 continue
-            row = None if not health_exists else connection.execute("SELECT * FROM fast_path_health JOIN accounts ON accounts.id=fast_path_health.account_id WHERE accounts.name=? AND remote_folder='INBOX'", (account.name,)).fetchone()
+            row = (
+                None
+                if not health_exists
+                else connection.execute(
+                    "SELECT * FROM fast_path_health JOIN accounts ON accounts.id=fast_path_health.account_id WHERE accounts.name=? AND remote_folder='INBOX'",
+                    (account.name,),
+                ).fetchone()
+            )
             configured = "idle-preferred" if account.imap.fast_path.idle_enabled else "poll-only"
             if row is None:
                 records.append(
@@ -374,8 +506,28 @@ def fast_path_status(config: AppConfig) -> list[HealthRecord]:
                 )
                 continue
             heartbeat = row["last_heartbeat_at"]
-            stale = not heartbeat or (now - datetime.fromisoformat(str(heartbeat))).total_seconds() > FAST_PATH_STALE_SECONDS
+            stale = (
+                not heartbeat
+                or (now - datetime.fromisoformat(str(heartbeat))).total_seconds()
+                > FAST_PATH_STALE_SECONDS
+            )
             mode = str(row["mode"])
             state = "stopped" if mode == "stopped" else ("stale" if stale else "active")
-            records.append(HealthRecord(account.name, "INBOX", configured, mode, state, heartbeat, row["last_event_at"], row["last_sync_succeeded_at"], row["last_index_succeeded_at"], int(row["consecutive_failures"]), int(row["reconnect_count"]), bool(row["index_pending"]), row["last_error_kind"]))
+            records.append(
+                HealthRecord(
+                    account.name,
+                    "INBOX",
+                    configured,
+                    mode,
+                    state,
+                    heartbeat,
+                    row["last_event_at"],
+                    row["last_sync_succeeded_at"],
+                    row["last_index_succeeded_at"],
+                    int(row["consecutive_failures"]),
+                    int(row["reconnect_count"]),
+                    bool(row["index_pending"]),
+                    row["last_error_kind"],
+                )
+            )
     return records

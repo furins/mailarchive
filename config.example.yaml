@@ -42,6 +42,18 @@ accounts:
         reconcile_interval_seconds: 600
         poll_interval_seconds: 90
 
+  personal-gmail:
+    kind: gmail
+    enabled: true
+    remote_retention_days: 365
+    remote_deletion_enabled: false
+    required_verified_backups: 2
+    config_ref: file:/etc/mailarchive/secrets/personal-gmail-token.json
+    gmail:
+      account_email: user@example.com
+      oauth_client_secret_file: /etc/mailarchive/secrets/google-oauth-client.json
+      poll_interval_seconds: 90
+
 spam:
   enabled: true
   suspect_quarantine_days: 365

@@ -263,10 +263,14 @@ def test_dovecot_idle_fast_path_acquires_and_indexes_without_poll(
     port, _, _ = dovecot_loopback
     values = yaml.safe_load(config_file.read_text())
     values["accounts"]["test"]["imap"] = {
-        "host": "127.0.0.1", "port": port, "username": "fixture",
-        "tls_mode": "INSECURE_LOOPBACK", "folders": ["INBOX"],
+        "host": "127.0.0.1",
+        "port": port,
+        "username": "fixture",
+        "tls_mode": "INSECURE_LOOPBACK",
+        "folders": ["INBOX"],
         "fast_path": {
-            "idle_enabled": True, "poll_interval_seconds": 120,
+            "idle_enabled": True,
+            "poll_interval_seconds": 120,
             "reconcile_interval_seconds": 1740,
         },
     }
@@ -278,11 +282,15 @@ def test_dovecot_idle_fast_path_acquires_and_indexes_without_poll(
     thread = threading.Thread(target=watcher.run, daemon=True)
     thread.start()
     _wait_until(lambda: fast_path_status(config)[0].effective_mode == "idle")
+
     def initial_sync_complete() -> bool:
         with connect(config.database.path) as connection:
-            return connection.execute(
-                "SELECT 1 FROM audit_events WHERE event_type='imap.fast_sync.succeeded'"
-            ).fetchone() is not None
+            return (
+                connection.execute(
+                    "SELECT 1 FROM audit_events WHERE event_type='imap.fast_sync.succeeded'"
+                ).fetchone()
+                is not None
+            )
 
     _wait_until(initial_sync_complete)
     # The initial arm-before-sync catch-up is complete; append into a subsequent genuine IDLE wait.
@@ -295,6 +303,7 @@ def test_dovecot_idle_fast_path_acquires_and_indexes_without_poll(
         assert client.append(encode_mailbox_name("INBOX"), None, None, raw)[0] == "OK"
     finally:
         client.logout()
+
     def searchable() -> bool:
         try:
             return bool(search_canonical_messages(config, "idle-distinctive-token"))

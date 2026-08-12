@@ -4,9 +4,10 @@ Local-first, searchable and verifiable email archiving for multiple Gmail, IMAP 
 
 ## Status
 
-M4 adds a long-running ordinary-IMAP INBOX fast path. SQLite inventory and exact
-RFC822/MIME bytes remain authoritative. Gmail, POP3, retention, and all remote mutation remain
-out of scope.
+M5 adds read-only Gmail REST acquisition. Gmail `Message.id` is global provider identity, while
+labels and thread IDs are metadata only; `messages.get(format=RAW)` bytes are canonically ingested
+unchanged. Gmail history is polled every 90 seconds by default, includes SPAM/TRASH inventory, and
+never uses Gmail IMAP, Pub/Sub, or mailbox mutation. See `docs/GMAIL_SETUP.md`.
 
 ## M4 IMAP fast path
 

@@ -95,3 +95,17 @@ The M3 Dovecot loopback fidelity test rejected isync/mbsync as a canonical acqui
 path: isync 1.4.4 converted CRLF to LF and injected `X-TUID` into its Maildir copy.
 MailArchive now fetches each new UID with read-only `BODY.PEEK[]`; the returned literal is
 written unchanged to canonical Maildir. mbsync is not a production dependency.
+
+## ADR-016 — Gmail REST API is the M5 provider path
+
+Status: accepted.
+
+Gmail M5 uses Gmail REST API v1 only, with `gmail.readonly` and explicit GET-only methods for
+profile, labels, messages, and history. Gmail `Message.id` is the provider-global remote
+identity; RFC Message-ID, threadId, labels, and label names are not identity. A message with many
+labels has one remote identity and may have one canonical byte object and many label relationships.
+Canonical acquisition uses `messages.get(format=RAW)`, strict base64url decoding, and M1 byte
+ingest without rewriting bytes. Gmail IMAP, Pub/Sub, users.watch, and all Gmail mailbox mutation
+are deliberately out of scope. History polling defaults to 90 seconds; expired history requires a
+safe full sync. Token and OAuth client-secret files must remain outside `archive.root`. SPAM and
+TRASH are inventoried as provider labels only; M7 owns local spam/quarantine policy.

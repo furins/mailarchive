@@ -40,6 +40,15 @@ class FastPathConfig:
 
 
 @dataclass(frozen=True)
+class GmailConfig:
+    """Read-only Gmail API configuration; secrets are always file references."""
+
+    account_email: str
+    oauth_client_secret_file: Path
+    poll_interval_seconds: int = 90
+
+
+@dataclass(frozen=True)
 class AccountConfig:
     name: str
     kind: AccountKind
@@ -49,6 +58,7 @@ class AccountConfig:
     required_verified_backups: int
     config_ref: str
     imap: ImapConfig | None = None
+    gmail: GmailConfig | None = None
 
 
 @dataclass(frozen=True)
