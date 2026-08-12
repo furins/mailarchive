@@ -106,14 +106,22 @@ class ImapNotificationConnection:
         self.client: NotificationConnection | None = None
 
     def open(self) -> bool:
-        password = os.environ.get(credential_variable(self.account.config_ref))
+        try:
+            variable = credential_variable(self.account.config_ref)
+        except ImapError:
+            raise FastPathPermanentError("invalid IMAP credential configuration") from None
+        password = os.environ.get(variable)
         if not password:
             raise FastPathPermanentError("missing credential environment variable")
         self.client = cast(
             NotificationConnection,
             ImapAdapter(self.config).open_notification_connection(self.account),
         )
-        if self.client.login(self.account.imap.username, password)[0] != "OK":  # type: ignore[union-attr]
+        try:
+            login_status, _ = self.client.login(self.account.imap.username, password)  # type: ignore[union-attr]
+        except imaplib.IMAP4.error:
+            raise FastPathPermanentError("IMAP authentication failed") from None
+        if login_status != "OK":
             raise FastPathPermanentError("IMAP authentication failed")
         if self.client.select(encode_mailbox_name("INBOX"), readonly=True)[0] != "OK":
             raise FastPathError("IMAP INBOX cannot be selected read-only")
@@ -154,6 +162,13 @@ class FastPathWatcher:
         self.index_adapter = index_adapter or NotmuchAdapter(config)
         self.clock, self.idle_window_seconds = monotonic_clock, idle_window_seconds
         self.account = self._account()
+        self.acquisition_degraded = False
+        self._transport_recovered = False
+        self._consecutive_transport_failures = 0
+        self._reconnect_count = 0
+
+    def _operational_mode(self, normal_mode: str) -> str:
+        return "degraded" if self.acquisition_degraded or self._index_pending() else normal_mode
 
     def _account(self) -> AccountConfig:
         account = next((item for item in self.config.accounts if item.name == self.account_name), None)
@@ -195,11 +210,13 @@ class FastPathWatcher:
             self._health(mode, last_error_at=utc_now(), last_error_kind="sync-busy")
             return False
         except Exception:
+            self.acquisition_degraded = True
             self._health("degraded", last_error_at=utc_now(), last_error_kind="acquisition", consecutive_failures=1)
             self._audit("imap.fast_sync.failed", "failed", {"folder": "INBOX", "error_kind": "acquisition"})
             # Acquisition failures do not create guessed identities.  A later reconciliation retries.
             return False
         self._health(mode, last_sync_succeeded_at=utc_now(), consecutive_failures=0)
+        self.acquisition_degraded = False
         self._audit("imap.fast_sync.succeeded", "success", {"folder": "INBOX", "fetched": len(results), "imported": sum(item.created for item in results)})
         self._refresh_index(mode)
         # Indexing is independent local derived state; never re-fetch bodies to repair it.
@@ -226,7 +243,7 @@ class FastPathWatcher:
         while not self.stop_event.is_set():
             self._audit("imap.watch.poll", "started", {"folder": "INBOX"})
             self._sync_and_refresh("poll")
-            self._health("poll", last_heartbeat_at=utc_now())
+            self._health(self._operational_mode("poll"), last_heartbeat_at=utc_now())
             self.stop_event.wait(interval)
 
     def _run_idle(self, connection: ImapNotificationConnection) -> None:
@@ -245,6 +262,20 @@ class FastPathWatcher:
                         # Local-only retry; it sends no notification-connection command.
                         self._refresh_index("idle")
                     batch = list(idler.burst(interval=BURST_INTERVAL_SECONDS))
+                    self._transport_recovered = True
+                    if self._consecutive_transport_failures:
+                        self._reconnect_count += 1
+                        self._consecutive_transport_failures = 0
+                        self._health(
+                            "idle",
+                            reconnect_count=self._reconnect_count,
+                            consecutive_failures=0,
+                        )
+                        self._audit(
+                            "imap.watch.reconnected",
+                            "success",
+                            {"folder": "INBOX", "reconnect_count": self._reconnect_count},
+                        )
             except (OSError, EOFError, TimeoutError, imaplib.IMAP4.abort):
                 raise
             except imaplib.IMAP4.error as error:
@@ -256,8 +287,7 @@ class FastPathWatcher:
                 self._audit("imap.watch.event", "observed", {"folder": "INBOX", "event_type": relevant})
             if self.clock() - last_reconcile >= self.account.imap.fast_path.reconcile_interval_seconds:
                 pending = True
-            heartbeat_mode = "degraded" if self._index_pending() else "idle"
-            self._health(heartbeat_mode, last_heartbeat_at=utc_now())
+            self._health(self._operational_mode("idle"), last_heartbeat_at=utc_now())
 
     def _index_pending(self) -> bool:
         with connect(self.config.database.path) as connection:
@@ -269,8 +299,6 @@ class FastPathWatcher:
         with watcher_lock(self.config, self.account):
             self._audit("imap.watch.started", "started", {"folder": "INBOX"})
             connection: ImapNotificationConnection | None = None
-            consecutive_transport_failures = 0
-            reconnect_count = 0
             try:
                 assert self.account.imap is not None
                 if not self.account.imap.fast_path.idle_enabled:
@@ -279,16 +307,12 @@ class FastPathWatcher:
                 while not self.stop_event.is_set():
                     try:
                         connection = self.notification_factory(self.config, self.account)
+                        self._transport_recovered = False
                         if not connection.open():
                             self._health("poll", last_error_at=utc_now(), last_error_kind="idle-unsupported")
                             self._audit("imap.watch.mode", "poll", {"folder": "INBOX", "reason": "idle-unsupported"})
                             self._run_poll()
                             return
-                        if consecutive_transport_failures:
-                            reconnect_count += 1
-                            self._health("idle", reconnect_count=reconnect_count, consecutive_failures=0)
-                            self._audit("imap.watch.reconnected", "success", {"folder": "INBOX", "reconnect_count": reconnect_count})
-                            consecutive_transport_failures = 0
                         self._run_idle(connection)
                         return
                     except FastPathIdleRejectedError:
@@ -300,10 +324,10 @@ class FastPathWatcher:
                         self._audit("imap.watch.failed", "failed", {"folder": "INBOX", "error_kind": "authentication"})
                         raise
                     except (OSError, EOFError, TimeoutError, imaplib.IMAP4.abort):
-                        consecutive_transport_failures += 1
-                        delay = _BACKOFF[min(consecutive_transport_failures - 1, len(_BACKOFF) - 1)]
-                        self._health("reconnecting", last_error_at=utc_now(), last_error_kind="network", consecutive_failures=consecutive_transport_failures, reconnect_count=reconnect_count)
-                        self._audit("imap.watch.reconnecting", "retrying", {"folder": "INBOX", "reconnect_count": reconnect_count, "error_kind": "network"})
+                        self._consecutive_transport_failures += 1
+                        delay = _BACKOFF[min(self._consecutive_transport_failures - 1, len(_BACKOFF) - 1)]
+                        self._health("reconnecting", last_error_at=utc_now(), last_error_kind="network", consecutive_failures=self._consecutive_transport_failures, reconnect_count=self._reconnect_count)
+                        self._audit("imap.watch.reconnecting", "retrying", {"folder": "INBOX", "reconnect_count": self._reconnect_count, "error_kind": "network"})
                         if self.stop_event.wait(delay):
                             return
                     finally:

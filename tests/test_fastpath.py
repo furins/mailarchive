@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import imaplib
 import threading
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -187,6 +188,54 @@ def test_authentication_failure_stops_without_polling_or_sync(config_file: Path)
     assert fast_path_status(config)[0].state == "stopped"
 
 
+def test_real_imaplib_login_rejection_is_safe_permanent_failure(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure(config_file)
+    monkeypatch.setenv("MAILARCHIVE_TEST_SECRET", "secret-value")
+    config, stop, log = load_config(config_file), threading.Event(), []
+
+    class _Client:
+        def login(self, _user: str, _password: str) -> tuple[str, list[bytes]]:
+            raise imaplib.IMAP4.error("fixture authentication rejected")
+
+        def logout(self) -> None:
+            log.append("logout")
+
+    monkeypatch.setattr("mailarchive.fastpath.ImapAdapter.open_notification_connection", lambda *_: _Client())
+    watcher = FastPathWatcher(config, "test", stop, sync_adapter=_Sync(log), index_adapter=_Index(log))
+    with pytest.raises(FastPathPermanentError):
+        watcher.run()
+    assert log == ["logout"]
+    status = fast_path_status(config)[0]
+    assert status.state == "stopped" and status.last_error_kind == "authentication"
+    from mailarchive.db import connect
+    with connect(config.database.path) as connection:
+        stored = str(connection.execute("SELECT group_concat(details_json) FROM audit_events").fetchone()[0])
+    assert "fixture authentication rejected" not in stored and "secret-value" not in stored
+    with watcher_lock(config, config.accounts[0]):
+        pass
+
+
+def test_acquisition_degradation_persists_until_success_in_idle_and_poll(config_file: Path) -> None:
+    _configure(config_file)
+    stop, log = threading.Event(), []
+    sync = _Sync(log, [RuntimeError("acquire"), None, RuntimeError("acquire"), None])
+    watcher = _watcher(config_file, [], log, stop, sync=sync)
+    assert not watcher._sync_and_refresh("idle")  # pyright: ignore[reportPrivateUsage]
+    watcher._health(watcher._operational_mode("idle"), last_heartbeat_at="2026-01-01T00:00:00+00:00")  # pyright: ignore[reportPrivateUsage]
+    assert fast_path_status(load_config(config_file))[0].effective_mode == "degraded"
+    assert watcher._sync_and_refresh("idle")  # pyright: ignore[reportPrivateUsage]
+    watcher._health(watcher._operational_mode("idle"))  # pyright: ignore[reportPrivateUsage]
+    assert fast_path_status(load_config(config_file))[0].effective_mode == "idle"
+    assert not watcher._sync_and_refresh("poll")  # pyright: ignore[reportPrivateUsage]
+    watcher._health(watcher._operational_mode("poll"))  # pyright: ignore[reportPrivateUsage]
+    assert fast_path_status(load_config(config_file))[0].effective_mode == "degraded"
+    assert watcher._sync_and_refresh("poll")  # pyright: ignore[reportPrivateUsage]
+    watcher._health(watcher._operational_mode("poll"))  # pyright: ignore[reportPrivateUsage]
+    assert fast_path_status(load_config(config_file))[0].effective_mode == "poll"
+
+
 def test_reconnect_count_is_cumulative_and_backoff_resets(config_file: Path) -> None:
     _configure(config_file)
     stop, log, waits = threading.Event(), [], []
@@ -226,6 +275,27 @@ def test_reconnect_count_is_cumulative_and_backoff_resets(config_file: Path) -> 
     status = fast_path_status(config)[0]
     assert waits == [1, 1]
     assert status.reconnect_count == 2 and status.consecutive_failures == 0
+
+
+def test_abort_uses_capped_consecutive_transport_backoff(config_file: Path) -> None:
+    _configure(config_file)
+    stop, log, waits = threading.Event(), [], []
+
+    class _Abort(_Notification):
+        @contextmanager
+        def idle(self, duration: float) -> Generator[_Idler]:
+            raise imaplib.IMAP4.abort("fixture abort")
+            yield _Idler([], self.log, self.stop)
+
+    config = load_config(config_file)
+    connections = [_Abort([], log, stop) for _ in range(7)]
+    watcher = FastPathWatcher(config, "test", stop, notification_factory=lambda *_: connections.pop(0), sync_adapter=_Sync(log), index_adapter=_Index(log))  # pyright: ignore[reportArgumentType]
+    def wait(delay: float) -> bool:
+        waits.append(delay)
+        return len(waits) == 7
+    stop.wait = wait  # type: ignore[method-assign]
+    watcher.run()
+    assert waits == [1, 2, 5, 10, 30, 60, 60]
 
 
 def test_watcher_lock_is_distinct_and_released(config_file: Path) -> None:
