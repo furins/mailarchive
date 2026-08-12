@@ -229,7 +229,18 @@ def test_loopback_dovecot_mbsync_preserves_server_and_canonical_bytes(
     assert _imap_snapshot(port) == (uidvalidity, before)
     layout = managed_layout(config, config.accounts[0], "INBOX")
     assert oct(layout.config_path.stat().st_mode & 0o777) == "0o600"
-    mirror = next((layout.mirror_mailbox / "INBOX" / "cur").iterdir())
+    mirror_files = [
+        item
+        for directory in (
+            layout.mirror_mailbox / "INBOX" / "cur",
+            layout.mirror_mailbox / "INBOX" / "new",
+        )
+        if directory.is_dir()
+        for item in directory.iterdir()
+        if item.is_file()
+    ]
+    assert len(mirror_files) == 1
+    mirror = mirror_files[0]
     assert mirror.read_bytes() == first == results[0].canonical_message.local_path.read_bytes()
     assert results[0].canonical_message.sha256 == hashlib.sha256(first).hexdigest()
     with connect(config.database.path) as connection:
