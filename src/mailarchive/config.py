@@ -18,6 +18,7 @@ from mailarchive.models import (
     FastPathConfig,
     GmailConfig,
     ImapConfig,
+    Pop3Config,
 )
 from mailarchive.safety import REMOTE_DELETION_DEFAULT, redact_secret_reference
 
@@ -167,6 +168,31 @@ def _gmail_config(account: Mapping[object, object], label: str, archive_root: Pa
     return GmailConfig(email, client_file, poll)
 
 
+def _pop3_config(account: Mapping[object, object], label: str) -> Pop3Config:
+    if account.get("imap") is not None or account.get("gmail") is not None:
+        raise ConfigError(f"{label} may not combine pop3 with another provider configuration")
+    values = _mapping(account.get("pop3"), f"{label}.pop3")
+    host = _required_string(values, "host", f"{label}.pop3")
+    port = values.get("port")
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ConfigError(f"{label}.pop3.port must be 1..65535")
+    tls_mode = values.get("tls_mode")
+    if tls_mode not in {"POP3S", "STARTTLS", "INSECURE_LOOPBACK"}:
+        raise ConfigError(f"{label}.pop3.tls_mode must be POP3S, STARTTLS, or INSECURE_LOOPBACK")
+    if tls_mode == "INSECURE_LOOPBACK" and host not in {"localhost", "127.0.0.1", "::1"}:
+        raise ConfigError(f"{label}.pop3 INSECURE_LOOPBACK host must be loopback")
+    timeout = values.get("connection_timeout_seconds", 30)
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 300:
+        raise ConfigError(f"{label}.pop3.connection_timeout_seconds must be 1..300")
+    return Pop3Config(
+        host=host,
+        port=port,
+        username=_required_string(values, "username", f"{label}.pop3"),
+        tls_mode=cast("Any", tls_mode),
+        connection_timeout_seconds=timeout,
+    )
+
+
 def load_config(path: Path) -> AppConfig:
     """Load a configuration file; absent or malformed safety settings are rejected."""
     try:
@@ -200,11 +226,14 @@ def load_config(path: Path) -> AppConfig:
             raise ConfigError(f"{label}.remote_deletion_enabled is unsupported in M0")
         config_ref = _required_string(account, "config_ref", label)
         gmail = None
+        pop3 = None
         if kind == "gmail":
             if not config_ref.startswith("file:"):
                 raise ConfigError(f"{label}.config_ref must use file: for Gmail")
             _absolute_secret_path(config_ref[5:], f"{label}.config_ref", archive_root)
             gmail = _gmail_config(account, label, archive_root)
+        if kind == "pop3":
+            pop3 = _pop3_config(account, label)
         accounts.append(
             AccountConfig(
                 name=name,
@@ -218,6 +247,7 @@ def load_config(path: Path) -> AppConfig:
                 config_ref=config_ref,
                 imap=_imap_config(account, label) if kind == "imap" else None,
                 gmail=gmail,
+                pop3=pop3,
             )
         )
     if not accounts:
@@ -266,6 +296,15 @@ def display_config(config: AppConfig) -> dict[str, object]:
                     "account_email": account.gmail.account_email,
                     "oauth_client_secret_file": str(account.gmail.oauth_client_secret_file),
                     "poll_interval_seconds": account.gmail.poll_interval_seconds,
+                },
+                "pop3": None
+                if account.pop3 is None
+                else {
+                    "host": account.pop3.host,
+                    "port": account.pop3.port,
+                    "username": account.pop3.username,
+                    "tls_mode": account.pop3.tls_mode,
+                    "connection_timeout_seconds": account.pop3.connection_timeout_seconds,
                 },
             }
             for account in config.accounts

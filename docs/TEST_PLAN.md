@@ -132,6 +132,27 @@ burst coalescing, polling, reconnection, watcher locking, stale local health and
 - verification failure revokes/blocks safety evidence;
 - two records from the same logical repository do not accidentally count as two independent required copies if policy demands distinct repositories.
 
+### M6 POP3 acquisition
+
+- a disposable local POP3 server verifies UIDL/RETR byte preservation for CRLF, folded headers,
+  multipart bodies, binary/base64 payloads, malformed messages, duplicate Message-ID, identical
+  bytes, and no final newline;
+- no DELE command is accepted or issued and a sync leaves the mailbox unchanged;
+- UIDL idempotency skips already-linked bodies; a UIDL cannot be relinked to a different SHA;
+- failed retrieval does not register a provider link, and a rerun safely completes partial local
+  success;
+- migration from M5 retains IMAP/Gmail identities, links and `fast_path_health`, with a clean
+  `foreign_key_check`;
+- `tests/test_getmail6_acceptance.py` invokes the real getmail 6.20.00 binary against a disposable
+  server using explicit non-destructive settings. It proves every seeded fixture changes in staging
+  (added `Return-Path`, LF reconstruction, and final-LF addition where applicable), proves DELE is
+  absent, and proves the source mailbox remains unchanged. Reproduce with
+  `uv run pytest tests/test_getmail6_acceptance.py -v`; the test cleanly skips if getmail is absent.
+
+- direct POP3 tests decode fragmented multiline wire data line by line, including a first dot-leading
+  line, internal single/double-dot lines, final CRLF, folded/multipart/base64 data, and terminator
+  exclusion. Duplicate UIDLs fail before RETR, canonical ingest, provider identity, or link creation.
+
 ## 7. Integrity tests
 
 - modified local `.eml` produces hash mismatch;

@@ -120,6 +120,13 @@ Deliver:
 - state tracking;
 - no delete-after-retrieve by default.
 
+Implemented as direct controlled POP3 UIDL/RETR acquisition. The real getmail 6.20.00 acceptance
+experiment definitively rejected its Maildir destination for canonical use: it adds `Return-Path`
+and reconstructs POP3 data with LF line endings, even with all known decoration and deletion options
+explicitly disabled. Direct retrieval remains the production adapter because canonical byte
+immutability takes priority over the original getmail6 preference. No delete option or remote
+mutation path is exposed.
+
 ## M7 — Spam quarantine
 
 Deliver:
