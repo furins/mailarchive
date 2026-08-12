@@ -162,6 +162,17 @@ def _migration_4(connection: sqlite3.Connection) -> None:
         )
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE remote_canonical_links (
+            remote_message_id TEXT PRIMARY KEY REFERENCES remote_messages(id),
+            canonical_message_id TEXT NOT NULL REFERENCES canonical_messages(id),
+            link_reason TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(remote_message_id, canonical_message_id)
+        )
+        """
+    )
 
 
 def _migration_5(connection: sqlite3.Connection) -> None:
@@ -187,17 +198,6 @@ def _migration_5(connection: sqlite3.Connection) -> None:
             index_pending INTEGER NOT NULL DEFAULT 0 CHECK (index_pending IN (0, 1)),
             updated_at TEXT NOT NULL,
             PRIMARY KEY(account_id, remote_folder)
-        )
-        """
-    )
-    connection.execute(
-        """
-        CREATE TABLE remote_canonical_links (
-            remote_message_id TEXT PRIMARY KEY REFERENCES remote_messages(id),
-            canonical_message_id TEXT NOT NULL REFERENCES canonical_messages(id),
-            link_reason TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            UNIQUE(remote_message_id, canonical_message_id)
         )
         """
     )

@@ -1,3 +1,5 @@
+# ruff: noqa: E501
+
 from __future__ import annotations
 
 import sqlite3
@@ -17,6 +19,46 @@ def test_database_initializes_idempotently(config_file: Path) -> None:
     with connect(config.database.path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 5
         assert connection.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 1
+
+
+def test_m3_schema_v4_upgrades_to_v5_without_changing_remote_links(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M4 must upgrade an actual M3 schema, where links already exist in v4."""
+    config = load_config(config_file)
+    original = database.MIGRATIONS
+    monkeypatch.setattr(database, "MIGRATIONS", original[:4])
+    initialize(config.database.path, config.accounts)
+    now = utc_now()
+    with connect(config.database.path) as connection:
+        aid = int(connection.execute("SELECT id FROM accounts WHERE name='test'").fetchone()[0])
+        connection.execute(
+            "INSERT INTO canonical_messages VALUES (?, ?, ?, ?, 1, NULL, NULL, ?, ?, 'verified', ?, ?)",
+            ("canonical", aid, "c" * 64, "/tmp/canonical.eml", now, now, now, now),
+        )
+        connection.execute(
+            "INSERT INTO remote_messages VALUES (?, ?, 'INBOX', 7, 9, NULL, ?, ?, 1, 'proven')",
+            ("remote", aid, now, now),
+        )
+        connection.execute(
+            "INSERT INTO remote_canonical_links VALUES ('remote', 'canonical', 'imap-uid-body-peek', ?)",
+            (now,),
+        )
+        connection.commit()
+    monkeypatch.setattr(database, "MIGRATIONS", original)
+    initialize(config.database.path, config.accounts)
+    initialize(config.database.path, config.accounts)
+    with connect(config.database.path) as connection:
+        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 5
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE name='fast_path_health'"
+        ).fetchone()
+        assert tuple(connection.execute("SELECT * FROM remote_canonical_links").fetchone()) == (
+            "remote",
+            "canonical",
+            "imap-uid-body-peek",
+            now,
+        )
 
 
 def test_foreign_keys_are_enabled(config_file: Path) -> None:
@@ -52,9 +94,12 @@ def test_failed_migration_rolls_back_and_is_retryable(
         initialize(database_path)
 
     with connect(database_path) as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'migration_probe'"
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'migration_probe'"
+            ).fetchone()[0]
+            == 0
+        )
         migration_row = connection.execute(
             "SELECT COUNT(*) FROM schema_migrations WHERE version = 1"
         ).fetchone()
@@ -66,9 +111,12 @@ def test_failed_migration_rolls_back_and_is_retryable(
     monkeypatch.setattr(database, "MIGRATIONS", ((1, corrected_migration),))
     initialize(database_path)
     with connect(database_path) as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'migration_probe'"
-        ).fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'migration_probe'"
+            ).fetchone()[0]
+            == 1
+        )
         migration_row = connection.execute(
             "SELECT COUNT(*) FROM schema_migrations WHERE version = 1"
         ).fetchone()

@@ -14,7 +14,12 @@ import pytest
 import yaml
 
 from mailarchive.config import ConfigError, load_config
-from mailarchive.fastpath import FastPathWatcher, fast_path_status, watcher_lock
+from mailarchive.fastpath import (
+    FastPathPermanentError,
+    FastPathWatcher,
+    fast_path_status,
+    watcher_lock,
+)
 from mailarchive.imap import ImapSyncBusyError
 
 
@@ -162,6 +167,65 @@ def test_status_is_local_and_stale_heartbeat_wins(config_file: Path, monkeypatch
     monkeypatch.setattr("mailarchive.imap.imaplib.IMAP4", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError()))
     status = fast_path_status(config)[0]
     assert status.effective_mode == "idle" and status.state == "stale"
+    watcher._health("stopped", last_heartbeat_at="2000-01-01T00:00:00+00:00")  # pyright: ignore[reportPrivateUsage]
+    assert fast_path_status(config)[0].state == "stopped"
+
+
+def test_authentication_failure_stops_without_polling_or_sync(config_file: Path) -> None:
+    _configure(config_file)
+    stop, log = threading.Event(), []
+
+    class _Rejected(_Notification):
+        def open(self) -> bool:
+            raise FastPathPermanentError("IMAP authentication failed")
+
+    config = load_config(config_file)
+    watcher = FastPathWatcher(config, "test", stop, notification_factory=lambda *_: _Rejected([], log, stop), sync_adapter=_Sync(log), index_adapter=_Index(log))  # pyright: ignore[reportArgumentType]
+    with pytest.raises(FastPathPermanentError):
+        watcher.run()
+    assert "sync:INBOX" not in log and "poll" not in log
+    assert fast_path_status(config)[0].state == "stopped"
+
+
+def test_reconnect_count_is_cumulative_and_backoff_resets(config_file: Path) -> None:
+    _configure(config_file)
+    stop, log, waits = threading.Event(), [], []
+
+    class _Broken(_Notification):
+        @contextmanager
+        def idle(self, duration: float) -> Generator[_Idler]:
+            self.log.append(f"idle-enter:{duration}")
+            raise OSError("fixture disconnect")
+            yield _Idler([], self.log, self.stop)
+
+    class _EventuallyBroken(_Notification):
+        def __init__(self, *args: object) -> None:
+            super().__init__(*args)  # type: ignore[arg-type]
+            self.entries = 0
+
+        @contextmanager
+        def idle(self, duration: float) -> Generator[_Idler]:
+            self.entries += 1
+            if self.entries >= 3:
+                raise OSError("fixture disconnect")
+            with super().idle(duration) as idler:
+                yield idler
+
+    connections = [
+        _Broken([], log, stop),
+        _EventuallyBroken([[], [], []], log, stop),
+        _Notification([[]], log, stop),
+    ]
+    config = load_config(config_file)
+    watcher = FastPathWatcher(config, "test", stop, notification_factory=lambda *_: connections.pop(0), sync_adapter=_Sync(log), index_adapter=_Index(log))  # pyright: ignore[reportArgumentType]
+    def wait(delay: float) -> bool:
+        waits.append(delay)
+        return False
+    stop.wait = wait  # type: ignore[method-assign]
+    watcher.run()
+    status = fast_path_status(config)[0]
+    assert waits == [1, 1]
+    assert status.reconnect_count == 2 and status.consecutive_failures == 0
 
 
 def test_watcher_lock_is_distinct_and_released(config_file: Path) -> None:
