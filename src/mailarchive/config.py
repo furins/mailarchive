@@ -14,6 +14,7 @@ from mailarchive.models import (
     AccountConfig,
     AppConfig,
     ArchiveConfig,
+    BackupRepositoryConfig,
     DatabaseConfig,
     FastPathConfig,
     GmailConfig,
@@ -193,6 +194,74 @@ def _pop3_config(account: Mapping[object, object], label: str) -> Pop3Config:
     )
 
 
+def _backup_repositories(
+    values: Mapping[object, object], archive_root: Path
+) -> tuple[BackupRepositoryConfig, ...]:
+    backup = values.get("backup", {})
+    backup_values = _mapping(backup, "backup")
+    raw_repositories = backup_values.get("repositories", {})
+    repositories = _mapping(raw_repositories, "backup.repositories")
+    result: list[BackupRepositoryConfig] = []
+    for raw_name, raw_repository in repositories.items():
+        name = _account_name(raw_name)
+        label = f"backup.repositories.{name}"
+        item = _mapping(raw_repository, label)
+        kind = item.get("kind", "borg")
+        if kind != "borg":
+            raise ConfigError(f"{label}.kind must be borg")
+        ref = _required_string(item, "repository_ref", label)
+        if any(char in ref for char in "\x00\r\n"):
+            raise ConfigError(f"{label}.repository_ref must not contain CR, LF, or NUL")
+        if ref.startswith("ssh://"):
+            if "?" in ref or "#" in ref:
+                raise ConfigError(f"{label}.repository_ref must be a password-free ssh:// Borg URL")
+            authority = ref[6:].split("/", 1)[0]
+            if ":" in authority.split("@", 1)[0]:
+                raise ConfigError(f"{label}.repository_ref must not embed a password")
+        else:
+            repository_path = Path(ref)
+            if not repository_path.is_absolute():
+                raise ConfigError(f"{label}.repository_ref must be an absolute path or ssh:// URL")
+            try:
+                repository_path.resolve(strict=False).relative_to(
+                    archive_root.resolve(strict=False)
+                )
+            except ValueError:
+                pass
+            else:
+                raise ConfigError(f"{label}.repository_ref must be outside archive.root")
+        encryption = _required_string(item, "encryption_mode", label)
+        if encryption not in {"repokey", "repokey-blake2", "none"}:
+            raise ConfigError(f"{label}.encryption_mode is unsupported")
+        passphrase_env = item.get("passphrase_env")
+        if encryption != "none":
+            if not isinstance(passphrase_env, str) or not fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*", passphrase_env
+            ):
+                raise ConfigError(f"{label}.passphrase_env must name an environment variable")
+        elif passphrase_env is not None:
+            raise ConfigError(f"{label}.passphrase_env is only valid for encrypted repositories")
+        timeout = item.get("command_timeout_seconds", 21600)
+        if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 86400:
+            raise ConfigError(f"{label}.command_timeout_seconds must be 1..86400")
+        policy = item.get("verification_policy", "borg-archive-data-v1")
+        if policy != "borg-archive-data-v1":
+            raise ConfigError(f"{label}.verification_policy must be borg-archive-data-v1")
+        assert isinstance(policy, str)
+        result.append(
+            BackupRepositoryConfig(
+                name,
+                _required_bool(item, "enabled", label, True),
+                ref,
+                cast("Any", encryption),
+                passphrase_env if isinstance(passphrase_env, str) else None,
+                policy,
+                timeout,
+            )
+        )
+    return tuple(result)
+
+
 def load_config(path: Path) -> AppConfig:
     """Load a configuration file; absent or malformed safety settings are rejected."""
     try:
@@ -256,6 +325,7 @@ def load_config(path: Path) -> AppConfig:
         archive=ArchiveConfig(root=archive_root, timezone=timezone),
         database=DatabaseConfig(path=Path(_required_string(database_values, "path", "database"))),
         accounts=tuple(accounts),
+        backup_repositories=_backup_repositories(values, archive_root),
     )
 
 
@@ -308,5 +378,17 @@ def display_config(config: AppConfig) -> dict[str, object]:
                 },
             }
             for account in config.accounts
+        ],
+        "backup_repositories": [
+            {
+                "name": item.name,
+                "enabled": item.enabled,
+                "repository_ref": item.repository_ref,
+                "encryption_mode": item.encryption_mode,
+                "passphrase_env": item.passphrase_env,
+                "verification_policy": item.verification_policy,
+                "command_timeout_seconds": item.command_timeout_seconds,
+            }
+            for item in config.backup_repositories
         ],
     }

@@ -240,3 +240,22 @@ to relationships and applies archived/quarantine/all lifecycle scope at query ti
 events include refresh, rebuild, and `recoll.search.failed`; commands use argv lists, explicit
 `-c` configuration and bounded timeouts. M8 does not call providers, alter fast-path acquisition,
 mutate remote mail, or implement deletion.
+# ADR-019: Borg 1.x verified backup evidence (M9)
+
+M9 supports Borg 1.x (CI baseline 1.2.8), rejecting Borg 2.x. Repositories are absolute local
+paths outside `archive.root` or password-free `ssh://` URLs; ordinary SSH host-key checking remains
+in force. Encryption mode is explicit and encrypted repositories receive a passphrase only through
+a configured environment-variable name at execution time.
+
+MailArchive makes a temporary `state/backup-snapshots/<run-id>` tree, using SQLite's online backup
+API and hash-checked hardlinks/copies of finalized archive/quarantine messages and their referenced
+content-addressed blobs. It excludes pending objects, credentials, caches, indexes, logs, and other
+derived state. The snapshot contains deterministic `metadata/backup-manifest.jsonl`; its SHA-256
+anchors verification after cleanup.
+
+Create is not verification. Verification reads the archived manifest, compares every archive regular
+file path/size/SHA-256, then runs `borg check --archives-only --verify-data`. Failure, including a
+later re-check, clears verified evidence. A restore test extracts only to an empty external directory
+and validates manifest objects and SQLite integrity. Runs in one repository are one destination;
+M10 must count distinct verified repositories. There is no retention/deletion work, nor Borg
+prune/delete/compact/repair in M9. Borg key/passphrase recovery remains an external operator duty.

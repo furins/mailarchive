@@ -161,6 +161,14 @@ burst coalescing, polling, reconnection, watcher locking, stale local health and
 - verification failure revokes/blocks safety evidence;
 - two records from the same logical repository do not accidentally count as two independent required copies if policy demands distinct repositories.
 
+### M9 Borg
+
+- disposable real Borg 1.x acceptance initializes `repokey-blake2`, creates, verifies and
+  restore-tests exact canonical bytes;
+- missing passphrase fails before a Borg process; repository identity replacement fails closed;
+- failed re-verification clears prior positive evidence; archived and quarantined objects plus
+  referenced blobs are protected while pending objects are excluded.
+
 ### M6 POP3 acquisition
 
 - a disposable local POP3 server verifies UIDL/RETR byte preservation for CRLF, folded headers,

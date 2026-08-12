@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, cast
 
-from mailarchive.models import AccountConfig, CanonicalMessage
+from mailarchive.models import AccountConfig, BackupRepositoryConfig, CanonicalMessage
 
 Migration = Callable[[sqlite3.Connection], None]
 
@@ -414,6 +414,33 @@ def _migration_9(connection: sqlite3.Connection) -> None:
             first_seen_at TEXT NOT NULL,
             CHECK(id=sha256)
         )""")
+
+
+def _migration_10(connection: sqlite3.Connection) -> None:
+    """M9 Borg repository binding and append-oriented backup evidence."""
+    connection.execute("""CREATE TABLE backup_repositories (
+        id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, kind TEXT NOT NULL CHECK(kind='borg'),
+        repository_ref TEXT NOT NULL, repository_identity TEXT, enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+        encryption_mode TEXT NOT NULL CHECK(encryption_mode IN ('repokey','repokey-blake2','none')),
+        verification_policy TEXT NOT NULL CHECK(verification_policy='borg-archive-data-v1'),
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+    connection.execute("""CREATE TABLE backup_runs (
+        id TEXT PRIMARY KEY, repository_id INTEGER NOT NULL REFERENCES backup_repositories(id),
+        started_at TEXT NOT NULL, completed_at TEXT, status TEXT NOT NULL CHECK(status IN ('running','succeeded','failed')),
+        archive_name TEXT NOT NULL, command_exit_code INTEGER, manifest_sha256 TEXT,
+        verification_status TEXT NOT NULL CHECK(verification_status IN ('unverified','verified','failed')),
+        verified_at TEXT, last_error_kind TEXT, details_json TEXT NOT NULL DEFAULT '{}',
+        UNIQUE(repository_id,archive_name))""")
+    connection.execute("""CREATE TABLE message_backup_evidence (
+        canonical_message_id TEXT NOT NULL REFERENCES canonical_messages(id), backup_run_id TEXT NOT NULL REFERENCES backup_runs(id),
+        covered INTEGER NOT NULL CHECK(covered IN (0,1)), verified INTEGER NOT NULL CHECK(verified IN (0,1)),
+        recorded_at TEXT NOT NULL, PRIMARY KEY(canonical_message_id,backup_run_id))""")
+    connection.execute("""CREATE TABLE backup_restore_tests (
+        id INTEGER PRIMARY KEY, backup_run_id TEXT NOT NULL REFERENCES backup_runs(id), started_at TEXT NOT NULL,
+        completed_at TEXT, status TEXT NOT NULL CHECK(status IN ('running','succeeded','failed')), error_kind TEXT)""")
+    connection.execute(
+        "CREATE INDEX backup_runs_repository_started ON backup_runs(repository_id, started_at DESC)"
+    )
     connection.execute("""
         CREATE TABLE message_attachments (
             canonical_message_id TEXT NOT NULL REFERENCES canonical_messages(id),
@@ -424,7 +451,9 @@ def _migration_9(connection: sqlite3.Connection) -> None:
             declared_mime_type TEXT,
             PRIMARY KEY(canonical_message_id,part_index)
         )""")
-    connection.execute("CREATE INDEX message_attachments_attachment ON message_attachments(attachment_id)")
+    connection.execute(
+        "CREATE INDEX message_attachments_attachment ON message_attachments(attachment_id)"
+    )
     connection.execute("""
         CREATE TABLE attachment_extractions (
             canonical_message_id TEXT PRIMARY KEY REFERENCES canonical_messages(id),
@@ -451,6 +480,7 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (7, _migration_7),
     (8, _migration_8),
     (9, _migration_9),
+    (10, _migration_10),
 )
 
 
@@ -492,7 +522,11 @@ def _apply_migration(connection: sqlite3.Connection, version: int, migration: Mi
             connection.execute("PRAGMA foreign_keys = ON")
 
 
-def initialize(path: Path, accounts: tuple[AccountConfig, ...] = ()) -> None:
+def initialize(
+    path: Path,
+    accounts: tuple[AccountConfig, ...] = (),
+    backup_repositories: tuple[BackupRepositoryConfig, ...] = (),
+) -> None:
     """Apply migrations and reconcile M0 account metadata idempotently."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with connect(path) as connection:
@@ -546,6 +580,26 @@ def initialize(path: Path, accounts: tuple[AccountConfig, ...] = ()) -> None:
                     account.remote_retention_days,
                     account.required_verified_backups,
                     account.config_ref,
+                    now,
+                    now,
+                ),
+            )
+        for repository in backup_repositories:
+            now = utc_now()
+            # Identity is intentionally absent from the update clause: only Borg probing may bind it.
+            connection.execute(
+                """INSERT INTO backup_repositories(name,kind,repository_ref,repository_identity,enabled,
+                encryption_mode,verification_policy,created_at,updated_at)
+                VALUES (?, 'borg', ?, NULL, ?, ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET repository_ref=excluded.repository_ref,
+                  enabled=excluded.enabled,encryption_mode=excluded.encryption_mode,
+                  verification_policy=excluded.verification_policy,updated_at=excluded.updated_at""",
+                (
+                    repository.name,
+                    repository.repository_ref,
+                    repository.enabled,
+                    repository.encryption_mode,
+                    repository.verification_policy,
                     now,
                     now,
                 ),

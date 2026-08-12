@@ -17,7 +17,7 @@ def test_database_initializes_idempotently(config_file: Path) -> None:
     initialize(config.database.path, config.accounts)
     initialize(config.database.path, config.accounts)
     with connect(config.database.path) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 9
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 10
         assert connection.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 1
 
 
@@ -49,7 +49,7 @@ def test_m3_schema_v4_upgrades_to_v5_without_changing_remote_links(
     initialize(config.database.path, config.accounts)
     initialize(config.database.path, config.accounts)
     with connect(config.database.path) as connection:
-        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 9
+        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 10
         assert connection.execute(
             "SELECT name FROM sqlite_master WHERE name='fast_path_health'"
         ).fetchone()
@@ -92,7 +92,7 @@ def test_real_v5_to_v6_preserves_imap_identity_links_and_health(
     initialize(config.database.path, config.accounts)
     initialize(config.database.path, config.accounts)
     with connect(config.database.path) as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 9
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 10
         assert tuple(
             db.execute(
                 "SELECT id,provider_kind,remote_folder,uidvalidity,remote_uid FROM remote_messages"
@@ -160,7 +160,7 @@ def test_v7_rebuild_preserves_gmail_label_foreign_key_graph(
     monkeypatch.setattr(database, "MIGRATIONS", original)
     initialize(config.database.path, config.accounts)
     with connect(config.database.path) as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 9
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 10
         assert tuple(
             db.execute(
                 "SELECT remote_message_id,account_id,label_id FROM gmail_message_labels"
@@ -267,7 +267,7 @@ def test_v8_to_v9_preserves_state_and_adds_attachment_constraints(
     initialize(config.database.path, config.accounts)
     initialize(config.database.path, config.accounts)
     with connect(config.database.path) as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 9
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 10
         assert db.execute("SELECT id FROM canonical_messages").fetchone()[0] == "v8-message"
         assert db.execute("SELECT classification FROM classifications").fetchone()[0] == "ham"
         assert db.execute("SELECT name FROM sqlite_master WHERE name='attachments'").fetchone()

@@ -150,3 +150,8 @@ untrusted metadata. Recoll indexes only that store with its managed config at
 `state/recoll/config`; its database at `state/recoll/db` can be rebuilt. Search defaults to
 archived relationships and SQLite authoritatively enforces `archived`, `quarantine`, or `all`
 scope. No M8 command contacts a mail provider or performs remote mutation.
+# M9 Borg backups
+
+Configure named Borg destinations under `backup.repositories`, then explicitly run
+`mailarchive backup repo init`, `backup run`, `backup verify`, and optionally `backup restore-test`.
+`mailarchive backup status` is local SQLite reporting only and never contacts Borg.

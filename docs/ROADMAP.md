@@ -170,6 +170,12 @@ Deliver:
 - evidence model;
 - restore test workflow.
 
+Implemented with Borg 1.x repositories, immutable repository-identity binding, controlled
+SQLite-backed snapshots, deterministic SHA-256 manifests, exact archive inventory plus
+`borg check --archives-only --verify-data`, and explicit out-of-place restore tests. Create
+alone is unverified; a failed re-verification revokes message evidence. M9 has no retention,
+remote deletion, or Borg prune/delete/compact operation.
+
 ## M10 — Retention engine
 
 Deliver:
