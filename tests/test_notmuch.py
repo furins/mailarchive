@@ -466,3 +466,64 @@ def test_no_message_id_uses_characterized_notmuch_sha1_id(
     spam_tags = quarantine._run(["search", "--output=tags", "--", f"id:{spam_id}"])  # pyright: ignore[reportPrivateUsage]
     assert {"archive", "quarantine", "spam"}.issubset(set(spam_tags.stdout.split()))
     assert spam.local_path.read_bytes() == spam_raw
+
+
+@pytest.mark.skipif(shutil.which("notmuch") is None, reason="requires locally installed notmuch")
+def test_manual_override_moves_between_split_indexes_and_rebuilds(
+    config_file: Path, tmp_path: Path
+) -> None:
+    """Both derived indexes follow authoritative manual state after a rebuild."""
+    config = load_config(config_file)
+    raw = _write_message(
+        tmp_path / "override.eml",
+        message_id="<override@example.test>",
+        subject="override",
+        body="override-token",
+        sender="override@example.test",
+    )
+    from mailarchive.classification import ClassificationResult, apply_classification
+
+    spam = apply_classification(
+        config,
+        ingest_bytes(config, raw, "test").canonical_message,
+        ClassificationResult("spam", 9.0, "automatic"),
+    )
+    archive, quarantine = (
+        NotmuchAdapter(config, kind="archive"),
+        NotmuchAdapter(config, kind="quarantine"),
+    )
+    archive.refresh()
+    quarantine.refresh()
+    assert _result_ids(config, "override-token") == []
+    assert _result_ids(config, "override-token", scope="quarantine") == [spam.id]
+    ham = apply_classification(
+        config, spam, ClassificationResult("ham", 0.0, "operator"), manual=True
+    )
+    archive.refresh()
+    quarantine.refresh()
+    assert ham.id == spam.id and ham.sha256 == spam.sha256 and ham.local_path.read_bytes() == raw
+    assert _result_ids(config, "override-token") == [ham.id]
+    assert _result_ids(config, "override-token", scope="quarantine") == []
+    archive_tags = archive._run(  # pyright: ignore[reportPrivateUsage]
+        ["search", "--output=tags", "--", "id:override@example.test"]
+    )
+    assert {"archive", "ham"}.issubset(set(archive_tags.stdout.split()))
+    spam_again = apply_classification(
+        config, ham, ClassificationResult("spam", 9.0, "operator"), manual=True
+    )
+    archive.refresh()
+    quarantine.refresh()
+    assert spam_again.id == ham.id and spam_again.sha256 == ham.sha256
+    assert spam_again.local_path.read_bytes() == raw
+    assert _result_ids(config, "override-token") == []
+    assert _result_ids(config, "override-token", scope="quarantine") == [spam_again.id]
+    quarantine_tags = quarantine._run(  # pyright: ignore[reportPrivateUsage]
+        ["search", "--output=tags", "--", "id:override@example.test"]
+    )
+    assert {"archive", "quarantine", "spam"}.issubset(set(quarantine_tags.stdout.split()))
+    shutil.rmtree(managed_layout(config, "archive").database_path)
+    shutil.rmtree(managed_layout(config, "quarantine").database_path)
+    archive.refresh()
+    quarantine.refresh()
+    assert _result_ids(config, "override-token") == []
+    assert _result_ids(config, "override-token", scope="quarantine") == [spam_again.id]

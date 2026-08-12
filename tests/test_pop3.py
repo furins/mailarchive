@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# pyright: reportUnknownMemberType=false, reportUnknownArgumentType=false, reportUnknownLambdaType=false, reportArgumentType=false
 import socketserver
 import threading
 from pathlib import Path
@@ -8,6 +9,7 @@ import pytest
 
 from mailarchive.config import load_config
 from mailarchive.db import connect
+from mailarchive.ingest import ingest_bytes
 from mailarchive.pop3 import Pop3Adapter, Pop3Error, Pop3Wire, register_pop3_link
 
 
@@ -201,6 +203,48 @@ def test_pop3_uidl_is_idempotent_and_never_deletes(
             == 2
         )
         assert db.execute("SELECT COUNT(*) FROM remote_canonical_links").fetchone()[0] == 2
+
+
+def test_linked_pending_is_recovered_without_retr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(_config(tmp_path))
+    raw = b"Message-ID: <pending@example.test>\r\n\r\nlocal\r\n"
+    pending = ingest_bytes(config, raw, "pop")
+    register_pop3_link(config, "pop", "U1", pending.canonical_message)
+    calls: list[str] = []
+
+    class KnownWire(FakeWire):
+        messages = {1: ("U1", raw)}
+
+        def retr(self, number: int) -> bytes:
+            calls.append(f"RETR {number}")
+            return super().retr(number)
+
+    monkeypatch.setenv("POP_TEST_PASSWORD", "safe")
+    monkeypatch.setattr("mailarchive.pop3._Pop3Wire", KnownWire)
+    from mailarchive.classification import ClassificationResult
+    from mailarchive.classification import reconcile_pending as real_reconcile
+
+    class Ham:
+        def classify(self, _raw: bytes) -> ClassificationResult:
+            return ClassificationResult("ham", 0.0, "test-ham")
+
+    monkeypatch.setattr(
+        "mailarchive.classification.reconcile_pending",
+        lambda cfg, **kwargs: real_reconcile(cfg, adapter=Ham(), **kwargs),
+    )
+    Pop3Adapter(config).sync("pop")
+    assert calls == [] and "DELE" not in KnownWire.commands
+    with connect(config.database.path) as db:
+        row = db.execute(
+            "SELECT storage_state,sha256,local_path FROM canonical_messages"
+        ).fetchone()
+        assert row is not None and row[0] == "archived"
+        assert row[1] == pending.canonical_message.sha256
+        assert Path(str(row[2])).read_bytes() == raw
+        assert db.execute("SELECT COUNT(*) FROM remote_messages").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM remote_canonical_links").fetchone()[0] == 1
 
 
 def test_pop3_uidl_cannot_remap_to_another_canonical(

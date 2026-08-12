@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+# pyright: reportUnknownMemberType=false, reportUnknownArgumentType=false, reportUnknownLambdaType=false, reportArgumentType=false
 import base64
 import hashlib
 import json
@@ -132,6 +133,94 @@ def test_multilabel_identity_cardinality_is_exact(tmp_path: Path) -> None:
         assert db.execute("SELECT COUNT(*) FROM remote_canonical_links").fetchone()[0] == 1
         assert db.execute("SELECT COUNT(*) FROM canonical_messages").fetchone()[0] == 1
         assert db.execute("SELECT COUNT(*) FROM gmail_message_labels").fetchone()[0] == 3
+
+
+def test_linked_pending_is_recovered_without_raw_refetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(_gmail_config(tmp_path))
+    raw = b"Message-ID: <pending@example.test>\r\n\r\nlocal\r\n"
+    fake = FakeGmail(raw)
+    adapter = GmailAdapter(config, lambda _account: fake)  # type: ignore[arg-type]
+    pending = ingest_bytes(config, raw, "gmail")
+    initialize(config.database.path, config.accounts)
+    with connect(config.database.path) as db:
+        aid = int(db.execute("SELECT id FROM accounts WHERE name='gmail'").fetchone()[0])
+    labels = adapter._labels(fake, aid)  # pyright: ignore[reportPrivateUsage]
+    adapter._register(  # pyright: ignore[reportPrivateUsage]
+        aid,
+        {"id": "G1", "threadId": "T1", "labelIds": ["INBOX", "IMPORTANT", "Label_123"]},
+        pending,
+        labels,
+    )
+    from mailarchive.classification import ClassificationResult
+    from mailarchive.classification import reconcile_pending as real_reconcile
+
+    class Ham:
+        def classify(self, _raw: bytes) -> ClassificationResult:
+            return ClassificationResult("ham", 0.0, "test-ham")
+
+    monkeypatch.setattr(
+        "mailarchive.classification.reconcile_pending",
+        lambda cfg, **kwargs: real_reconcile(cfg, adapter=Ham(), **kwargs),
+    )
+    adapter.sync("gmail")
+    assert fake.raw_gets == 0
+    with connect(config.database.path) as db:
+        row = db.execute(
+            "SELECT storage_state,sha256,local_path FROM canonical_messages"
+        ).fetchone()
+        assert row is not None and row[0] == "archived"
+        assert row[1] == pending.canonical_message.sha256
+        assert Path(str(row[2])).read_bytes() == raw
+        assert db.execute("SELECT COUNT(*) FROM remote_messages").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM remote_canonical_links").fetchone()[0] == 1
+
+
+def test_gmail_spam_label_remains_non_authoritative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = b"Message-ID: <spam-label@example.test>\r\n\r\nexact\r\n"
+
+    class SpamLabel(FakeGmail):
+        def labels(self) -> dict[str, object]:
+            payload = super().labels()
+            cast(list[dict[str, str]], payload["labels"]).append(
+                {"id": "SPAM", "name": "SPAM", "type": "system"}
+            )
+            return payload
+
+        def message(self, message_id: str, format: str) -> dict[str, object]:
+            result = super().message(message_id, format)
+            result["labelIds"] = ["INBOX", "IMPORTANT", "Label_123", "SPAM"]
+            return result
+
+    config = load_config(_gmail_config(tmp_path))
+    fake = SpamLabel(raw)
+    from mailarchive.classification import ClassificationResult
+    from mailarchive.classification import classify_pending as real_classify
+
+    class Ham:
+        def classify(self, _raw: bytes) -> ClassificationResult:
+            return ClassificationResult("ham", 0.0, "test-ham")
+
+    monkeypatch.setattr(
+        "mailarchive.classification.classify_pending",
+        lambda cfg, message, *_a, **_k: real_classify(cfg, message, Ham()),
+    )
+    GmailAdapter(config, lambda _account: fake).sync("gmail")  # type: ignore[arg-type]
+    assert fake.raw_gets == 1
+    with connect(config.database.path) as db:
+        row = db.execute(
+            "SELECT storage_state,sha256,local_path FROM canonical_messages"
+        ).fetchone()
+        assert row is not None and row[0] == "archived"
+        assert Path(str(row[2])).read_bytes() == raw
+        spam_labels = db.execute(
+            "SELECT COUNT(*) FROM gmail_message_labels WHERE label_id='SPAM'"
+        ).fetchone()
+        assert spam_labels is not None and spam_labels[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM gmail_message_labels").fetchone()[0] == 4
 
 
 def test_client_uses_only_get_for_mailbox_calls() -> None:

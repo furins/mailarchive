@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# pyright: reportUnknownMemberType=false, reportUnknownArgumentType=false, reportUnknownLambdaType=false, reportArgumentType=false
 import imaplib
 import ssl
 from pathlib import Path
@@ -18,7 +19,7 @@ from mailarchive.imap import (
     parse_fetch_response,
     register_remote_link,
 )
-from mailarchive.ingest import ingest_file
+from mailarchive.ingest import ingest_bytes, ingest_file
 from mailarchive.models import AccountConfig
 
 
@@ -154,6 +155,43 @@ def test_sync_uses_only_read_only_uid_operations(
         not in {"store", "copy", "move", "expunge", "append", "delete", "create", "rename", "close"}
         for call in client.calls
     )
+
+
+def test_linked_pending_is_recovered_without_body_peek(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real sync path repairs linked staging bytes without reacquisition."""
+    _configure_imap(config_file)
+    config = load_config(config_file)
+    client = _ReadOnlyClient()
+    monkeypatch.setenv("MAILARCHIVE_TEST_SECRET", "fixture")
+    monkeypatch.setattr(ImapAdapter, "_open", lambda *_: client)
+    raw = b"Message-ID: <pending@example.test>\r\n\r\nlocal\r\n"
+    pending = ingest_bytes(config, raw, "test")
+    register_remote_link(config, "test", "INBOX", 9, 1, pending.canonical_message)
+
+    from mailarchive.classification import ClassificationResult
+    from mailarchive.classification import reconcile_pending as real_reconcile
+
+    class Ham:
+        def classify(self, _raw: bytes) -> ClassificationResult:
+            return ClassificationResult("ham", 0.0, "test-ham")
+
+    monkeypatch.setattr(
+        "mailarchive.classification.reconcile_pending",
+        lambda cfg, **kwargs: real_reconcile(cfg, adapter=Ham(), **kwargs),
+    )
+    ImapAdapter(config).sync("test", "INBOX")
+    assert not any(call[1][0] == "fetch" for call in client.calls if call[0] == "uid")
+    with connect(config.database.path) as db:
+        row = db.execute(
+            "SELECT storage_state,sha256,local_path FROM canonical_messages"
+        ).fetchone()
+        assert row is not None and row[0] == "archived"
+        assert row[1] == pending.canonical_message.sha256
+        assert Path(str(row[2])).read_bytes() == raw
+        assert db.execute("SELECT COUNT(*) FROM remote_messages").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM remote_canonical_links").fetchone()[0] == 1
 
 
 def test_tls_connections_use_verifying_default_context(
