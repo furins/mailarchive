@@ -151,6 +151,8 @@ def main(argv: list[str] | None = None) -> int:
             canonical_message_count = 0
             schema_version = 0
             lifecycle: dict[str, int] = {}
+            quarantine_counts: dict[str, int] = {}
+            classifier_failure_count = 0
             if initialized:
                 with connect(config.database.path) as connection:
                     version_row = connection.execute(
@@ -174,6 +176,19 @@ def main(argv: list[str] | None = None) -> int:
                         if schema_version >= 8
                         else {}
                     )
+                    if schema_version >= 8:
+                        quarantine_counts = {
+                            str(row[0]): int(row[1])
+                            for row in connection.execute(
+                                """SELECT x.classification,COUNT(*) FROM canonical_messages c
+                                JOIN classifications x ON x.id=(SELECT id FROM classifications
+                                WHERE canonical_message_id=c.id ORDER BY manual_override DESC,id DESC LIMIT 1)
+                                WHERE c.storage_state='quarantined' GROUP BY x.classification"""
+                            )
+                        }
+                        classifier_failure_count = int(connection.execute(
+                            "SELECT COUNT(*) FROM audit_events WHERE event_type='classification.failed'"
+                        ).fetchone()[0])
             health = [record.__dict__ for record in fast_path_status(config)] if initialized else []
             gmail_status: list[dict[str, object]] = [
                 {
@@ -293,6 +308,8 @@ def main(argv: list[str] | None = None) -> int:
                     "account_count": account_count,
                     "canonical_message_count": canonical_message_count,
                     "lifecycle_counts": lifecycle if initialized else {},
+                    "quarantine_counts": quarantine_counts if initialized else {},
+                    "classifier_failure_event_count": classifier_failure_count,
                     "remote_mutation_supported": False,
                     "fast_path": health,
                     "gmail": gmail_status,
@@ -305,7 +322,7 @@ def main(argv: list[str] | None = None) -> int:
                 _emit([], args.json)
                 return 0
             with connect(config.database.path) as connection:
-                rows = connection.execute("""SELECT c.id,a.name,c.local_path,c.quarantined_at,x.classification,x.score,x.classified_at
+                rows = connection.execute("""SELECT c.id AS canonical_id,a.name AS account,c.local_path,c.quarantined_at,x.classification,x.score,x.classified_at
                     FROM canonical_messages c JOIN accounts a ON a.id=c.account_id
                     LEFT JOIN classifications x ON x.id=(SELECT id FROM classifications WHERE canonical_message_id=c.id ORDER BY manual_override DESC,id DESC LIMIT 1)
                     WHERE c.storage_state='quarantined' ORDER BY c.quarantined_at DESC""").fetchall()
@@ -360,9 +377,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if args.command == "index":
-            adapter = NotmuchAdapter(config)
-            adapter.refresh()
-            _emit({"refreshed": True, "notmuch_version": adapter.version()}, args.json)
+            archive_adapter = NotmuchAdapter(config, kind="archive")
+            archive_adapter.refresh()
+            NotmuchAdapter(config, kind="quarantine").refresh()
+            _emit({"refreshed": True, "notmuch_version": archive_adapter.version()}, args.json)
             return 0
         if args.command == "search":
             results = search_canonical_messages(config, args.query, scope=args.scope)

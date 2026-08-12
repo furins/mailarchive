@@ -117,8 +117,8 @@ The current effective classification may be calculated from latest/manual rules.
 The latest valid manual override wins; otherwise the latest automatic verdict wins. History is never
 rewritten for an override.
 
-notmuch classification tags are derived aggregate hints at its RFC Message-ID group boundary. They
-are not a per-canonical classification, identity, retention, or deletion input; SQLite is the
+notmuch classification tags are derived hints in independently indexed archive/quarantine domains.
+They are not a per-canonical classification, identity, retention, or deletion input; SQLite is the
 authoritative source for those facts.
 
 ## 7. protections

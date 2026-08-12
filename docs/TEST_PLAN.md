@@ -83,9 +83,9 @@ Production accounts are never test fixtures.
   responses fail closed to SUSPECT; no response body is canonical content;
 - index rebuild reapplies tags from SQLite, excludes quarantine by default, and permits explicit
   `tag:quarantine` searches; status and quarantine listing remain local-only.
-- RFC Message-ID collisions with different canonical bytes must preserve both objects: SQLite scope
-  filtering returns archived/quarantine/all objects correctly even though notmuch tags are shared
-  group-level hints.
+- RFC Message-ID collisions with different canonical bytes must preserve both objects. Archive and
+  quarantine have independent derived notmuch indexes so quarantine-only content cannot influence
+  archive query candidates; SQLite still verifies every returned canonical row.
 - a linked pending message can be reconciled locally without provider RAW/RETR/BODY.PEEK refetch;
   missing or hash-mismatched pending files fail closed and remain pending.
 

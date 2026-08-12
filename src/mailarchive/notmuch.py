@@ -58,16 +58,15 @@ class SearchResult:
         }
 
 
-def managed_layout(config: AppConfig) -> NotmuchLayout:
+NotmuchIndexKind = Literal["archive", "quarantine"]
+
+
+def managed_layout(config: AppConfig, kind: NotmuchIndexKind = "archive") -> NotmuchLayout:
     """Return paths deliberately outside the canonical mail tree."""
     archive_root = config.archive.root.resolve()
-    # Both finalized roots are indexable.  Pending staging and all local state
-    # are explicitly ignored below, so a pending message is never searchable.
-    mail_root = archive_root
+    mail_root = archive_root / ("mail" if kind == "archive" else "quarantine")
     state_root = archive_root / "state" / "notmuch"
-    database_path = state_root / "db"
-    # `state/` is under mail_root so both finalized roots can be indexed, but
-    # is explicitly ignored in the managed [new] configuration.
+    database_path = state_root / kind
     return NotmuchLayout(
         mail_root=mail_root,
         state_root=state_root,
@@ -97,7 +96,7 @@ def managed_config_text(layout: NotmuchLayout) -> str:
             "",
             "[new]",
             "tags=archive",
-            "ignore=staging;state;attachments;metadata;logs",
+            "ignore=state;attachments;metadata;logs",
             "",
             "[index]",
             "decrypt=false",
@@ -106,9 +105,9 @@ def managed_config_text(layout: NotmuchLayout) -> str:
     )
 
 
-def write_managed_config(config: AppConfig) -> NotmuchLayout:
+def write_managed_config(config: AppConfig, kind: NotmuchIndexKind = "archive") -> NotmuchLayout:
     """Atomically write the managed configuration and create an empty hook directory."""
-    layout = managed_layout(config)
+    layout = managed_layout(config, kind)
     layout.mail_root.mkdir(parents=True, exist_ok=True)
     layout.hook_directory.mkdir(parents=True, exist_ok=True)
     layout.config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -147,11 +146,13 @@ class NotmuchAdapter:
         self,
         config: AppConfig,
         *,
+        kind: NotmuchIndexKind = "archive",
         executable: str = "notmuch",
         command_timeout_seconds: float = COMMAND_TIMEOUT_SECONDS,
         refresh_timeout_seconds: float = REFRESH_TIMEOUT_SECONDS,
     ) -> None:
         self.config = config
+        self.kind: NotmuchIndexKind = kind
         self.executable = executable
         self.command_timeout_seconds = command_timeout_seconds
         self.refresh_timeout_seconds = refresh_timeout_seconds
@@ -159,7 +160,7 @@ class NotmuchAdapter:
     def _run(
         self, arguments: list[str], *, timeout_seconds: float | None = None
     ) -> subprocess.CompletedProcess[str]:
-        layout = write_managed_config(self.config)
+        layout = write_managed_config(self.config, self.kind)
         command = [self.executable, f"--config={layout.config_path}", *arguments]
         timeout = self.command_timeout_seconds if timeout_seconds is None else timeout_seconds
         try:
@@ -206,7 +207,7 @@ class NotmuchAdapter:
         file_names = cast(list[object], output)
         if not all(isinstance(item, str) for item in file_names):
             raise NotmuchError("notmuch returned an unexpected file-search JSON format")
-        layout = managed_layout(self.config)
+        layout = managed_layout(self.config, self.kind)
         return [
             (Path(item) if Path(item).is_absolute() else layout.mail_root / item).resolve()
             for item in cast(list[str], file_names)
@@ -222,7 +223,7 @@ class NotmuchAdapter:
         """Rebuild M7 derived tags exclusively from authoritative SQLite state."""
         if not self.config.database.path.exists():
             return
-        layout = managed_layout(self.config)
+        layout = managed_layout(self.config, self.kind)
         with connect(self.config.database.path) as connection:
             if (
                 connection.execute(
@@ -235,7 +236,8 @@ class NotmuchAdapter:
                 """SELECT c.local_path, c.message_id_header, x.classification FROM canonical_messages c
                 JOIN classifications x ON x.id=(SELECT id FROM classifications
                     WHERE canonical_message_id=c.id ORDER BY manual_override DESC,id DESC LIMIT 1)
-                WHERE c.storage_state IN ('archived','quarantined')"""
+                WHERE c.storage_state=?""",
+                ("archived" if self.kind == "archive" else "quarantined",),
             ).fetchall()
         self.tag(["-ham", "-suspect", "-spam", "-quarantine"], "*")
         for row in rows:
@@ -270,7 +272,16 @@ def search_canonical_messages(
     """Use notmuch only for candidates; SQLite controls canonical-file visibility."""
     if scope not in {"archived", "quarantine", "all"}:
         raise ValueError("search scope must be archived, quarantine, or all")
-    paths = NotmuchAdapter(config).search_files(query)
+    kinds: tuple[NotmuchIndexKind, ...] = (
+        ("archive",)
+        if scope == "archived"
+        else ("quarantine",)
+        if scope == "quarantine"
+        else ("archive", "quarantine")
+    )
+    paths = [
+        path for kind in kinds for path in NotmuchAdapter(config, kind=kind).search_files(query)
+    ]
     if not paths:
         return []
     with connect(config.database.path) as connection:
@@ -320,4 +331,8 @@ def search_canonical_messages(
         )
         for row in rows
     }
-    return [by_path[path] for path in paths if path in by_path]
+    return list(
+        {
+            result.canonical_message.id: result for path, result in by_path.items() if path in paths
+        }.values()
+    )

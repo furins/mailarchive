@@ -258,7 +258,8 @@ def apply_classification(
     try:
         from mailarchive.notmuch import NotmuchAdapter
 
-        NotmuchAdapter(config).refresh()
+        NotmuchAdapter(config, kind="archive").refresh()
+        NotmuchAdapter(config, kind="quarantine").refresh()
     except Exception:
         pass
     return stored

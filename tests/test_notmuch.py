@@ -64,10 +64,10 @@ def test_managed_configuration_is_deterministic_and_separate(config_file: Path) 
     config = load_config(config_file)
     layout = write_managed_config(config)
     contents = layout.config_path.read_text(encoding="utf-8")
-    assert layout.mail_root == config.archive.root.resolve()
-    assert layout.database_path == config.archive.root.resolve() / "state" / "notmuch" / "db"
-    assert layout.database_path.is_relative_to(layout.mail_root)
-    assert "ignore=staging;state;attachments;metadata;logs" in contents
+    assert layout.mail_root == config.archive.root.resolve() / "mail"
+    assert layout.database_path == config.archive.root.resolve() / "state" / "notmuch" / "archive"
+    assert not layout.database_path.is_relative_to(layout.mail_root)
+    assert "ignore=state;attachments;metadata;logs" in contents
     assert "exclude_tags=quarantine" not in contents
     assert f"mail_root={layout.mail_root}" in contents
     assert f"path={layout.database_path}" in contents
@@ -376,8 +376,49 @@ def test_collision_lifecycle_visibility_is_filtered_by_sqlite(
     tags = adapter._run(  # pyright: ignore[reportPrivateUsage]
         ["search", "--exclude=false", "--output=tags", "--", "id:collision@example.test"]
     )
-    assert {"ham", "quarantine", "spam"}.issubset(set(tags.stdout.split()))
+    assert {"ham"}.issubset(set(tags.stdout.split()))
+    quarantine_tags = NotmuchAdapter(config, kind="quarantine")._run(  # pyright: ignore[reportPrivateUsage]
+        ["search", "--exclude=false", "--output=tags", "--", "id:collision@example.test"]
+    )
+    assert {"quarantine", "spam"}.issubset(set(quarantine_tags.stdout.split()))
     shutil.rmtree(managed_layout(config).database_path)
     adapter.refresh()
     assert _result_ids(config, "collision") == [first.id]
     assert _result_ids(config, "collision", scope="quarantine") == [second.id]
+
+
+@pytest.mark.skipif(shutil.which("notmuch") is None, reason="requires locally installed notmuch")
+def test_split_indexes_isolate_collision_query_terms(config_file: Path, tmp_path: Path) -> None:
+    """Notmuch emits duplicate filenames for one matching Message-ID group."""
+    config = load_config(config_file)
+    ham = tmp_path / "ham.eml"
+    spam = tmp_path / "spam.eml"
+    _write_message(
+        ham,
+        message_id="<query-collision@example.test>",
+        subject="same",
+        body="ham-only-token",
+        sender="c@example.test",
+    )
+    _write_message(
+        spam,
+        message_id="<query-collision@example.test>",
+        subject="same",
+        body="spam-only-token",
+        sender="c@example.test",
+    )
+    first = ingest_file(config, ham, "test").canonical_message
+    from mailarchive.classification import ClassificationResult, apply_classification
+
+    second = apply_classification(
+        config,
+        ingest_bytes(config, spam.read_bytes(), "test").canonical_message,
+        ClassificationResult("spam", 9, "test"),
+    )
+    NotmuchAdapter(config, kind="archive").refresh()
+    NotmuchAdapter(config, kind="quarantine").refresh()
+    assert _result_ids(config, "body:ham-only-token") == [first.id]
+    assert _result_ids(config, "body:ham-only-token", scope="quarantine") == []
+    assert _result_ids(config, "body:spam-only-token") == []
+    assert _result_ids(config, "body:spam-only-token", scope="quarantine") == [second.id]
+    assert _result_ids(config, "body:spam-only-token", scope="all") == [second.id]
