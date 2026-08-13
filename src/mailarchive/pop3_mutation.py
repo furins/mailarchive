@@ -16,6 +16,7 @@ from typing import Protocol
 from mailarchive.db import account_id, connect
 from mailarchive.imap import credential_variable
 from mailarchive.models import AppConfig, Pop3Config
+from mailarchive.pop3 import Pop3SyncBusyError, pop3_lock
 from mailarchive.remote_mutation import DeletionTarget, MutationResult, ProviderDeletionTarget
 
 
@@ -242,27 +243,35 @@ class Pop3MutationAdapter:
             return self._failure("IDENTITY_MISMATCH")
         wire: Pop3MutationWire | None = None
         try:
-            wire = self._session(password)
-            uidls = wire.uidls()
-            number = next(
-                (item for item, uidl in uidls.items() if uidl == exact.provider_message_id), None
-            )
-            if number is None:
-                return MutationResult("success-confirmed", confirmed_absent=True)
-            if hashlib.sha256(wire.retr(number)).hexdigest() != exact.canonical_sha256:
-                return self._failure("IDENTITY_MISMATCH")
-            try:
-                wire.dele(number)
-            except (OSError, Pop3MutationError):
-                wire.abort_without_quit()
+            with pop3_lock(self.config, self.account):
+                wire = self._session(password)
+                uidls = wire.uidls()
+                number = next(
+                    (
+                        item
+                        for item, uidl in uidls.items()
+                        if uidl == exact.provider_message_id
+                    ),
+                    None,
+                )
+                if number is None:
+                    return MutationResult("success-confirmed", confirmed_absent=True)
+                if hashlib.sha256(wire.retr(number)).hexdigest() != exact.canonical_sha256:
+                    return self._failure("IDENTITY_MISMATCH")
+                try:
+                    wire.dele(number)
+                except (OSError, Pop3MutationError):
+                    wire.abort_without_quit()
+                    wire = None
+                    return self._observe(exact, password)
+                try:
+                    wire.quit_and_commit()
+                except (OSError, Pop3MutationError):
+                    return self._observe(exact, password)
                 wire = None
                 return self._observe(exact, password)
-            try:
-                wire.quit_and_commit()
-            except (OSError, Pop3MutationError):
-                return self._observe(exact, password)
-            wire = None
-            return self._observe(exact, password)
+        except Pop3SyncBusyError:
+            return self._failure("REMOTE_STATE_CONFLICT")
         except (OSError, Pop3MutationError):
             return self._failure("PROVIDER_REJECTED")
         finally:

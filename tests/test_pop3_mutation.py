@@ -10,12 +10,13 @@ import pytest
 
 from mailarchive.config import load_config
 from mailarchive.db import account_id, connect, initialize
+from mailarchive.pop3 import Pop3Adapter, Pop3SyncBusyError, pop3_lock
 from mailarchive.pop3_mutation import (
     Pop3MutationAdapter,
     Pop3MutationError,
     _MutationWire,  # pyright: ignore[reportPrivateUsage]
 )
-from mailarchive.remote_mutation import ProviderDeletionTarget
+from mailarchive.remote_mutation import MutationResult, ProviderDeletionTarget
 
 
 def _config(tmp_path: Path) -> Path:
@@ -188,6 +189,66 @@ def test_pop3_mutation_unobservable_outcomes_never_retry_dele(
     result = adapter.delete(target)
     assert result.outcome == "outcome-unknown"
     assert server.dele_calls == [7] and server.quit_calls == 0
+
+
+def test_shared_pop3_lock_blocks_mutation_before_wire_construction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = FakeServer({"U1": b"target\r\n"})
+    adapter, target = _adapter(tmp_path, monkeypatch, server)
+    with pop3_lock(adapter.config, adapter.account):
+        result = adapter.delete(target)
+    assert result.error_code == "REMOTE_STATE_CONFLICT"
+    assert server.sessions == 0 and server.dele_calls == [] and server.quit_calls == 0
+
+
+def test_mutation_holds_shared_lock_until_provider_attempt_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = FakeServer({"U1": b"target\r\n"})
+    base, target = _adapter(tmp_path, monkeypatch, server)
+    entered, release = threading.Event(), threading.Event()
+
+    class BlockingWire(FakeWire):
+        def uidls(self) -> dict[int, str]:
+            if self.server.sessions == 1:
+                entered.set()
+                assert release.wait(timeout=5)
+            return super().uidls()
+
+    adapter = Pop3MutationAdapter(
+        base.config,
+        "pop",
+        wire_factory=lambda _settings: BlockingWire(server),
+    )
+    acquisition_wires = 0
+
+    def unexpected_acquisition_wire(_settings: object) -> object:
+        nonlocal acquisition_wires
+        acquisition_wires += 1
+        raise AssertionError("acquisition wire must not be constructed while deletion owns lock")
+
+    monkeypatch.setattr("mailarchive.pop3._Pop3Wire", unexpected_acquisition_wire)
+    result: list[MutationResult] = []
+    thread = threading.Thread(target=lambda: result.append(adapter.delete(target)))
+    thread.start()
+    assert entered.wait(timeout=5)
+    with connect(base.config.database.path) as db:
+        before = db.execute(
+            "SELECT id,provider_message_id,remote_present FROM remote_messages ORDER BY id"
+        ).fetchall()
+    with pytest.raises(Pop3SyncBusyError):
+        Pop3Adapter(base.config).sync("pop")
+    with connect(base.config.database.path) as db:
+        after = db.execute(
+            "SELECT id,provider_message_id,remote_present FROM remote_messages ORDER BY id"
+        ).fetchall()
+    assert acquisition_wires == 0
+    assert after == before
+    release.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert result and result[0].outcome == "success-confirmed"
 
 
 @pytest.mark.parametrize("listing", [b"1 U1\r\n1 U2\r\n", b"1 U1\r\n2 U1\r\n"])
