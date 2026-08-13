@@ -21,6 +21,7 @@ from mailarchive.config import ConfigError, display_config, load_config
 from mailarchive.db import account_id, connect, initialize
 from mailarchive.fastpath import FAST_PATH_STALE_SECONDS, FastPathWatcher, fast_path_status
 from mailarchive.gmail import GmailAdapter, GmailError, GmailWatcher, authorize
+from mailarchive.gmail_mutation import authorize_delete
 from mailarchive.imap import ImapAdapter, ImapError
 from mailarchive.ingest import IngestError, ingest_file
 from mailarchive.notmuch import NotmuchAdapter, NotmuchError, search_canonical_messages
@@ -114,6 +115,12 @@ def build_parser() -> argparse.ArgumentParser:
     gmail_auth.add_argument("--account", required=True)
     gmail_auth.add_argument("--config", required=True)
     gmail_auth.add_argument("--json", action="store_true")
+    gmail_delete_auth = gmail_subcommands.add_parser(
+        "auth-delete", help="authorize the separate Gmail permanent-deletion credential"
+    )
+    gmail_delete_auth.add_argument("--account", required=True)
+    gmail_delete_auth.add_argument("--config", required=True)
+    gmail_delete_auth.add_argument("--json", action="store_true")
     gmail_sync = gmail_subcommands.add_parser(
         "sync", help="synchronize Gmail through read-only REST"
     )
@@ -653,6 +660,13 @@ def main(argv: list[str] | None = None) -> int:
                 email = authorize(account)
                 _emit(
                     {"authorized": True, "account": account.name, "profile_email": email}, args.json
+                )
+                return 0
+            if args.gmail_command == "auth-delete":
+                email = authorize_delete(account)
+                _emit(
+                    {"authorized_delete": True, "account": account.name, "profile_email": email},
+                    args.json,
                 )
                 return 0
             if args.gmail_command == "sync":

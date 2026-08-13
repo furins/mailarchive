@@ -48,6 +48,7 @@ class GmailConfig:
     account_email: str
     oauth_client_secret_file: Path
     poll_interval_seconds: int = 90
+    remote_delete_token_file: Path | None = None
 
 
 @dataclass(frozen=True)

@@ -224,6 +224,9 @@ started-before-call state transitions. It is frozen at `94acb8e02caf0f3336206025
 M12-B adds an injectable dedicated IMAP adapter: UIDPLUS is mandatory, remote BODY.PEEK[] SHA-256
 must match before exact UID STORE/UID EXPUNGE, and global EXPUNGE/CLOSE are forbidden. Default CLI
 wiring remains fail-closed; Gmail, POP3, and reconciliation are later checkpoints.
+M12-C adds an injectable Gmail adapter with a separate `https://mail.google.com/` credential;
+M5 remains `gmail.readonly`. It validates profile, Message.id and RAW SHA before one DELETE and
+mandatory GET confirmation. Default factory wiring remains disabled.
 
 ## M13 — Operations
 

@@ -117,6 +117,14 @@ UID STORE of `\\Deleted` followed by UID EXPUNGE for that same UID. Global EXPUN
 writable SELECT are forbidden. A preexisting `\\Deleted` target is a conflict; uncertain results
 are never retried automatically.
 
+### M12-C Gmail adapter checkpoint
+
+M12-A and M12-B remain frozen at `94acb8e02caf0f3336206025d0901ce9985504e4` and
+`fda07c73fafccd16434d61c0a549967f9cbe849b`. M12-C retains M5 `gmail.readonly` acquisition and
+uses a separate optional 0600 token outside `archive.root` for `https://mail.google.com/`. Its
+injected adapter verifies profile identity and exact Message.id RAW SHA before one DELETE and GET
+confirmation; ambiguous requests are never retried. The default factory remains fail-closed.
+
 ## 7. Rate limiting and blast-radius control
 
 When remote deletion is eventually enabled:

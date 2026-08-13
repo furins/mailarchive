@@ -102,6 +102,11 @@ account's explicit `remote_deletion_enabled: true` setting, expires plans after 
 creates an immutable separate execution run, and stops on the first non-success. Provider-writing
 adapters are deliberately not implemented in this checkpoint.
 
+M12-C adds a separate injectable Gmail mutation adapter. M5 remains `gmail.readonly`; the optional
+separate deletion token uses `https://mail.google.com/`, verifies the configured profile and exact
+Gmail `Message.id`, requires RAW SHA-256 equality, sends at most one DELETE, then requires a
+same-ID GET confirmation. Default production wiring remains disabled.
+
 M12-B adds a dedicated injectable IMAP adapter only. It is still not selected by the default
 production factory. The adapter requires UIDPLUS and exact BODY.PEEK[] SHA-256 validation, then
 uses only an exact UID STORE of `\\Deleted` and exact UID EXPUNGE; global EXPUNGE and CLOSE are

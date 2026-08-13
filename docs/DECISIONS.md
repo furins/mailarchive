@@ -298,3 +298,11 @@ UIDPLUS, validates UIDVALIDITY and exact BODY.PEEK[] SHA-256, and refuses a pree
 `\\Deleted` target. It may only issue UID STORE for the one planned UID followed by UID EXPUNGE
 for that UID. Global EXPUNGE and CLOSE are prohibited. The M12-A default production factory stays
 fail-closed until M12-E adds wiring and reconciliation.
+
+# ADR-023: Separate M12-C Gmail mutation credential
+
+M12-C never broadens M5's `gmail.readonly` token. A distinct optional 0600 token outside the
+archive uses only `https://mail.google.com/` as Gmail mailbox scope. Its adapter verifies the
+profile at authorization and execution, addresses only exact Message.id, compares decoded RAW with
+the canonical SHA-256, issues at most one DELETE, and confirms absence with GET. Default CLI
+wiring remains deferred to M12-E.
