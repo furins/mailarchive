@@ -114,6 +114,25 @@ class RemoteMutationAdapter(Protocol):
     def delete(self, target: DeletionTarget) -> MutationResult: ...
 
 
+@dataclass(frozen=True)
+class ObservationResult:
+    """Closed, read-only proof about the exact historical mutation target."""
+
+    state: str
+
+
+_OBSERVATION_STATES = {
+    "confirmed-absent",
+    "confirmed-present-match",
+    "identity-conflict",
+    "unknown",
+}
+
+
+class RemoteObservationAdapter(Protocol):
+    def observe(self, target: DeletionTarget) -> ObservationResult: ...
+
+
 PLAN_TTL = timedelta(minutes=60)
 
 
@@ -284,6 +303,145 @@ def _planned_target(db: sqlite3.Connection, mutation_id: int) -> DeletionTarget:
     return _target(row)
 
 
+def _historical_target(db: sqlite3.Connection, mutation_id: int) -> DeletionTarget:
+    """Rebuild the target that was attempted, never current provider identity."""
+    row = db.execute(
+        """SELECT m.*,a.name AS account_name FROM remote_mutations m
+        JOIN accounts a ON a.id=m.account_id WHERE m.id=?""",
+        (mutation_id,),
+    ).fetchone()
+    if row is None:
+        raise ReconciliationError("historical mutation disappeared")
+    remote_message_id = str(row["remote_message_id"])
+    canonical_message_id = str(row["canonical_message_id"])
+    account_id = int(row["account_id"])
+    account_name = str(row["account_name"])
+    provider_kind = str(row["provider_kind"])
+    canonical_sha256 = str(row["canonical_sha256"])
+    if row["provider_kind"] == "imap":
+        return ImapDeletionTarget(
+            remote_message_id,
+            canonical_message_id,
+            account_id,
+            account_name,
+            provider_kind,
+            canonical_sha256,
+            remote_folder=str(row["remote_folder"]),
+            uidvalidity=int(row["uidvalidity"]),
+            remote_uid=int(row["remote_uid"]),
+        )
+    return ProviderDeletionTarget(
+        remote_message_id,
+        canonical_message_id,
+        account_id,
+        account_name,
+        provider_kind,
+        canonical_sha256,
+        str(row["provider_message_id"]),
+    )
+
+
+class ReconciliationError(RuntimeError):
+    """A local production-run reconciliation precondition failed."""
+
+
+def reconcile_production_run(
+    config: AppConfig,
+    run_id: int,
+    *,
+    observer_factory: Callable[[AppConfig, str], RemoteObservationAdapter],
+) -> dict[str, object]:
+    """Read-only recovery of started/unknown rows; never resumes a production run."""
+    counts = {"observed": 0, "resolved_absent": 0, "resolved_present": 0, "unresolved": 0}
+    with connect(config.database.path) as db:
+        run = db.execute("SELECT * FROM remote_mutation_runs WHERE id=?", (run_id,)).fetchone()
+        if run is None or run["mode"] != "production-execute" or run["status"] != "halted":
+            raise ReconciliationError("run is not a halted production execution")
+        rows = db.execute(
+            "SELECT id FROM remote_mutations WHERE mutation_run_id=? AND status IN ('started','unknown') ORDER BY id",
+            (run_id,),
+        ).fetchall()
+    for item in rows:
+        mutation_id = int(item["id"])
+        with connect(config.database.path) as db:
+            target = _historical_target(db, mutation_id)
+            row = db.execute(
+                "SELECT status FROM remote_mutations WHERE id=?", (mutation_id,)
+            ).fetchone()
+            insert_audit_event(
+                db,
+                actor="mailarchive.remote_mutation",
+                event_type="remote_mutation.reconcile.started",
+                result="started",
+                details_json=json.dumps(
+                    {
+                        "run_id": run_id,
+                        "mutation_id": mutation_id,
+                        "account_id": target.account_id,
+                        "provider_kind": target.provider_kind,
+                    },
+                    sort_keys=True,
+                ),
+            )
+            db.commit()
+        try:
+            observed = observer_factory(config, target.account_name).observe(target)
+            state = observed.state if observed.state in _OBSERVATION_STATES else "unknown"
+        except Exception:
+            state = "unknown"
+        counts["observed"] += 1
+        with connect(config.database.path) as db:
+            now = utc_now()
+            if state == "confirmed-absent":
+                db.execute(
+                    "UPDATE remote_mutations SET status='succeeded',completed_at=?,reconciled_at=?,provider_response_summary='confirmed-absent',error_code='NONE' WHERE id=?",
+                    (now, now, mutation_id),
+                )
+                db.execute(
+                    "UPDATE remote_messages SET remote_present=0 WHERE id=?",
+                    (target.remote_message_id,),
+                )
+                event, result = "remote_mutation.reconcile.absent", "success"
+                counts["resolved_absent"] += 1
+            elif state == "confirmed-present-match":
+                db.execute(
+                    "UPDATE remote_mutations SET status='failed',completed_at=?,reconciled_at=?,provider_response_summary='confirmed-no-mutation',error_code='RECONCILED_PRESENT' WHERE id=?",
+                    (now, now, mutation_id),
+                )
+                db.execute(
+                    "UPDATE remote_messages SET remote_present=1 WHERE id=?",
+                    (target.remote_message_id,),
+                )
+                event, result = "remote_mutation.reconcile.present", "failed"
+                counts["resolved_present"] += 1
+            else:
+                if str(row["status"]) == "started":
+                    db.execute(
+                        "UPDATE remote_mutations SET status='unknown',completed_at=?,provider_response_summary='outcome-uncertain',error_code='TRANSPORT_UNKNOWN' WHERE id=?",
+                        (now, mutation_id),
+                    )
+                event, result = "remote_mutation.reconcile.unknown", "unknown"
+                counts["unresolved"] += 1
+            insert_audit_event(
+                db,
+                actor="mailarchive.remote_mutation",
+                event_type=event,
+                result=result,
+                details_json=json.dumps(
+                    {
+                        "run_id": run_id,
+                        "mutation_id": mutation_id,
+                        "account_id": target.account_id,
+                        "provider_kind": target.provider_kind,
+                        "state": state,
+                    },
+                    sort_keys=True,
+                ),
+            )
+            db.commit()
+    return {"run_id": run_id, "status": "halted", **counts, "resumed": False}
+
+
 def _still_current(
     config: AppConfig,
     target: DeletionTarget,
@@ -399,15 +557,20 @@ def execute_production_plan(
             raise ProductionPlanError(
                 "source plan is not explicitly limited to the requested account"
             )
-        if db.execute(
-            "SELECT 1 FROM remote_mutation_runs WHERE mode='production-execute' AND source_plan_run_id=?",
-            (source_plan_run_id,),
-        ).fetchone() is not None:
+        if (
+            db.execute(
+                "SELECT 1 FROM remote_mutation_runs WHERE mode='production-execute' AND source_plan_run_id=?",
+                (source_plan_run_id,),
+            ).fetchone()
+            is not None
+        ):
             raise ProductionPlanError("source plan already has a production execution")
         try:
             requested_at = datetime.fromisoformat(str(source["requested_at"]))
         except ValueError as error:
-            raise ProductionPlanError("source plan has an invalid requested_at timestamp") from error
+            raise ProductionPlanError(
+                "source plan has an invalid requested_at timestamp"
+            ) from error
         if requested_at.tzinfo is None or requested_at.astimezone(UTC) > now:
             raise ProductionPlanError("source plan has an invalid requested_at timestamp")
         if now - requested_at.astimezone(UTC) > PLAN_TTL:
@@ -421,8 +584,7 @@ def execute_production_plan(
         )
         if any(selected > limit for limit in limits) or (
             int(source["effective_max_per_run"]) > config.remote_deletion.max_per_run
-            or int(source["effective_max_per_account"])
-            > config.remote_deletion.max_per_account
+            or int(source["effective_max_per_account"]) > config.remote_deletion.max_per_account
         ):
             raise ProductionPlanError("source plan exceeds current safety limit")
         rows = db.execute(
@@ -460,11 +622,7 @@ def execute_production_plan(
         for row in rows:
             target = _planned_target(db, int(row["id"]))
             report = fresh[str(row["remote_message_id"])]
-            if (
-                not _still_current(
-                    config, target, str(row["target_fingerprint_sha256"]), report
-                )
-            ):
+            if not _still_current(config, target, str(row["target_fingerprint_sha256"]), report):
                 raise ProductionPlanError("source plan target fingerprint or identity is stale")
         # Required to be a local, non-network factory preflight in all future phases.
         adapter = adapter_factory(config, account_name)

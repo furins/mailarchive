@@ -23,6 +23,7 @@ from mailarchive.remote_mutation import (
     DeletionTarget,
     ImapDeletionTarget,
     MutationResult,
+    ObservationResult,
     ProductionPlanError,
     ProviderDeletionTarget,
     RemoteMutationAdapter,
@@ -30,6 +31,7 @@ from mailarchive.remote_mutation import (
     execute_fake,
     execute_production_plan,
     plan_dry_run,
+    reconcile_production_run,
 )
 
 
@@ -41,6 +43,16 @@ class FakeAdapter:
     def delete(self, target: DeletionTarget) -> MutationResult:
         self.calls.append(target)
         return self.outcome
+
+
+class FakeObserver:
+    def __init__(self, state: str) -> None:
+        self.state = state
+        self.targets: list[DeletionTarget] = []
+
+    def observe(self, target: DeletionTarget) -> ObservationResult:
+        self.targets.append(target)
+        return ObservationResult(self.state)
 
 
 class IdentityFakeAdapter:
@@ -525,10 +537,18 @@ def test_pop3_adapter_engine_halts_on_failure_or_unknown(
         pop3_engine_config(config_file, server.server.server_address[1])
         monkeypatch.setenv("POP_ENGINE_PASSWORD", "local-only")
         config, _ = eligible_remote(
-            config_file, provider_kind="pop3", remote_id="a", provider_message_id="U1", body=b"first\r\n"
+            config_file,
+            provider_kind="pop3",
+            remote_id="a",
+            provider_message_id="U1",
+            body=b"first\r\n",
         )
         eligible_remote(
-            config_file, provider_kind="pop3", remote_id="b", provider_message_id="U2", body=b"later\r\n"
+            config_file,
+            provider_kind="pop3",
+            remote_id="b",
+            provider_message_id="U2",
+            body=b"later\r\n",
         )
         source = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
         production = execute_production_plan(
@@ -541,16 +561,25 @@ def test_pop3_adapter_engine_halts_on_failure_or_unknown(
                 (production,),
             ).fetchall()
             assert [tuple(row) for row in rows] == [("a", expected), ("b", "planned")]
-            assert db.execute("SELECT remote_present FROM remote_messages WHERE id='a'").fetchone()[0] == 1
+            assert (
+                db.execute("SELECT remote_present FROM remote_messages WHERE id='a'").fetchone()[0]
+                == 1
+            )
         with pytest.raises(ProductionPlanError):
             execute_production_plan(
-                config, source, "test", adapter_factory=lambda cfg, name: Pop3MutationAdapter(cfg, name)
+                config,
+                source,
+                "test",
+                adapter_factory=lambda cfg, name: Pop3MutationAdapter(cfg, name),
             )
         if mode == "unknown":
             fresh = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
             with pytest.raises(ProductionPlanError, match="unresolved"):
                 execute_production_plan(
-                    config, fresh, "test", adapter_factory=lambda cfg, name: Pop3MutationAdapter(cfg, name)
+                    config,
+                    fresh,
+                    "test",
+                    adapter_factory=lambda cfg, name: Pop3MutationAdapter(cfg, name),
                 )
         assert server.commands.count("DELE") == 1
     finally:
@@ -1229,3 +1258,110 @@ def test_acquisition_sources_remain_without_provider_write_path() -> None:
         assert forbidden not in mutation_source
     assert "--execute" not in cli_source.replace("--execute-plan", "")
     assert "gmail.readonly" in gmail_source
+
+
+@pytest.mark.parametrize(
+    ("initial", "state", "expected", "remote_present", "reconciled"),
+    [
+        ("started", "confirmed-absent", "succeeded", 0, True),
+        ("started", "confirmed-present-match", "failed", 1, True),
+        ("started", "unknown", "unknown", 1, False),
+        ("started", "identity-conflict", "unknown", 1, False),
+        ("unknown", "confirmed-absent", "succeeded", 0, True),
+        ("unknown", "confirmed-present-match", "failed", 1, True),
+        ("unknown", "unknown", "unknown", 1, False),
+        ("unknown", "identity-conflict", "unknown", 1, False),
+    ],
+)
+def test_reconciliation_historical_snapshot_and_state_matrix(
+    config_file: Path,
+    initial: str,
+    state: str,
+    expected: str,
+    remote_present: int,
+    reconciled: bool,
+) -> None:
+    config, _ = eligible_remote(config_file, provider_kind="pop3", provider_message_id="original")
+    config = production_enabled(config)
+    source = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
+    run = execute_production_plan(
+        config,
+        source,
+        "test",
+        adapter_factory=ProductionFactory(FakeAdapter(MutationResult("outcome-unknown"))),
+    )
+    with connect(config.database.path) as db:
+        mutation = db.execute(
+            "SELECT id FROM remote_mutations WHERE mutation_run_id=?", (run,)
+        ).fetchone()[0]
+        db.execute(
+            "UPDATE remote_mutations SET status=?,completed_at=NULL,reconciled_at=NULL WHERE id=?",
+            (initial, mutation),
+        )
+        db.execute("UPDATE remote_messages SET provider_message_id='drifted',remote_present=1")
+        db.commit()
+    observer = FakeObserver(state)
+    result = reconcile_production_run(
+        config, run, observer_factory=lambda _config, _account: observer
+    )
+    assert result["resumed"] is False
+    assert isinstance(observer.targets[0], ProviderDeletionTarget)
+    assert observer.targets[0].provider_message_id == "original"
+    with connect(config.database.path) as db:
+        row = db.execute(
+            "SELECT status,reconciled_at FROM remote_mutations WHERE id=?", (mutation,)
+        ).fetchone()
+        assert row["status"] == expected
+        assert (row["reconciled_at"] is not None) is reconciled
+        assert db.execute("SELECT remote_present FROM remote_messages").fetchone()[0] == remote_present
+        event = "remote_mutation.reconcile." + (
+            "absent" if state == "confirmed-absent" else "present" if state == "confirmed-present-match" else "unknown"
+        )
+        assert db.execute("SELECT COUNT(*) FROM audit_events WHERE event_type=?", (event,)).fetchone()[0] == 1
+
+
+def test_reconciliation_invalid_result_and_exception_are_bounded(config_file: Path) -> None:
+    config, _ = eligible_remote(config_file)
+    config = production_enabled(config)
+    source = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
+    run = execute_production_plan(
+        config,
+        source,
+        "test",
+        adapter_factory=ProductionFactory(FakeAdapter(MutationResult("outcome-unknown"))),
+    )
+
+    class RaisingObserver:
+        def observe(self, target: DeletionTarget) -> ObservationResult:
+            del target
+            raise RuntimeError("token=secret raw RFC822")
+
+    reconcile_production_run(config, run, observer_factory=lambda _config, _account: RaisingObserver())
+    with connect(config.database.path) as db:
+        row = db.execute("SELECT status,error_code,reconciled_at FROM remote_mutations WHERE mutation_run_id=?", (run,)).fetchone()
+        assert tuple(row) == ("unknown", "INVALID_ADAPTER_RESULT", None)
+        assert b"token=secret" not in config.database.path.read_bytes()
+
+
+def test_reconciliation_never_resumes_later_planned_mutations(config_file: Path) -> None:
+    config, _ = eligible_remote(
+        config_file, provider_kind="pop3", remote_id="a", provider_message_id="a"
+    )
+    eligible_remote(
+        config_file, provider_kind="pop3", remote_id="b", provider_message_id="b", body=b"second"
+    )
+    config = production_enabled(config)
+    source = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
+    deletion = FakeAdapter(MutationResult("outcome-unknown"))
+    run = execute_production_plan(config, source, "test", adapter_factory=ProductionFactory(deletion))
+    assert len(deletion.calls) == 1
+    reconcile_production_run(
+        config, run, observer_factory=lambda _config, _account: FakeObserver("confirmed-absent")
+    )
+    with connect(config.database.path) as db:
+        rows = db.execute(
+            "SELECT status FROM remote_mutations WHERE mutation_run_id=? ORDER BY remote_message_id", (run,)
+        ).fetchall()
+        assert [str(row[0]) for row in rows] == ["succeeded", "planned"]
+        assert db.execute("SELECT status FROM remote_mutation_runs WHERE id=?", (run,)).fetchone()[0] == "halted"
+    assert len(deletion.calls) == 1
