@@ -378,13 +378,42 @@ class ReconciliationError(RuntimeError):
     """A local production-run reconciliation precondition failed."""
 
 
+def observation_adapter_factory(
+    config: AppConfig, account_name: str
+) -> RemoteObservationAdapter:
+    """Construct the closed, read-only provider observer without network I/O."""
+    account = next((item for item in config.accounts if item.name == account_name), None)
+    if account is None:
+        raise ReconciliationError("reconciliation account is not configured")
+    # These imports are deliberately local: each concrete adapter imports the
+    # target/observation types above, while construction itself remains local.
+    if account.kind == "imap":
+        from mailarchive.imap_mutation import ImapMutationAdapter
+
+        return ImapMutationAdapter(config, account_name)
+    if account.kind == "gmail":
+        from mailarchive.gmail_mutation import GmailMutationAdapter, google_mutation_transport
+
+        return GmailMutationAdapter(
+            config,
+            account_name,
+            transport_factory=google_mutation_transport,
+        )
+    if account.kind == "pop3":
+        from mailarchive.pop3_mutation import Pop3MutationAdapter
+
+        return Pop3MutationAdapter(config, account_name)
+    raise ReconciliationError("reconciliation account provider is unsupported")
+
+
 def reconcile_production_run(
     config: AppConfig,
     run_id: int,
     *,
-    observer_factory: Callable[[AppConfig, str], RemoteObservationAdapter],
+    observer_factory: Callable[[AppConfig, str], RemoteObservationAdapter] | None = None,
 ) -> dict[str, object]:
     """Read-only recovery of started/unknown rows; never resumes a production run."""
+    observer_factory = observation_adapter_factory if observer_factory is None else observer_factory
     counts = {"observed": 0, "resolved_absent": 0, "resolved_present": 0, "unresolved": 0}
     with connect(config.database.path) as db:
         run = db.execute("SELECT * FROM remote_mutation_runs WHERE id=?", (run_id,)).fetchone()

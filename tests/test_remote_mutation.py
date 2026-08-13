@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import socket
 import socketserver
 import threading
 from collections.abc import Callable
@@ -11,13 +12,15 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from google.oauth2.credentials import Credentials
 
 from mailarchive.classification import ClassificationResult, apply_classification
 from mailarchive.config import load_config
 from mailarchive.db import account_id, connect, initialize, utc_now
 from mailarchive.gmail_mutation import GmailMutationAdapter
+from mailarchive.imap_mutation import ImapMutationAdapter
 from mailarchive.ingest import ingest_bytes
-from mailarchive.models import AppConfig
+from mailarchive.models import AppConfig, FastPathConfig, ImapConfig
 from mailarchive.pop3_mutation import Pop3MutationAdapter
 from mailarchive.remote_mutation import (
     DeletionTarget,
@@ -31,6 +34,7 @@ from mailarchive.remote_mutation import (
     _normalize_result,  # pyright: ignore[reportPrivateUsage]
     execute_fake,
     execute_production_plan,
+    observation_adapter_factory,
     plan_dry_run,
     reconcile_production_run,
 )
@@ -1444,3 +1448,141 @@ def test_reconciliation_preserves_local_graph_on_conclusive_absence(config_file:
         assert [tuple(row) for row in db.execute("SELECT * FROM message_attachments")] == links
         assert [tuple(row) for row in db.execute("SELECT * FROM message_backup_evidence")] == evidence
     assert path.read_bytes() == before
+
+
+def test_observation_adapter_factory_constructs_imap_without_network(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Factory selection is closed and constructor work never opens a provider socket."""
+    config = load_config(config_file)
+    initialize(config.database.path, config.accounts)
+    account = replace(
+        config.accounts[0],
+        imap=ImapConfig(
+            host="127.0.0.1",
+            port=143,
+            username="fixture",
+            tls_mode="INSECURE_LOOPBACK",
+            folders=("INBOX",),
+            connection_timeout_seconds=5,
+            fast_path=FastPathConfig(),
+        ),
+    )
+    configured = replace(config, accounts=(account,))
+
+    def no_network(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("observer construction must not connect")
+
+    monkeypatch.setattr(socket, "create_connection", no_network)
+    assert isinstance(observation_adapter_factory(configured, "test"), ImapMutationAdapter)
+    with pytest.raises(ReconciliationError):
+        observation_adapter_factory(configured, "missing")
+
+
+@pytest.mark.parametrize(("state", "expected", "presence"), [
+    ("confirmed-absent", "succeeded", 0),
+    ("confirmed-present-match", "failed", 1),
+    ("unknown", "unknown", 1),
+])
+def test_default_reconciliation_uses_real_gmail_observer(
+    config_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    state: str, expected: str, presence: int,
+) -> None:
+    """The default factory reaches the frozen Gmail observer, never delete()."""
+    gmail_engine_config(config_file, tmp_path)
+    config, canonical = eligible_remote(
+        config_file, provider_kind="gmail", remote_id="gmail-historical", provider_message_id="target"
+    )
+    source = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
+    run = execute_production_plan(
+        config, source, "test", adapter_factory=ProductionFactory(FakeAdapter(MutationResult("outcome-unknown")))
+    )
+    raw = Path(
+        connect(config.database.path).execute(
+            "SELECT local_path FROM canonical_messages WHERE id=?", (canonical,)
+        ).fetchone()[0]
+    ).read_bytes()
+    messages = {"target": raw} if state == "confirmed-present-match" else {}
+    fake = EngineGmail(config.database.path, messages)
+    if state == "unknown":
+        def unavailable(_message_id: str) -> dict[str, object] | None:
+            raise OSError("unavailable")
+
+        fake.get_raw = unavailable  # type: ignore[method-assign]
+    import mailarchive.gmail_mutation as gmail_mutation
+
+    def transport_factory(_credentials: Credentials) -> EngineGmail:
+        return fake
+
+    monkeypatch.setattr(gmail_mutation, "_GoogleMutationTransport", transport_factory)
+
+    def forbidden_delete(self: GmailMutationAdapter, target: DeletionTarget) -> MutationResult:
+        del self, target
+        raise AssertionError("reconciliation must not call delete")
+
+    monkeypatch.setattr(GmailMutationAdapter, "delete", forbidden_delete)
+    readonly = Path(config.accounts[0].config_ref.removeprefix("file:")).read_bytes()
+    reconcile_production_run(config, run)
+    assert fake.deletes == []
+    assert Path(config.accounts[0].config_ref.removeprefix("file:")).read_bytes() == readonly
+    with connect(config.database.path) as db:
+        row = db.execute(
+            "SELECT status,reconciled_at FROM remote_mutations WHERE mutation_run_id=?", (run,)
+        ).fetchone()
+        assert row["status"] == expected
+        assert (row["reconciled_at"] is not None) is (state != "unknown")
+        assert db.execute("SELECT remote_present FROM remote_messages").fetchone()[0] == presence
+
+
+@pytest.mark.parametrize(("state", "expected", "presence"), [
+    ("confirmed-absent", "succeeded", 0),
+    ("confirmed-present-match", "failed", 1),
+    ("unknown", "unknown", 1),
+])
+def test_default_reconciliation_uses_real_pop3_observer(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch, state: str, expected: str, presence: int
+) -> None:
+    """The default factory uses the real POP3 wire read path and no DELE/QUIT."""
+    database = config_file.parent / "state" / "mailarchive.sqlite3"
+    server = EnginePop3Server(database, {})
+    try:
+        pop3_engine_config(config_file, int(server.server.server_address[1]))
+        config, canonical = eligible_remote(
+            config_file,
+            provider_kind="pop3",
+            remote_id="pop3-historical",
+            provider_message_id="target",
+            body=b"body\r\n",
+        )
+        raw = Path(
+            connect(config.database.path).execute(
+                "SELECT local_path FROM canonical_messages WHERE id=?", (canonical,)
+            ).fetchone()[0]
+        ).read_bytes()
+        if state == "confirmed-present-match":
+            server.messages["target"] = raw
+        elif state == "unknown":
+            server.close()
+        monkeypatch.setenv("POP_ENGINE_PASSWORD", "fixture-password")
+        source = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
+        run = execute_production_plan(
+            config, source, "test", adapter_factory=ProductionFactory(FakeAdapter(MutationResult("outcome-unknown")))
+        )
+
+        def forbidden_delete(self: Pop3MutationAdapter, target: DeletionTarget) -> MutationResult:
+            del self, target
+            raise AssertionError("reconciliation must not call delete")
+
+        monkeypatch.setattr(Pop3MutationAdapter, "delete", forbidden_delete)
+        reconcile_production_run(config, run)
+        assert "DELE" not in server.commands and "QUIT" not in server.commands
+        with connect(config.database.path) as db:
+            row = db.execute(
+                "SELECT status,reconciled_at FROM remote_mutations WHERE mutation_run_id=?", (run,)
+            ).fetchone()
+            assert row["status"] == expected
+            assert (row["reconciled_at"] is not None) is (state != "unknown")
+            assert db.execute("SELECT remote_present FROM remote_messages").fetchone()[0] == presence
+    finally:
+        if state != "unknown":
+            server.close()

@@ -94,6 +94,11 @@ class _GoogleMutationTransport:
         )
 
 
+def google_mutation_transport(credentials: Credentials) -> MutationTransport:
+    """Construct the fixed-host mutation transport for the closed E1 observer factory."""
+    return _GoogleMutationTransport(credentials)
+
+
 def _delete_path(account: AccountConfig) -> Path:
     if account.gmail is None or account.gmail.remote_delete_token_file is None:
         raise GmailAuthError("Gmail remote delete token file is not configured")
