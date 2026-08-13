@@ -20,6 +20,8 @@ accounts:
     enabled: true
     remote_retention_days: 365
     remote_deletion_enabled: false
+    # DANGEROUS M12 opt-in for a dedicated non-production account only:
+    # remote_deletion_enabled: true
     required_verified_backups: 2
     config_ref: env:MAILARCHIVE_PERSONAL_IMAP_PASSWORD
     imap:

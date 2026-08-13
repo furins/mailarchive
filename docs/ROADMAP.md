@@ -218,6 +218,10 @@ Deliver:
 - first test-account procedure;
 - failure recovery.
 
+M12-A implements the provider-neutral authority chain only: explicit account opt-in, a 60-minute
+source-plan TTL, immutable production execution runs, fresh M10 revalidation, and serial
+started-before-call state transitions. Provider mutation adapters remain out of scope for M12-A.
+
 ## M13 — Operations
 
 Deliver:

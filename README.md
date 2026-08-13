@@ -94,6 +94,14 @@ evaluation and appends an exact, rate-limited target snapshot. It cannot execute
 provider mutation: M11 has no `--execute` command, write-capable adapter, or Gmail
 write scope. `remote_deletion.max_per_run` and `max_per_account` both default to 10.
 
+## M12-A production execution foundation
+
+M12-A can execute only one existing, account-filtered M11 dry-run plan with
+`remote-delete --execute-plan RUN_ID --account ACCOUNT --config CONFIG`. It requires the
+account's explicit `remote_deletion_enabled: true` setting, expires plans after 60 minutes,
+creates an immutable separate execution run, and stops on the first non-success. Provider-writing
+adapters are deliberately not implemented in this checkpoint.
+
 M1 stores each account's byte-unique message at
 `<archive.root>/mail/<account>/cur/<sha256>.eml`. The source is read in binary mode and
 the canonical file has precisely the same bytes. Reingesting identical bytes within an

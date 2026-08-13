@@ -101,6 +101,13 @@ destructive call begins, a committed `started` row must exist. If completion can
 the row is `unknown`, later work stops, automatic retry is forbidden, and operator reconciliation
 is required.
 
+### M12-A source-plan execution authority
+
+An M12 execution is a separate run and may consume only one completed, account-filtered M11 plan.
+It needs per-account opt-in, expires after 60 minutes, repeats M10 safety evaluation before setup
+and before each call, records `started` before a call, and halts on any non-success. M12-A has no
+provider-writing adapter, so explicit execution fails closed until later provider phases.
+
 ## 7. Rate limiting and blast-radius control
 
 When remote deletion is eventually enabled:

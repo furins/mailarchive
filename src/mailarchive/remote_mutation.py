@@ -3,13 +3,16 @@
 No production network-writing adapter exists here.  The CLI calls ``plan_dry_run``
 only; tests may pass an in-memory adapter to ``execute_fake`` directly.
 """
+# ruff: noqa: E501
 
 from __future__ import annotations
 
 import hashlib
 import json
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Protocol, cast
 
 from mailarchive.db import connect, insert_audit_event, utc_now
@@ -110,6 +113,18 @@ def _normalize_result(
 
 class RemoteMutationAdapter(Protocol):
     def delete(self, target: DeletionTarget) -> MutationResult: ...
+
+
+PLAN_TTL = timedelta(minutes=60)
+
+
+class ProductionPlanError(RuntimeError):
+    """The explicit M12 authorization chain cannot be proven locally."""
+
+
+def production_adapter_factory(config: AppConfig, account_name: str) -> RemoteMutationAdapter:
+    """M12-A deliberately has no production provider-writing adapter."""
+    raise ProductionPlanError("production provider adapter not implemented in M12-A")
 
 
 def production_adapter() -> RemoteMutationAdapter:
@@ -342,6 +357,158 @@ def execute_fake(config: AppConfig, run_id: int, adapter: RemoteMutationAdapter)
             status = _record_outcome(config, run_id, int(row["id"]), target, result)
         except Exception:
             # Provider exception text can contain remote data; retain only a bounded category.
+            status = _record_outcome(
+                config,
+                run_id,
+                int(row["id"]),
+                target,
+                MutationResult("outcome-unknown"),
+                internal_error_code="ADAPTER_EXCEPTION",
+            )
+        if status != "succeeded":
+            return
+
+
+def execute_production_plan(
+    config: AppConfig,
+    source_plan_run_id: int,
+    account_name: str,
+    *,
+    adapter_factory: Callable[[AppConfig, str], RemoteMutationAdapter] = production_adapter_factory,
+) -> int:
+    """Execute only one current, account-filtered M11 plan; serial and fail-closed."""
+    account = next((item for item in config.accounts if item.name == account_name), None)
+    if account is None or not account.enabled or not account.remote_deletion_enabled:
+        raise ProductionPlanError(
+            "account is not explicitly enabled for production remote deletion"
+        )
+    now = datetime.now(UTC)
+    with connect(config.database.path) as db:
+        source = db.execute(
+            "SELECT * FROM remote_mutation_runs WHERE id=?", (source_plan_run_id,)
+        ).fetchone()
+        if source is None or source["mode"] != "dry-run" or source["status"] != "completed":
+            raise ProductionPlanError("source run is not a completed dry-run plan")
+        if source["account_filter"] != account_name or int(source["selected_count"]) < 1:
+            raise ProductionPlanError(
+                "source plan is not explicitly limited to the requested account"
+            )
+        requested_at = datetime.fromisoformat(str(source["requested_at"])).astimezone(UTC)
+        if now - requested_at > PLAN_TTL:
+            raise ProductionPlanError("source plan expired; create a new dry-run")
+        if int(source["selected_count"]) > min(
+            int(source["effective_max_per_run"]), config.remote_deletion.max_per_run
+        ):
+            raise ProductionPlanError("source plan exceeds current global safety limit")
+        rows = db.execute(
+            "SELECT * FROM remote_mutations WHERE mutation_run_id=? ORDER BY id",
+            (source_plan_run_id,),
+        ).fetchall()
+        if len(rows) != int(source["selected_count"]) or any(
+            row["status"] != "dry-run" or not bool(row["dry_run"]) for row in rows
+        ):
+            raise ProductionPlanError("source plan mutation state is invalid")
+        account_row = db.execute("SELECT id FROM accounts WHERE name=?", (account_name,)).fetchone()
+        if account_row is None:
+            raise ProductionPlanError("account is not active locally")
+        configured_account_id = int(account_row[0])
+        if any(int(row["account_id"]) != configured_account_id for row in rows):
+            raise ProductionPlanError("source plan contains another account")
+        # Fresh M10 before cloning; never reuse prior plan eligibility.
+        fresh = {
+            str(item["remote_message_id"]): item
+            for item in evaluate_all(config, account=account_name)
+        }
+        if any(
+            not bool(fresh.get(str(row["remote_message_id"]), {}).get("eligible")) for row in rows
+        ):
+            raise ProductionPlanError("source plan became stale or ineligible")
+        created = utc_now()
+        run = db.execute(
+            """INSERT INTO remote_mutation_runs(requested_at,mode,status,account_filter,
+            requested_limit,effective_max_per_run,effective_max_per_account,eligible_count,selected_count,
+            skipped_limit_count,policy_version,source_plan_run_id,authorization_method)
+            VALUES(?,'production-execute','planned',?,?,?,?,?,?,?,?,?, 'account-opt-in+explicit-plan-v1')""",
+            (
+                created,
+                account_name,
+                None,
+                source["effective_max_per_run"],
+                source["effective_max_per_account"],
+                len(rows),
+                len(rows),
+                0,
+                POLICY_VERSION,
+                source_plan_run_id,
+            ),
+        )
+        production_run_id = int(cast(int, run.lastrowid))
+        for row in rows:
+            evaluation = fresh[str(row["remote_message_id"])]
+            db.execute(
+                """INSERT INTO remote_mutations(mutation_run_id,deletion_evaluation_id,account_id,remote_message_id,
+                canonical_message_id,provider_kind,operation,remote_folder,uidvalidity,remote_uid,provider_message_id,
+                canonical_sha256,target_fingerprint_sha256,dry_run,requested_at,status,source_plan_mutation_id)
+                VALUES(?,?,?,?,?,?, 'delete',?,?,?,?,?,?,0,?,'planned',?)""",
+                (
+                    production_run_id,
+                    int(cast(int, evaluation["deletion_evaluation_id"])),
+                    row["account_id"],
+                    row["remote_message_id"],
+                    row["canonical_message_id"],
+                    row["provider_kind"],
+                    row["remote_folder"],
+                    row["uidvalidity"],
+                    row["remote_uid"],
+                    row["provider_message_id"],
+                    row["canonical_sha256"],
+                    row["target_fingerprint_sha256"],
+                    created,
+                    row["id"],
+                ),
+            )
+        insert_audit_event(
+            db,
+            actor="mailarchive.remote_mutation",
+            event_type="remote_delete.production.started",
+            result="started",
+            details_json=json.dumps(
+                {"source_plan_run_id": source_plan_run_id, "selected": len(rows)}, sort_keys=True
+            ),
+        )
+        db.commit()
+    adapter = adapter_factory(config, account_name)
+    _execute_serial(config, production_run_id, adapter)
+    return production_run_id
+
+
+def _execute_serial(config: AppConfig, run_id: int, adapter: RemoteMutationAdapter) -> None:
+    while True:
+        with connect(config.database.path) as db:
+            row = db.execute(
+                "SELECT * FROM remote_mutations WHERE mutation_run_id=? AND status='planned' ORDER BY id LIMIT 1",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                db.execute(
+                    "UPDATE remote_mutation_runs SET status='completed',completed_at=? WHERE id=?",
+                    (utc_now(), run_id),
+                )
+                db.commit()
+                return
+            target = _planned_target(db, int(row["id"]))
+        if not _still_current(config, target, str(row["target_fingerprint_sha256"])):
+            _halt_stale(config, run_id, int(row["id"]))
+            return
+        with connect(config.database.path) as db:
+            db.execute(
+                "UPDATE remote_mutations SET status='started',started_at=? WHERE id=?",
+                (utc_now(), row["id"]),
+            )
+            db.commit()
+        try:
+            status = _record_outcome(config, run_id, int(row["id"]), target, adapter.delete(target))
+        except Exception:
             status = _record_outcome(
                 config,
                 run_id,

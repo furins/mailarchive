@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -10,16 +11,18 @@ import pytest
 
 from mailarchive.classification import ClassificationResult, apply_classification
 from mailarchive.config import load_config
-from mailarchive.db import account_id, connect, initialize
+from mailarchive.db import account_id, connect, initialize, utc_now
 from mailarchive.ingest import ingest_bytes
 from mailarchive.models import AppConfig
 from mailarchive.remote_mutation import (
     DeletionTarget,
     ImapDeletionTarget,
     MutationResult,
+    ProductionPlanError,
     ProviderDeletionTarget,
     _normalize_result,  # pyright: ignore[reportPrivateUsage]
     execute_fake,
+    execute_production_plan,
     plan_dry_run,
 )
 
@@ -101,6 +104,34 @@ class RunStateAdapter:
                 ).fetchone()[0]
             )
         return MutationResult("success-confirmed", confirmed_absent=True)
+
+
+class ProductionAdapter:
+    def __init__(self, database_path: Path, result: MutationResult) -> None:
+        self.database_path = database_path
+        self.result = result
+        self.calls: list[DeletionTarget] = []
+        self.started = False
+
+    def delete(self, target: DeletionTarget) -> MutationResult:
+        self.calls.append(target)
+        with connect(self.database_path) as db:
+            self.started = (
+                db.execute(
+                    "SELECT status FROM remote_mutations WHERE remote_message_id=? AND dry_run=0",
+                    (target.remote_message_id,),
+                ).fetchone()[0]
+                == "started"
+            )
+        return self.result
+
+
+class ProductionFactory:
+    def __init__(self, adapter: ProductionAdapter) -> None:
+        self.adapter = adapter
+
+    def __call__(self, config: AppConfig, account_name: str) -> ProductionAdapter:
+        return self.adapter
 
 
 class RawExceptionAdapter:
@@ -192,6 +223,101 @@ def eligible_remote(
             )
         db.commit()
     return config, canonical.id
+
+
+def production_enabled(config: AppConfig) -> AppConfig:
+    return replace(
+        config,
+        accounts=tuple(
+            replace(account, remote_deletion_enabled=True) for account in config.accounts
+        ),
+    )
+
+
+def test_production_executes_only_filtered_source_plan_and_preserves_history(
+    config_file: Path,
+) -> None:
+    config, _ = eligible_remote(config_file)
+    config = production_enabled(config)
+    source_id = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
+    adapter = ProductionAdapter(
+        config.database.path, MutationResult("success-confirmed", confirmed_absent=True)
+    )
+    production_id = execute_production_plan(
+        config, source_id, "test", adapter_factory=ProductionFactory(adapter)
+    )
+    assert adapter.started is True and len(adapter.calls) == 1
+    with connect(config.database.path) as db:
+        source = db.execute(
+            "SELECT mode,status FROM remote_mutation_runs WHERE id=?", (source_id,)
+        ).fetchone()
+        produced = db.execute(
+            "SELECT * FROM remote_mutation_runs WHERE id=?", (production_id,)
+        ).fetchone()
+        mutation = db.execute(
+            "SELECT * FROM remote_mutations WHERE mutation_run_id=?", (production_id,)
+        ).fetchone()
+        assert tuple(source) == ("dry-run", "completed")
+        assert (
+            produced["mode"] == "production-execute" and produced["source_plan_run_id"] == source_id
+        )
+        assert mutation["dry_run"] == 0 and mutation["source_plan_mutation_id"] is not None
+        assert db.execute("SELECT remote_present FROM remote_messages").fetchone()[0] == 0
+    with pytest.raises(ProductionPlanError, match="source plan"):
+        execute_production_plan(config, source_id, "test", adapter_factory=ProductionFactory(adapter))
+
+
+@pytest.mark.parametrize("change", ("legal_hold", "keep_online", "remote_present"))
+def test_production_stale_or_disabled_gate_never_calls_adapter(
+    config_file: Path, change: str
+) -> None:
+    config, canonical_id = eligible_remote(config_file)
+    config = production_enabled(config)
+    source_id = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
+    with connect(config.database.path) as db:
+        if change in {"legal_hold", "keep_online"}:
+            db.execute(
+                f"INSERT INTO retention_controls VALUES(?,{1 if change == 'keep_online' else 0},{1 if change == 'legal_hold' else 0},'test',?)",
+                (canonical_id, utc_now()),
+            )
+        else:
+            db.execute("UPDATE remote_messages SET remote_present=0")
+        db.commit()
+    adapter = ProductionAdapter(
+        config.database.path, MutationResult("success-confirmed", confirmed_absent=True)
+    )
+    with pytest.raises(ProductionPlanError):
+        execute_production_plan(config, source_id, "test", adapter_factory=ProductionFactory(adapter))
+    assert adapter.calls == []
+
+
+def test_production_failure_halts_and_does_not_call_later_target(config_file: Path) -> None:
+    config, _ = eligible_remote(config_file, remote_id="first", body=b"first")
+    eligible_remote(config_file, remote_id="second", body=b"second", remote_uid=10)
+    config = production_enabled(config)
+    source_id = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
+    adapter = ProductionAdapter(
+        config.database.path,
+        MutationResult("failure-confirmed-no-mutation", error_code="PROVIDER_REJECTED"),
+    )
+    production_id = execute_production_plan(
+        config, source_id, "test", adapter_factory=ProductionFactory(adapter)
+    )
+    assert [target.remote_message_id for target in adapter.calls] == ["first"]
+    with connect(config.database.path) as db:
+        assert (
+            db.execute(
+                "SELECT status FROM remote_mutation_runs WHERE id=?", (production_id,)
+            ).fetchone()[0]
+            == "halted"
+        )
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM remote_mutations WHERE mutation_run_id=? AND status='planned'",
+                (production_id,),
+            ).fetchone()[0]
+            == 1
+        )
 
 
 def test_dry_run_anchors_fresh_evaluation_and_exact_imap_target(config_file: Path) -> None:
@@ -600,7 +726,7 @@ def test_pop3_changed_uidl_is_stale_before_fake_call(config_file: Path) -> None:
         assert db.execute("SELECT error_code FROM remote_mutations").fetchone()[0] == "STALE_PLAN"
 
 
-def test_m11_production_sources_expose_no_provider_write_path() -> None:
+def test_acquisition_sources_remain_without_provider_write_path() -> None:
     root = Path(__file__).parents[1]
     mutation_source = (root / "src/mailarchive/remote_mutation.py").read_text(encoding="utf-8")
     cli_source = (root / "src/mailarchive/cli.py").read_text(encoding="utf-8")
@@ -616,5 +742,5 @@ def test_m11_production_sources_expose_no_provider_write_path() -> None:
         "gmail.modify",
     ):
         assert forbidden not in mutation_source
-    assert "--execute" not in cli_source
+    assert "--execute" not in cli_source.replace("--execute-plan", "")
     assert "gmail.readonly" in gmail_source

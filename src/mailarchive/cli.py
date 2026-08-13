@@ -26,7 +26,7 @@ from mailarchive.ingest import IngestError, ingest_file
 from mailarchive.notmuch import NotmuchAdapter, NotmuchError, search_canonical_messages
 from mailarchive.pop3 import Pop3Adapter, Pop3Error
 from mailarchive.recoll import RecollAdapter, RecollError, search_attachments
-from mailarchive.remote_mutation import plan_dry_run
+from mailarchive.remote_mutation import ProductionPlanError, execute_production_plan, plan_dry_run
 from mailarchive.retention import evaluate_all, set_control
 
 
@@ -205,8 +205,12 @@ def build_parser() -> argparse.ArgumentParser:
     remote_delete = subcommands.add_parser(
         "remote-delete", help="plan local-only remote deletion dry-run"
     )
-    remote_delete.add_argument(
-        "--dry-run", action="store_true", help="required; creates no provider connection"
+    mode = remote_delete.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
+        "--dry-run", action="store_true", help="local-only plan; no provider connection"
+    )
+    mode.add_argument(
+        "--execute-plan", type=int, metavar="RUN_ID", help="execute one existing account plan"
     )
     remote_delete.add_argument("--account")
     remote_delete.add_argument("--limit", type=int)
@@ -260,12 +264,21 @@ def main(argv: list[str] | None = None) -> int:
             _emit(results, args.json)
             return 0
         if args.command == "remote-delete":
-            if not args.dry_run:
-                _error(
-                    "--dry-run is required; production remote deletion is unavailable before M12"
-                )
+            if args.execute_plan is not None and (args.account is None or args.limit is not None):
+                _error("--execute-plan requires --account and cannot be combined with --limit")
             initialize(config.database.path, config.accounts, config.backup_repositories)
-            _emit(plan_dry_run(config, account=args.account, limit=args.limit), args.json)
+            if args.dry_run:
+                _emit(plan_dry_run(config, account=args.account, limit=args.limit), args.json)
+                return 0
+            assert args.execute_plan is not None and args.account is not None
+            _emit(
+                {
+                    "production_run_id": execute_production_plan(
+                        config, args.execute_plan, args.account
+                    )
+                },
+                args.json,
+            )
             return 0
         if args.command == "retention":
             initialize(config.database.path, config.accounts, config.backup_repositories)
@@ -678,6 +691,7 @@ def main(argv: list[str] | None = None) -> int:
         AttachmentError,
         RecollError,
         BorgError,
+        ProductionPlanError,
         OSError,
         sqlite3.DatabaseError,
     ) as error:
