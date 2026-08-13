@@ -12,6 +12,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable, Generator
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -20,17 +21,17 @@ import yaml
 
 from mailarchive.classification import ClassificationResult, apply_classification
 from mailarchive.config import load_config
-from mailarchive.db import connect
+from mailarchive.db import account_id, connect, initialize
 from mailarchive.fastpath import FastPathWatcher, fast_path_status
 from mailarchive.imap import ImapAdapter, encode_mailbox_name
-from mailarchive.imap_mutation import ImapMutationAdapter
+from mailarchive.imap_mutation import ImapClient, ImapMutationAdapter
 from mailarchive.notmuch import (
     NotmuchAdapter,
     NotmuchError,
     SearchResult,
     search_canonical_messages,
 )
-from mailarchive.remote_mutation import execute_production_plan, plan_dry_run
+from mailarchive.remote_mutation import ImapDeletionTarget, execute_production_plan, plan_dry_run
 
 
 def _free_port() -> int:
@@ -207,6 +208,147 @@ def _mark_deleted_fixture(port: int, uid: int) -> None:
         assert client.uid("STORE", str(uid), "+FLAGS.SILENT", r"(\Deleted)")[0] == "OK"
     finally:
         client.logout()
+
+
+class _RecordingImapClient:
+    """Narrow test proxy that forwards to Dovecot while recording adapter commands."""
+
+    def __init__(self, client: imaplib.IMAP4) -> None:
+        self.client = client
+        self.commands: list[tuple[str, tuple[object, ...]]] = []
+
+    def login(self, user: str, password: str) -> tuple[str, list[object]]:
+        self.commands.append(("LOGIN", ()))
+        return cast(tuple[str, list[object]], self.client.login(user, password))
+
+    def capability(self) -> tuple[str, list[object]]:
+        self.commands.append(("CAPABILITY", ()))
+        return cast(tuple[str, list[object]], self.client.capability())
+
+    def select(self, mailbox: str, readonly: bool = False) -> tuple[str, list[object]]:
+        self.commands.append(("SELECT", (readonly,)))
+        return cast(tuple[str, list[object]], self.client.select(mailbox, readonly=readonly))
+
+    def response(self, code: str) -> tuple[str, list[object]]:
+        self.commands.append(("RESPONSE", (code,)))
+        return cast(tuple[str, list[object]], self.client.response(code))
+
+    def uid(self, command: str, *args: str) -> tuple[str, list[object]]:
+        self.commands.append((f"UID {command.upper()}", args))
+        return cast(tuple[str, list[object]], self.client.uid(command, *args))
+
+    def unselect(self) -> tuple[str, list[object]]:
+        self.commands.append(("UNSELECT", ()))
+        return cast(tuple[str, list[object]], self.client.unselect())
+
+    def logout(self) -> tuple[str, list[object]]:
+        self.commands.append(("LOGOUT", ()))
+        return cast(tuple[str, list[object]], self.client.logout())
+
+
+def _imap_observer(
+    config_file: Path, port: int, monkeypatch: pytest.MonkeyPatch
+) -> tuple[ImapMutationAdapter, list[_RecordingImapClient], int]:
+    values = yaml.safe_load(config_file.read_text())
+    values["accounts"]["test"]["imap"] = {
+        "host": "127.0.0.1",
+        "port": port,
+        "username": "fixture",
+        "tls_mode": "INSECURE_LOOPBACK",
+        "folders": ["INBOX"],
+    }
+    config_file.write_text(yaml.safe_dump(values))
+    monkeypatch.setenv("MAILARCHIVE_TEST_SECRET", "fixture-password")
+    config = load_config(config_file)
+    initialize(config.database.path, config.accounts)
+    with connect(config.database.path) as db:
+        local_account_id = account_id(db, "test")
+    assert local_account_id is not None
+    recordings: list[_RecordingImapClient] = []
+
+    def client_factory(_account: object) -> ImapClient:
+        client = _RecordingImapClient(imaplib.IMAP4("127.0.0.1", port))
+        recordings.append(client)
+        return cast(ImapClient, client)
+
+    return (
+        ImapMutationAdapter(config, "test", client_factory=client_factory),
+        recordings,
+        local_account_id,
+    )
+
+
+def _observe_target(
+    account_id_value: int, uidvalidity: int, uid: int, raw: bytes
+) -> ImapDeletionTarget:
+    return ImapDeletionTarget(
+        remote_message_id="historical-remote",
+        canonical_message_id="historical-canonical",
+        account_id=account_id_value,
+        account_name="test",
+        provider_kind="imap",
+        canonical_sha256=hashlib.sha256(raw).hexdigest(),
+        remote_folder="INBOX",
+        uidvalidity=uidvalidity,
+        remote_uid=uid,
+    )
+
+
+def _assert_observe_trace_is_read_only(recordings: list[_RecordingImapClient]) -> None:
+    commands = [command for recording in recordings for command, _args in recording.commands]
+    assert not {"UID STORE", "UID EXPUNGE", "STORE", "EXPUNGE", "CLOSE"} & set(commands)
+    assert any(
+        command == "SELECT" and arguments == (True,)
+        for recording in recordings
+        for command, arguments in recording.commands
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("present", "confirmed-present-match"),
+        ("absent", "confirmed-absent"),
+        ("deleted", "identity-conflict"),
+        ("uidvalidity", "identity-conflict"),
+        ("sha", "identity-conflict"),
+    ],
+)
+def test_dovecot_imap_observe_is_read_only_and_exact(
+    config_file: Path,
+    dovecot_loopback: tuple[int, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    expected: str,
+) -> None:
+    """E1b2: real Dovecot observation never changes any mailbox identity or bytes."""
+    port, mail, _ = dovecot_loopback
+    target_raw = _raw("<observe-target@test>", "observe target")
+    unrelated_raw = _raw("<observe-unrelated@test>", "observe unrelated")
+    (mail / "new" / "target").write_bytes(target_raw)
+    (mail / "new" / "unrelated").write_bytes(unrelated_raw)
+    uidvalidity, snapshot = _snapshot(port)
+    target_uid = next(uid for uid, (_flags, raw) in snapshot.items() if raw == target_raw)
+    unrelated_uid = next(uid for uid, (_flags, raw) in snapshot.items() if raw == unrelated_raw)
+    if case == "deleted":
+        _mark_deleted_fixture(port, target_uid)
+        uidvalidity, snapshot = _snapshot(port)
+
+    adapter, recordings, local_account_id = _imap_observer(config_file, port, monkeypatch)
+    target = _observe_target(local_account_id, uidvalidity, target_uid, target_raw)
+    if case == "absent":
+        target = replace(target, remote_uid=max(snapshot) + 100)
+    elif case == "uidvalidity":
+        target = replace(target, uidvalidity=uidvalidity + 1)
+    elif case == "sha":
+        target = replace(target, canonical_sha256="0" * 64)
+
+    assert adapter.observe(target).state == expected
+    _assert_observe_trace_is_read_only(recordings)
+    assert _snapshot(port) == (uidvalidity, snapshot)
+    assert _snapshot(port)[1][unrelated_uid] == snapshot[unrelated_uid]
+    if case == "deleted":
+        assert _snapshot(port)[1][target_uid] == snapshot[target_uid]
 
 
 def test_direct_loopback_acquisition_preserves_server_bytes(
