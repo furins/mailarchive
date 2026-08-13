@@ -13,6 +13,7 @@ from mailarchive.ingest import ingest_bytes
 from mailarchive.models import AppConfig
 from mailarchive.remote_mutation import (
     DeletionTarget,
+    ImapDeletionTarget,
     MutationResult,
     ProviderDeletionTarget,
     execute_fake,
@@ -45,6 +46,20 @@ class IdentityFakeAdapter:
         return self.outcome
 
 
+class ImapFakeAdapter:
+    """Disposable IMAP namespace keyed precisely by folder, UIDVALIDITY and UID."""
+
+    def __init__(self, objects: set[tuple[str, int, int]]) -> None:
+        self.objects = objects
+        self.calls: list[ImapDeletionTarget] = []
+
+    def delete(self, target: DeletionTarget) -> MutationResult:
+        assert isinstance(target, ImapDeletionTarget)
+        self.calls.append(target)
+        self.objects.discard((target.remote_folder, target.uidvalidity, target.remote_uid))
+        return MutationResult("success-confirmed", confirmed_absent=True)
+
+
 class UnknownAfterCallAdapter:
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
@@ -63,6 +78,31 @@ class UnknownAfterCallAdapter:
             )
         # Model a failure after an irreversible provider operation may have happened.
         raise ConnectionError("untrusted provider response")
+
+
+class RunStateAdapter:
+    def __init__(self, database_path: Path) -> None:
+        self.database_path = database_path
+        self.run_state: tuple[object, ...] | None = None
+        self.mutation_status: str | None = None
+
+    def delete(self, target: DeletionTarget) -> MutationResult:
+        with connect(self.database_path) as db:
+            self.run_state = tuple(
+                db.execute("SELECT mode,status,completed_at FROM remote_mutation_runs").fetchone()
+            )
+            self.mutation_status = str(
+                db.execute(
+                    "SELECT status FROM remote_mutations WHERE remote_message_id=?",
+                    (target.remote_message_id,),
+                ).fetchone()[0]
+            )
+        return MutationResult("success-confirmed", confirmed_absent=True)
+
+
+class RawExceptionAdapter:
+    def delete(self, target: DeletionTarget) -> MutationResult:
+        raise RuntimeError("token=super-secret RFC822 payload From: private@example.test")
 
 
 def eligible_remote(
@@ -186,6 +226,84 @@ def test_fake_success_persists_result_and_only_changes_remote_observation(
         )
 
 
+def test_imap_fake_deletes_only_exact_namespace_identity_and_preserves_local_state(
+    config_file: Path,
+) -> None:
+    config, canonical_id = eligible_remote(config_file)
+    with connect(config.database.path) as db:
+        before = db.execute(
+            "SELECT local_path FROM canonical_messages WHERE id=?", (canonical_id,)
+        ).fetchone()
+        attachment_count = db.execute("SELECT COUNT(*) FROM message_attachments").fetchone()[0]
+        evidence_count = db.execute("SELECT COUNT(*) FROM message_backup_evidence").fetchone()[0]
+    assert before is not None
+    bytes_before = Path(str(before["local_path"])).read_bytes()
+    run_id = int(cast(int, plan_dry_run(config)["run_id"]))
+    fake = ImapFakeAdapter({("INBOX", 7, 9), ("INBOX", 7, 10)})
+    execute_fake(config, run_id, fake)
+    assert fake.objects == {("INBOX", 7, 10)}
+    assert fake.calls[0].remote_folder == "INBOX"
+    assert fake.calls[0].uidvalidity == 7
+    assert fake.calls[0].remote_uid == 9
+    with connect(config.database.path) as db:
+        assert (
+            db.execute("SELECT remote_present FROM remote_messages WHERE id='remote'").fetchone()[0]
+            == 0
+        )
+        assert (
+            db.execute("SELECT COUNT(*) FROM message_attachments").fetchone()[0] == attachment_count
+        )
+        assert (
+            db.execute("SELECT COUNT(*) FROM message_backup_evidence").fetchone()[0]
+            == evidence_count
+        )
+    assert Path(str(before["local_path"])).read_bytes() == bytes_before
+
+
+def test_imap_changed_uidvalidity_is_stale_before_fake_call(config_file: Path) -> None:
+    config, _ = eligible_remote(config_file)
+    run_id = int(cast(int, plan_dry_run(config)["run_id"]))
+    with connect(config.database.path) as db:
+        db.execute("UPDATE remote_messages SET uidvalidity=8 WHERE id='remote'")
+        db.commit()
+    fake = ImapFakeAdapter({("INBOX", 7, 9), ("INBOX", 7, 10)})
+    execute_fake(config, run_id, fake)
+    assert fake.calls == []
+    assert fake.objects == {("INBOX", 7, 9), ("INBOX", 7, 10)}
+    with connect(config.database.path) as db:
+        assert tuple(db.execute("SELECT status,error_code FROM remote_mutations").fetchone()) == (
+            "failed",
+            "STALE_PLAN",
+        )
+        assert (
+            db.execute("SELECT status FROM remote_mutation_runs WHERE id=?", (run_id,)).fetchone()[
+                0
+            ]
+            == "halted"
+        )
+
+
+def test_imap_changed_uid_is_stale_before_fake_call(config_file: Path) -> None:
+    config, _ = eligible_remote(config_file)
+    run_id = int(cast(int, plan_dry_run(config)["run_id"]))
+    with connect(config.database.path) as db:
+        db.execute("UPDATE remote_messages SET remote_uid=10 WHERE id='remote'")
+        db.commit()
+    fake = ImapFakeAdapter({("INBOX", 7, 9), ("INBOX", 7, 10)})
+    execute_fake(config, run_id, fake)
+    assert fake.calls == []
+    assert fake.objects == {("INBOX", 7, 9), ("INBOX", 7, 10)}
+
+
+def test_fake_run_clears_dry_run_completion_before_started_adapter_call(config_file: Path) -> None:
+    config, _ = eligible_remote(config_file)
+    run_id = int(cast(int, plan_dry_run(config)["run_id"]))
+    adapter = RunStateAdapter(config.database.path)
+    execute_fake(config, run_id, adapter)
+    assert adapter.run_state == ("fake-execute", "planned", None)
+    assert adapter.mutation_status == "started"
+
+
 def test_fake_unknown_halts_and_does_not_claim_absence(config_file: Path) -> None:
     config, _ = eligible_remote(config_file)
     run_id = int(cast(int, plan_dry_run(config)["run_id"]))
@@ -201,6 +319,67 @@ def test_fake_unknown_halts_and_does_not_claim_absence(config_file: Path) -> Non
             ]
             == "halted"
         )
+
+
+def test_raw_adapter_summary_is_not_persisted(config_file: Path) -> None:
+    config, _ = eligible_remote(config_file)
+    run_id = int(cast(int, plan_dry_run(config)["run_id"]))
+    raw = "raw provider response token=abc MIME payload" * 20
+    execute_fake(
+        config,
+        run_id,
+        FakeAdapter(
+            MutationResult(
+                "failure-confirmed-no-mutation", summary=raw, error_code="PROVIDER_REJECTED"
+            )
+        ),
+    )
+    with connect(config.database.path) as db:
+        row = db.execute(
+            "SELECT provider_response_summary,error_code FROM remote_mutations"
+        ).fetchone()
+        assert tuple(row) == ("confirmed-no-mutation", "PROVIDER_REJECTED")
+        assert raw not in str(row["provider_response_summary"])
+
+
+def test_invalid_adapter_result_is_unknown_and_raw_exception_is_not_persisted(
+    config_file: Path,
+) -> None:
+    config, _ = eligible_remote(config_file)
+    run_id = int(cast(int, plan_dry_run(config)["run_id"]))
+    execute_fake(
+        config, run_id, FakeAdapter(MutationResult("bad-outcome", summary="raw", error_code="BAD"))
+    )
+    with connect(config.database.path) as db:
+        row = db.execute(
+            "SELECT status,provider_response_summary,error_code FROM remote_mutations"
+        ).fetchone()
+        assert tuple(row) == ("unknown", "outcome-uncertain", "INVALID_ADAPTER_RESULT")
+        assert (
+            db.execute("SELECT status FROM remote_mutation_runs WHERE id=?", (run_id,)).fetchone()[
+                0
+            ]
+            == "halted"
+        )
+    config, _ = eligible_remote(
+        config_file, remote_id="exception-remote", body=b"exception", remote_uid=10
+    )
+    run_id = int(cast(int, plan_dry_run(config)["run_id"]))
+    execute_fake(config, run_id, RawExceptionAdapter())
+    with connect(config.database.path) as db:
+        persisted = (
+            "\n".join(
+                str(value)
+                for row in db.execute(
+                    "SELECT provider_response_summary,error_code FROM remote_mutations"
+                ).fetchall()
+                for value in row
+            )
+            + "\n"
+            + "\n".join(str(row[0]) for row in db.execute("SELECT details_json FROM audit_events"))
+        )
+        assert "super-secret" not in persisted
+        assert "private@example.test" not in persisted
 
 
 def test_exception_after_fake_call_is_unknown_started_first_and_stops_later_rows(

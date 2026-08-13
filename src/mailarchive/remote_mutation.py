@@ -77,6 +77,33 @@ class MutationResult:
     error_code: str | None = None
 
 
+_OUTCOME_STATUS = {
+    "success-confirmed": ("succeeded", "confirmed-absent"),
+    "failure-confirmed-no-mutation": ("failed", "confirmed-no-mutation"),
+    "outcome-unknown": ("unknown", "outcome-uncertain"),
+}
+_ERROR_CODES = {
+    "NONE",
+    "TARGET_NOT_FOUND",
+    "IDENTITY_MISMATCH",
+    "PROVIDER_REJECTED",
+    "TRANSPORT_UNKNOWN",
+    "ADAPTER_EXCEPTION",
+    "STALE_PLAN",
+    "INVALID_ADAPTER_RESULT",
+}
+
+
+def _normalize_result(result: MutationResult) -> tuple[str, str, str]:
+    """Return only closed result categories; never retain adapter-supplied text."""
+    outcome = _OUTCOME_STATUS.get(result.outcome)
+    code = result.error_code or "NONE"
+    if outcome is None or code not in _ERROR_CODES - {"STALE_PLAN", "INVALID_ADAPTER_RESULT"}:
+        return "unknown", "outcome-uncertain", "INVALID_ADAPTER_RESULT"
+    status, summary = outcome
+    return status, summary, code
+
+
 class RemoteMutationAdapter(Protocol):
     def delete(self, target: DeletionTarget) -> MutationResult: ...
 
@@ -184,8 +211,8 @@ def plan_dry_run(
                 mutation_run_id,deletion_evaluation_id,account_id,remote_message_id,
                 canonical_message_id,provider_kind,operation,remote_folder,uidvalidity,
                 remote_uid,provider_message_id,canonical_sha256,target_fingerprint_sha256,
-                dry_run,requested_at,status,provider_response_summary)
-                VALUES(?,?,?,?,?,?, 'delete',?,?,?,?,?,?,1,?,'dry-run','local-plan')""",
+                dry_run,requested_at,status)
+                VALUES(?,?,?,?,?,?, 'delete',?,?,?,?,?,?,1,?,'dry-run')""",
                 (
                     run_id,
                     int(cast(int, evaluation["deletion_evaluation_id"])),
@@ -269,7 +296,9 @@ def execute_fake(config: AppConfig, run_id: int, adapter: RemoteMutationAdapter)
     """Test-only execution; pre-call started state is committed before each fake call."""
     with connect(config.database.path) as db:
         db.execute(
-            "UPDATE remote_mutation_runs SET mode='fake-execute',status='planned' WHERE id=?",
+            """UPDATE remote_mutation_runs SET mode='fake-execute',status='planned',
+            completed_at=NULL
+            WHERE id=?""",
             (run_id,),
         )
         db.commit()
@@ -309,8 +338,8 @@ def execute_fake(config: AppConfig, run_id: int, adapter: RemoteMutationAdapter)
         except Exception:
             # Provider exception text can contain remote data; retain only a bounded category.
             result = MutationResult("outcome-unknown", error_code="ADAPTER_EXCEPTION")
-        _record_outcome(config, run_id, int(row["id"]), target, result)
-        if result.outcome != "success-confirmed":
+        status = _record_outcome(config, run_id, int(row["id"]), target, result)
+        if status != "succeeded":
             return
 
 
@@ -338,19 +367,14 @@ def _halt_stale(config: AppConfig, run_id: int, mutation_id: int) -> None:
 
 def _record_outcome(
     config: AppConfig, run_id: int, mutation_id: int, target: DeletionTarget, result: MutationResult
-) -> None:
-    statuses = {
-        "success-confirmed": "succeeded",
-        "failure-confirmed-no-mutation": "failed",
-        "outcome-unknown": "unknown",
-    }
-    status = statuses.get(result.outcome, "unknown")
+) -> str:
+    status, summary, error_code = _normalize_result(result)
     with connect(config.database.path) as db:
         now = utc_now()
         db.execute(
             """UPDATE remote_mutations SET status=?,completed_at=?,provider_response_summary=?,
             error_code=? WHERE id=?""",
-            (status, now, result.summary[:64] or None, result.error_code, mutation_id),
+            (status, now, summary, error_code, mutation_id),
         )
         if status == "succeeded" and result.confirmed_absent:
             db.execute(
@@ -370,3 +394,4 @@ def _record_outcome(
                 (now, run_id),
             )
         db.commit()
+    return status

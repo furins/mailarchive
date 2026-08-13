@@ -489,7 +489,9 @@ def _migration_11(connection: sqlite3.Connection) -> None:
         required_verified_backups INTEGER NOT NULL CHECK(required_verified_backups>=1),
         verified_repository_count INTEGER NOT NULL CHECK(verified_repository_count>=0), retention_deadline TEXT,
         CHECK(remote_retention_days IS NULL OR remote_retention_days>0))""")
-    connection.execute("CREATE INDEX deletion_evaluations_run_remote ON deletion_evaluations(evaluation_run_id, remote_message_id)")
+    connection.execute(
+        "CREATE INDEX deletion_evaluations_run_remote ON deletion_evaluations(evaluation_run_id, remote_message_id)"
+    )
 
 
 def _migration_12(connection: sqlite3.Connection) -> None:
@@ -514,12 +516,15 @@ def _migration_12(connection: sqlite3.Connection) -> None:
         target_fingerprint_sha256 TEXT NOT NULL CHECK(length(target_fingerprint_sha256)=64), dry_run INTEGER NOT NULL CHECK(dry_run IN (0,1)),
         requested_at TEXT NOT NULL, started_at TEXT, completed_at TEXT,
         status TEXT NOT NULL CHECK(status IN ('planned','dry-run','started','succeeded','failed','unknown')),
-        provider_response_summary TEXT, error_code TEXT,
+        provider_response_summary TEXT CHECK(provider_response_summary IN ('confirmed-absent','confirmed-no-mutation','outcome-uncertain')),
+        error_code TEXT CHECK(error_code IN ('NONE','TARGET_NOT_FOUND','IDENTITY_MISMATCH','PROVIDER_REJECTED','TRANSPORT_UNKNOWN','ADAPTER_EXCEPTION','STALE_PLAN','INVALID_ADAPTER_RESULT')),
         UNIQUE(mutation_run_id,remote_message_id),
         CHECK((provider_kind='imap' AND remote_folder IS NOT NULL AND uidvalidity IS NOT NULL AND remote_uid IS NOT NULL AND provider_message_id IS NULL)
            OR (provider_kind IN ('gmail','pop3') AND provider_message_id IS NOT NULL AND remote_folder IS NULL AND uidvalidity IS NULL AND remote_uid IS NULL))
     )""")
-    connection.execute("CREATE INDEX remote_mutations_run_status ON remote_mutations(mutation_run_id,status)")
+    connection.execute(
+        "CREATE INDEX remote_mutations_run_status ON remote_mutations(mutation_run_id,status)"
+    )
 
 
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
