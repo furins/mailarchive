@@ -11,6 +11,7 @@ import yaml
 from mailarchive.config import load_config
 from mailarchive.db import account_id, connect, initialize
 from mailarchive.imap_mutation import ImapClient, ImapMutationAdapter
+from mailarchive.models import AccountConfig
 from mailarchive.remote_mutation import ImapDeletionTarget
 
 
@@ -35,6 +36,7 @@ class ScriptedImap:
         return "OK", [b"logged"]
 
     def capability(self) -> tuple[str, list[bytes]]:
+        self.commands.append(("CAPABILITY", ()))
         return "OK", [b"IMAP4rev1 UIDPLUS" if self.uidplus else b"IMAP4rev1"]
 
     def select(self, _mailbox: str, readonly: bool = False) -> tuple[str, list[bytes]]:
@@ -108,6 +110,10 @@ def _adapter(
 
 def _mutations(client: ScriptedImap) -> list[tuple[str, tuple[str, ...]]]:
     return [command for command in client.commands if command[0] in {"STORE", "EXPUNGE"}]
+
+
+def _observe_commands_are_read_only(client: ScriptedImap) -> None:
+    assert not {command for command, _args in client.commands} & {"STORE", "EXPUNGE", "CLOSE"}
 
 
 def _without_uidplus(client: ScriptedImap) -> None:
@@ -267,6 +273,99 @@ def test_uid_expunge_unobservable_is_unknown_without_retry(
     adapter, target = _adapter(config_file, monkeypatch, client)
     assert adapter.delete(target).error_code == "TRANSPORT_UNKNOWN"
     assert len([item for item in _mutations(client) if item[0] == "EXPUNGE"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("client", "expected"),
+    [
+        (ScriptedImap(None, uidplus=False), "confirmed-absent"),
+        (ScriptedImap(b"target", uidplus=False), "confirmed-present-match"),
+        (ScriptedImap(b"target", uidvalidity=8), "identity-conflict"),
+        (ScriptedImap(b"target", deleted=True), "identity-conflict"),
+    ],
+)
+def test_observe_exact_uid_namespace_and_hash(
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client: ScriptedImap,
+    expected: str,
+) -> None:
+    adapter, target = _adapter(config_file, monkeypatch, client)
+    result = adapter.observe(target)
+    assert result.state == expected
+    _observe_commands_are_read_only(client)
+    assert not [command for command in client.commands if command[0] == "CAPABILITY"]
+    assert ("SELECT", ("True",)) in client.commands
+
+
+def test_observe_hash_mismatch_is_identity_conflict(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = ScriptedImap(b"target")
+    adapter, target = _adapter(config_file, monkeypatch, client)
+    client.raw = b"other"
+    assert adapter.observe(target).state == "identity-conflict"
+    _observe_commands_are_read_only(client)
+
+
+def test_observe_malformed_or_unobservable_fetch_is_unknown(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = ScriptedImap(b"target")
+    original = client.uid
+
+    def malformed(command: str, *args: str) -> tuple[str, list[object]]:
+        if command == "FETCH":
+            client.commands.append((command, args))
+            return "OK", [b"not a FETCH literal"]
+        return original(command, *args)
+
+    client.uid = malformed  # type: ignore[method-assign]
+    adapter, target = _adapter(config_file, monkeypatch, client)
+    assert adapter.observe(target).state == "unknown"
+    _observe_commands_are_read_only(client)
+
+    unavailable = ScriptedImap(b"target")
+    unavailable.fetch_raises = True
+    adapter, target = _adapter(config_file, monkeypatch, unavailable)
+    assert adapter.observe(target).state == "unknown"
+    _observe_commands_are_read_only(unavailable)
+
+
+def test_observe_missing_secret_or_invalid_target_never_constructs_client(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = ScriptedImap(b"target")
+    adapter, target = _adapter(config_file, monkeypatch, client)
+    calls = 0
+
+    def unexpected_client(_account: AccountConfig) -> ImapClient:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("network client must not be constructed")
+
+    adapter = ImapMutationAdapter(
+        config=adapter.config,
+        account_name="test",
+        client_factory=unexpected_client,
+    )
+    monkeypatch.delenv("MAILARCHIVE_TEST_SECRET")
+    assert adapter.observe(target).state == "unknown"
+    assert calls == 0
+
+    invalid = ImapDeletionTarget(
+        target.remote_message_id,
+        target.canonical_message_id,
+        target.account_id,
+        target.account_name,
+        target.provider_kind,
+        target.canonical_sha256,
+        target.remote_folder,
+        target.uidvalidity,
+        0,
+    )
+    assert adapter.observe(invalid).state == "identity-conflict"
+    assert calls == 0
 
 
 def test_acquisition_and_mutation_command_boundaries() -> None:

@@ -25,7 +25,12 @@ from mailarchive.imap import (
     parse_uidvalidity,
 )
 from mailarchive.models import AccountConfig, AppConfig
-from mailarchive.remote_mutation import DeletionTarget, ImapDeletionTarget, MutationResult
+from mailarchive.remote_mutation import (
+    DeletionTarget,
+    ImapDeletionTarget,
+    MutationResult,
+    ObservationResult,
+)
 
 _FLAGS = re.compile(rb"(?:^|\s)FLAGS \(([^()]*)\)")
 
@@ -136,6 +141,10 @@ class ImapMutationAdapter:
     def _unknown(self) -> MutationResult:
         return MutationResult("outcome-unknown", error_code="TRANSPORT_UNKNOWN")
 
+    @staticmethod
+    def _observation(state: str) -> ObservationResult:
+        return ObservationResult(state)
+
     def _valid(self, target: DeletionTarget) -> ImapDeletionTarget | None:
         if not isinstance(target, ImapDeletionTarget) or target.provider_kind != "imap":
             return None
@@ -153,6 +162,54 @@ class ImapMutationAdapter:
 
     def _same_namespace(self, client: ImapClient, target: ImapDeletionTarget) -> bool:
         return parse_uidvalidity(cast(imaplib.IMAP4, client)) == target.uidvalidity
+
+    def _observe_selected(
+        self, client: ImapClient, target: ImapDeletionTarget
+    ) -> ObservationResult:
+        """Observe one exact UID in an already read-only selected mailbox."""
+        if not self._same_namespace(client, target):
+            return self._observation("identity-conflict")
+        observed = _fetch_observation(client, target.remote_uid)
+        if not observed.present:
+            return self._observation("confirmed-absent")
+        if observed.deleted or observed.raw is None:
+            return self._observation("identity-conflict")
+        if hashlib.sha256(observed.raw).hexdigest() != target.canonical_sha256:
+            return self._observation("identity-conflict")
+        return self._observation("confirmed-present-match")
+
+    def observe(self, target: DeletionTarget) -> ObservationResult:
+        """Read-only proof about one exact IMAP UID namespace and byte object."""
+        exact = self._valid(target)
+        if exact is None:
+            return self._observation("identity-conflict")
+        password = os.environ.get(self.credential_variable)
+        if not password:
+            return self._observation("unknown")
+        client: ImapClient | None = None
+        try:
+            with folder_lock(self.config, self.account, exact.remote_folder):
+                client = self.client_factory(self.account)
+                assert self.account.imap is not None
+                if client.login(self.account.imap.username, password)[0] != "OK":
+                    return self._observation("unknown")
+                if (
+                    client.select(encode_mailbox_name(exact.remote_folder), readonly=True)[0]
+                    != "OK"
+                ):
+                    return self._observation("unknown")
+                return self._observe_selected(client, exact)
+        except OSError, imaplib.IMAP4.error, ImapError:
+            return self._observation("unknown")
+        finally:
+            if client is not None:
+                try:
+                    unselect = getattr(client, "unselect", None)
+                    if callable(unselect):
+                        unselect()
+                    client.logout()
+                except OSError, imaplib.IMAP4.error:
+                    pass
 
     def _clean_or_unknown(self, client: ImapClient, target: ImapDeletionTarget) -> MutationResult:
         try:
