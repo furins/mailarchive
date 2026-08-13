@@ -358,18 +358,20 @@ def _update_current_presence_if_historical_identity_matches(
                 target.remote_uid,
             ),
         )
-    else:
-        db.execute(
-            """UPDATE remote_messages SET remote_present=? WHERE id=? AND account_id=?
-            AND provider_kind=? AND provider_message_id=?""",
-            (
-                present,
-                target.remote_message_id,
-                target.account_id,
-                target.provider_kind,
-                target.provider_message_id,
-            ),
-        )
+        return
+    if not isinstance(target, ProviderDeletionTarget):
+        raise ValueError("unsupported historical target type")
+    db.execute(
+        """UPDATE remote_messages SET remote_present=? WHERE id=? AND account_id=?
+        AND provider_kind=? AND provider_message_id=?""",
+        (
+            present,
+            target.remote_message_id,
+            target.account_id,
+            target.provider_kind,
+            target.provider_message_id,
+        ),
+    )
 
 
 class ReconciliationError(RuntimeError):
