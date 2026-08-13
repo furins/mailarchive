@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Protocol, cast
 
 import requests
+from google.auth.exceptions import RefreshError
+from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
@@ -224,11 +226,25 @@ class GmailMutationAdapter:
         except Exception:
             return "unobservable", False
 
+    def _refresh_if_needed(self) -> bool:
+        if not self.credentials.expired:
+            return True
+        try:
+            self.credentials.refresh(GoogleRequest())
+            _write_token(
+                _delete_path(self.account), _serialized_delete_credentials(self.credentials)
+            )
+            return True
+        except RefreshError, OSError, GmailAuthError:
+            return False
+
     def delete(self, target: DeletionTarget) -> MutationResult:
         exact = self._target(target)
         if exact is None or not self.account.enabled or self.account.gmail is None:
             return self._failure("IDENTITY_MISMATCH")
         with gmail_lock(self.config, self.account, "sync"):
+            if not self._refresh_if_needed():
+                return self._failure("AUTHORIZATION_FAILED")
             transport = self.transport_factory(self.credentials)
             try:
                 profile = _valid_id(transport.profile().get("emailAddress"), "profile email")

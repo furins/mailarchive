@@ -177,15 +177,23 @@ def _gmail_config(account: Mapping[object, object], label: str, archive_root: Pa
     delete_token = values.get("remote_delete_token_file")
     if delete_token is not None and not isinstance(delete_token, str):
         raise ConfigError(f"{label}.gmail.remote_delete_token_file must be a path string")
-    return GmailConfig(
-        email,
-        client_file,
-        poll,
+    delete_path = (
         None
         if delete_token is None
         else _absolute_secret_path(
             delete_token, f"{label}.gmail.remote_delete_token_file", archive_root
-        ),
+        )
+    )
+    config_ref = account.get("config_ref")
+    if delete_path is not None and isinstance(config_ref, str) and config_ref.startswith("file:"):
+        readonly_path = Path(config_ref[5:]).resolve(strict=False)
+        if readonly_path == delete_path:
+            raise ConfigError(f"{label}.gmail.remote_delete_token_file must differ from config_ref")
+    return GmailConfig(
+        email,
+        client_file,
+        poll,
+        delete_path,
     )
 
 

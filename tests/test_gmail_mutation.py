@@ -53,6 +53,7 @@ def _adapter(
                 "client_id": "x",
                 "client_secret": "y",
                 "scopes": [GMAIL_DELETE_SCOPE],
+                "expiry": "2099-01-01T00:00:00Z",
             }
         )
     )
@@ -158,6 +159,54 @@ def test_delete_token_configuration_is_separate_and_safe(config_file: Path, tmp_
     config_file.write_text(yaml.safe_dump(values))
     with pytest.raises(ConfigError):
         load_config(config_file)
+
+
+@pytest.mark.parametrize("path", ["same", "normalized"])
+def test_delete_token_cannot_alias_readonly_token(
+    config_file: Path, tmp_path: Path, path: str
+) -> None:
+    values = yaml.safe_load(config_file.read_text())
+    readonly = tmp_path / "readonly.json"
+    values["accounts"]["test"] = {
+        "kind": "gmail",
+        "enabled": True,
+        "remote_retention_days": 365,
+        "required_verified_backups": 2,
+        "config_ref": f"file:{readonly}",
+        "gmail": {
+            "account_email": "user@example.test",
+            "oauth_client_secret_file": "/tmp/client.json",
+            "remote_delete_token_file": str(
+                readonly if path == "same" else tmp_path / "x" / ".." / "readonly.json"
+            ),
+        },
+    }
+    config_file.write_text(yaml.safe_dump(values))
+    with pytest.raises(ConfigError, match="differ"):
+        load_config(config_file)
+
+
+def test_expired_delete_credential_refreshes_before_delete(
+    config_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeGmail({"target": b"target"})
+    adapter, target = _adapter(config_file, tmp_path, fake)
+    readonly_before = Path(adapter.account.config_ref[5:])
+    readonly_before.write_text("readonly")
+    refreshed = {"done": False}
+    monkeypatch.setattr(type(adapter.credentials), "expired", property(lambda _self: True))
+    def refresh(_request: object) -> None:
+        refreshed.update(done=True)
+
+    monkeypatch.setattr(adapter.credentials, "refresh", refresh)
+    monkeypatch.setattr(
+        adapter.credentials, "to_json", lambda: json.dumps({"scopes": [GMAIL_DELETE_SCOPE]})
+    )
+    assert adapter.delete(target).outcome == "success-confirmed"
+    assert refreshed["done"] and readonly_before.read_text() == "readonly"
+    assert adapter.account.gmail is not None
+    token_path = adapter.account.gmail.remote_delete_token_file
+    assert token_path is not None and token_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_gmail_acquisition_stays_readonly_and_mutation_is_narrow() -> None:
