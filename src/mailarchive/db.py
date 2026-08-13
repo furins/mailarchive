@@ -414,33 +414,6 @@ def _migration_9(connection: sqlite3.Connection) -> None:
             first_seen_at TEXT NOT NULL,
             CHECK(id=sha256)
         )""")
-
-
-def _migration_10(connection: sqlite3.Connection) -> None:
-    """M9 Borg repository binding and append-oriented backup evidence."""
-    connection.execute("""CREATE TABLE backup_repositories (
-        id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, kind TEXT NOT NULL CHECK(kind='borg'),
-        repository_ref TEXT NOT NULL, repository_identity TEXT, enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
-        encryption_mode TEXT NOT NULL CHECK(encryption_mode IN ('repokey','repokey-blake2','none')),
-        verification_policy TEXT NOT NULL CHECK(verification_policy='borg-archive-data-v1'),
-        created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
-    connection.execute("""CREATE TABLE backup_runs (
-        id TEXT PRIMARY KEY, repository_id INTEGER NOT NULL REFERENCES backup_repositories(id),
-        started_at TEXT NOT NULL, completed_at TEXT, status TEXT NOT NULL CHECK(status IN ('running','succeeded','failed')),
-        archive_name TEXT NOT NULL, command_exit_code INTEGER, manifest_sha256 TEXT,
-        verification_status TEXT NOT NULL CHECK(verification_status IN ('unverified','verified','failed')),
-        verified_at TEXT, last_error_kind TEXT, details_json TEXT NOT NULL DEFAULT '{}',
-        UNIQUE(repository_id,archive_name))""")
-    connection.execute("""CREATE TABLE message_backup_evidence (
-        canonical_message_id TEXT NOT NULL REFERENCES canonical_messages(id), backup_run_id TEXT NOT NULL REFERENCES backup_runs(id),
-        covered INTEGER NOT NULL CHECK(covered IN (0,1)), verified INTEGER NOT NULL CHECK(verified IN (0,1)),
-        recorded_at TEXT NOT NULL, PRIMARY KEY(canonical_message_id,backup_run_id))""")
-    connection.execute("""CREATE TABLE backup_restore_tests (
-        id INTEGER PRIMARY KEY, backup_run_id TEXT NOT NULL REFERENCES backup_runs(id), started_at TEXT NOT NULL,
-        completed_at TEXT, status TEXT NOT NULL CHECK(status IN ('running','succeeded','failed')), error_kind TEXT)""")
-    connection.execute(
-        "CREATE INDEX backup_runs_repository_started ON backup_runs(repository_id, started_at DESC)"
-    )
     connection.execute("""
         CREATE TABLE message_attachments (
             canonical_message_id TEXT NOT NULL REFERENCES canonical_messages(id),
@@ -468,6 +441,33 @@ def _migration_10(connection: sqlite3.Connection) -> None:
             CHECK((status='success' AND extracted_at IS NOT NULL AND last_error_kind IS NULL)
                OR (status='failed' AND extracted_at IS NULL AND last_error_kind IS NOT NULL))
         )""")
+
+
+def _migration_10(connection: sqlite3.Connection) -> None:
+    """M9 Borg repository binding and append-oriented backup evidence."""
+    connection.execute("""CREATE TABLE backup_repositories (
+        id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, kind TEXT NOT NULL CHECK(kind='borg'),
+        repository_ref TEXT NOT NULL, repository_identity TEXT, enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+        encryption_mode TEXT NOT NULL CHECK(encryption_mode IN ('repokey','repokey-blake2','none')),
+        verification_policy TEXT NOT NULL CHECK(verification_policy='borg-archive-data-v1'),
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+    connection.execute("""CREATE TABLE backup_runs (
+        id TEXT PRIMARY KEY, repository_id INTEGER NOT NULL REFERENCES backup_repositories(id),
+        started_at TEXT NOT NULL, completed_at TEXT, status TEXT NOT NULL CHECK(status IN ('running','succeeded','failed')),
+        archive_name TEXT NOT NULL, command_exit_code INTEGER, manifest_sha256 TEXT,
+        verification_status TEXT NOT NULL CHECK(verification_status IN ('unverified','verified','failed')),
+        verified_at TEXT, last_error_kind TEXT, details_json TEXT NOT NULL DEFAULT '{}',
+        UNIQUE(repository_id,archive_name))""")
+    connection.execute("""CREATE TABLE message_backup_evidence (
+        canonical_message_id TEXT NOT NULL REFERENCES canonical_messages(id), backup_run_id TEXT NOT NULL REFERENCES backup_runs(id),
+        covered INTEGER NOT NULL CHECK(covered IN (0,1)), verified INTEGER NOT NULL CHECK(verified IN (0,1)),
+        recorded_at TEXT NOT NULL, PRIMARY KEY(canonical_message_id,backup_run_id))""")
+    connection.execute("""CREATE TABLE backup_restore_tests (
+        id INTEGER PRIMARY KEY, backup_run_id TEXT NOT NULL REFERENCES backup_runs(id), started_at TEXT NOT NULL,
+        completed_at TEXT, status TEXT NOT NULL CHECK(status IN ('running','succeeded','failed')), error_kind TEXT)""")
+    connection.execute(
+        "CREATE INDEX backup_runs_repository_started ON backup_runs(repository_id, started_at DESC)"
+    )
 
 
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (

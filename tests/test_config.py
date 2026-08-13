@@ -63,3 +63,51 @@ def test_path_like_account_names_are_rejected(config_file: Path, account_name: o
     config_file.write_text(yaml.safe_dump(values), encoding="utf-8")
     with pytest.raises(ConfigError, match="account names"):
         load_config(config_file)
+
+
+@pytest.mark.parametrize(
+    "repository_ref",
+    [
+        "ssh://backup.example.test:2222/./mailarchive",
+        "ssh://user@backup.example.test:2222/./mailarchive",
+    ],
+)
+def test_borg_ssh_url_allows_optional_user_and_port(config_file: Path, repository_ref: str) -> None:
+    values = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    values["backup"] = {
+        "repositories": {
+            "remote": {
+                "repository_ref": repository_ref,
+                "encryption_mode": "repokey-blake2",
+                "passphrase_env": "MAILARCHIVE_BORG_TEST",
+            }
+        }
+    }
+    config_file.write_text(yaml.safe_dump(values), encoding="utf-8")
+    assert load_config(config_file).backup_repositories[0].repository_ref == repository_ref
+
+
+@pytest.mark.parametrize(
+    "repository_ref",
+    [
+        "ssh://user:password@backup.example.test/repo",
+        "ssh://backup.example.test/repo?unsafe=yes",
+        "ssh://backup.example.test/repo#unsafe",
+    ],
+)
+def test_borg_ssh_url_rejects_credentials_query_and_fragment(
+    config_file: Path, repository_ref: str
+) -> None:
+    values = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    values["backup"] = {
+        "repositories": {
+            "remote": {
+                "repository_ref": repository_ref,
+                "encryption_mode": "repokey-blake2",
+                "passphrase_env": "MAILARCHIVE_BORG_TEST",
+            }
+        }
+    }
+    config_file.write_text(yaml.safe_dump(values), encoding="utf-8")
+    with pytest.raises(ConfigError, match="password-free"):
+        load_config(config_file)

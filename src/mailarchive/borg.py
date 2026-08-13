@@ -14,10 +14,12 @@ import shutil
 import sqlite3
 import subprocess
 import uuid
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from re import fullmatch
+from typing import cast
 
 from mailarchive.db import connect, initialize, utc_now
 from mailarchive.models import AppConfig, BackupRepositoryConfig
@@ -99,10 +101,11 @@ class BorgAdapter:
     def version(self) -> str:
         result = self.command(["--version"])
         version = result.stdout.strip()
-        if not version.startswith("borg 1."):
+        matched = fullmatch(r"borg (\d+)\.(\d+)\.(\d+)(?:[+.-][A-Za-z0-9.]+)?", version)
+        if matched is None:
             raise BorgError("unsupported-version", "M9 requires Borg 1.x >= 1.2.8")
-        pieces = version.split()[1].split(".")
-        if len(pieces) < 2 or int(pieces[1]) < 2:
+        numeric = tuple(int(piece) for piece in matched.groups())
+        if not (numeric >= (1, 2, 8) and numeric < (2, 0, 0)):
             raise BorgError("unsupported-version", "M9 requires Borg 1.x >= 1.2.8")
         return version
 
@@ -168,7 +171,10 @@ class BorgAdapter:
                 raise BorgError("inventory-parse")
             path, size, digest = parts
             if digest:  # directories intentionally have no sha256
-                output[path] = (int(size), digest)
+                try:
+                    output[path] = (int(size), digest)
+                except ValueError as error:
+                    raise BorgError("inventory-parse") from error
         return output
 
     def verify_data(self, archive_name: str) -> None:
@@ -241,8 +247,21 @@ def _build_snapshot(config: AppConfig, run_id: str) -> tuple[Path, list[str], st
     root = config.archive.root.resolve()
     snapshot = root / "state" / "backup-snapshots" / run_id
     sqlite_path = snapshot / "state" / "mailarchive.sqlite3"
-    snapshot.mkdir(parents=True, exist_ok=False)
-    _snapshot_database(config.database.path, sqlite_path)
+    try:
+        snapshot.mkdir(parents=True, exist_ok=False)
+        _snapshot_database(config.database.path, sqlite_path)
+        return _materialize_snapshot(config, root, snapshot, sqlite_path)
+    except BorgError:
+        shutil.rmtree(snapshot, ignore_errors=True)
+        raise
+    except (OSError, sqlite3.Error) as error:
+        shutil.rmtree(snapshot, ignore_errors=True)
+        raise BorgError("snapshot-materialization") from error
+
+
+def _materialize_snapshot(
+    config: AppConfig, root: Path, snapshot: Path, sqlite_path: Path
+) -> tuple[Path, list[str], str]:
     entries: list[dict[str, object]] = []
     canonical_ids: list[str] = []
     with sqlite3.connect(sqlite_path) as db:
@@ -364,7 +383,7 @@ def backup_run(config: AppConfig, name: str) -> str:
                 (run_id, db_repository["id"], utc_now(), "running", archive),
             )
             db.commit()
-        snapshot: Path | None = None
+        snapshot = config.archive.root.resolve() / "state" / "backup-snapshots" / run_id
         try:
             snapshot, canonical_ids, manifest = _build_snapshot(config, run_id)
             adapter.create(archive, snapshot)
@@ -386,9 +405,17 @@ def backup_run(config: AppConfig, name: str) -> str:
                 )
                 db.commit()
             raise
+        except (OSError, sqlite3.Error) as error:
+            bounded = BorgError("local-operation")
+            with connect(config.database.path) as db:
+                db.execute(
+                    "UPDATE backup_runs SET status='failed',completed_at=?,verification_status='failed',last_error_kind=? WHERE id=?",
+                    (utc_now(), bounded.kind, run_id),
+                )
+                db.commit()
+            raise bounded from error
         finally:
-            if snapshot is not None:
-                shutil.rmtree(snapshot, ignore_errors=True)
+            shutil.rmtree(snapshot, ignore_errors=True)
     return run_id
 
 
@@ -400,6 +427,56 @@ def _fail_verification(config: AppConfig, run_id: str, kind: str) -> None:
         )
         db.execute("UPDATE message_backup_evidence SET verified=0 WHERE backup_run_id=?", (run_id,))
         db.commit()
+
+
+def _parse_manifest(manifest: bytes) -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
+    try:
+        for line in manifest.splitlines():
+            parsed = json.loads(line)
+            if not isinstance(parsed, Mapping):
+                raise TypeError("manifest record is not an object")
+            entry = dict(cast(Mapping[str, object], parsed))
+            kind = entry.get("kind")
+            path = entry.get("path")
+            digest = entry.get("sha256")
+            size = entry.get("size_bytes")
+            if (
+                kind not in {"canonical", "attachment", "sqlite"}
+                or not isinstance(path, str)
+                or not path
+                or not isinstance(digest, str)
+                or fullmatch(r"[0-9a-f]{64}", digest) is None
+                or isinstance(size, bool)
+                or not isinstance(size, int)
+                or size < 0
+            ):
+                raise ValueError("invalid manifest fields")
+            entries.append(entry)
+    except (json.JSONDecodeError, TypeError, ValueError) as error:
+        raise BorgError("manifest-parse") from error
+    if not entries:
+        raise BorgError("manifest-parse")
+    return entries
+
+
+def _expected_inventory(entries: list[dict[str, object]]) -> dict[str, tuple[int, str]]:
+    try:
+        expected: dict[str, tuple[int, str]] = {}
+        for item in entries:
+            path, size, digest = item["path"], item["size_bytes"], item["sha256"]
+            if (
+                not isinstance(path, str)
+                or not isinstance(size, int)
+                or not isinstance(digest, str)
+            ):
+                raise ValueError("invalid manifest fields")
+            expected[path] = (size, digest)
+    except (KeyError, TypeError, ValueError) as error:
+        raise BorgError("manifest-parse") from error
+    if len(expected) != len(entries):
+        raise BorgError("manifest-parse")
+    return expected
 
 
 def verify_run(config: AppConfig, run_id: str) -> None:
@@ -420,11 +497,8 @@ def verify_run(config: AppConfig, run_id: str) -> None:
             manifest = adapter.manifest_bytes(str(run["archive_name"]))
             if hashlib.sha256(manifest).hexdigest() != run["manifest_sha256"]:
                 raise BorgError("manifest-mismatch")
-            entries = [json.loads(line) for line in manifest.splitlines()]
-            expected = {
-                str(item["path"]): (int(item["size_bytes"]), str(item["sha256"]))
-                for item in entries
-            }
+            entries = _parse_manifest(manifest)
+            expected = _expected_inventory(entries)
             expected["metadata/backup-manifest.jsonl"] = (
                 len(manifest),
                 hashlib.sha256(manifest).hexdigest(),
@@ -435,6 +509,10 @@ def verify_run(config: AppConfig, run_id: str) -> None:
     except BorgError as error:
         _fail_verification(config, run_id, error.kind)
         raise
+    except (OSError, sqlite3.Error) as error:
+        bounded = BorgError("verification-local-error")
+        _fail_verification(config, run_id, bounded.kind)
+        raise bounded from error
     with connect(config.database.path) as db:
         now = utc_now()
         db.execute(
@@ -457,7 +535,7 @@ def restore_test(config: AppConfig, run_id: str, destination: Path) -> None:
         raise BorgError("restore-destination-invalid")
     with connect(config.database.path) as db:
         run = db.execute(
-            "SELECT r.*,b.name FROM backup_runs r JOIN backup_repositories b ON b.id=r.repository_id WHERE r.id=?",
+            "SELECT r.*,b.name,b.repository_identity FROM backup_runs r JOIN backup_repositories b ON b.id=r.repository_id WHERE r.id=?",
             (run_id,),
         ).fetchone()
         if run is None:
@@ -471,6 +549,8 @@ def restore_test(config: AppConfig, run_id: str, destination: Path) -> None:
     try:
         destination.mkdir(parents=True, exist_ok=True)
         adapter = BorgAdapter(config, _repository(config, str(run["name"])))
+        if adapter.identity() != run["repository_identity"]:
+            raise BorgError("repository-identity-mismatch")
         adapter.extract(str(run["archive_name"]), destination)
         manifest = (destination / "metadata" / "backup-manifest.jsonl").read_bytes()
         if hashlib.sha256(manifest).hexdigest() != run["manifest_sha256"]:
@@ -497,6 +577,15 @@ def restore_test(config: AppConfig, run_id: str, destination: Path) -> None:
             )
             db.commit()
         raise
+    except (OSError, sqlite3.Error, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+        bounded = BorgError("restore-parse")
+        with connect(config.database.path) as db:
+            db.execute(
+                "UPDATE backup_restore_tests SET completed_at=?,status='failed',error_kind=? WHERE id=?",
+                (utc_now(), bounded.kind, test_id),
+            )
+            db.commit()
+        raise bounded from error
     with connect(config.database.path) as db:
         db.execute(
             "UPDATE backup_restore_tests SET completed_at=?,status='succeeded' WHERE id=?",

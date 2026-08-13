@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from re import fullmatch
 from typing import Any, cast
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
@@ -213,10 +214,22 @@ def _backup_repositories(
         if any(char in ref for char in "\x00\r\n"):
             raise ConfigError(f"{label}.repository_ref must not contain CR, LF, or NUL")
         if ref.startswith("ssh://"):
-            if "?" in ref or "#" in ref:
+            parsed = urlparse(ref)
+            if (
+                parsed.scheme != "ssh"
+                or not parsed.hostname
+                or parsed.password is not None
+                or parsed.query
+                or parsed.fragment
+            ):
                 raise ConfigError(f"{label}.repository_ref must be a password-free ssh:// Borg URL")
-            authority = ref[6:].split("/", 1)[0]
-            if ":" in authority.split("@", 1)[0]:
+            try:
+                port = parsed.port
+            except ValueError as error:
+                raise ConfigError(f"{label}.repository_ref has an invalid ssh port") from error
+            if port is not None and not 1 <= port <= 65535:
+                raise ConfigError(f"{label}.repository_ref has an invalid ssh port")
+            if not parsed.path:
                 raise ConfigError(f"{label}.repository_ref must not embed a password")
         else:
             repository_path = Path(ref)
