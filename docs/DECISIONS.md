@@ -257,7 +257,8 @@ Create is not verification. Verification reads the archived manifest, compares e
 file path/size/SHA-256, then runs `borg check --archives-only --verify-data`. Failure, including a
 later re-check, clears verified evidence. A restore test extracts only to an empty external directory
 and validates manifest objects and SQLite integrity. Runs in one repository are one destination;
-M10 must count distinct verified repositories. There is no retention/deletion work, nor Borg
+M10 must count distinct verified Borg repository identities, never merely configured repository
+rows. There is no retention/deletion work, nor Borg
 prune/delete/compact/repair in M9. Borg key/passphrase recovery remains an external operator duty.
 
 # ADR-020: Local retention candidate policy (M10)
@@ -267,7 +268,8 @@ irrelevant. It evaluates each proven remote identity, not Message-ID or just can
 Canonical-level keep-online and legal-hold controls conservatively block every linked identity, and
 quarantine is a hard blocker. A candidate requires the live archive file to resolve beneath managed
 `mail/` and exactly match its stored SHA-256, plus evidence from distinct currently verified Borg
-repository IDs. M9 evidence is consumed from SQLite only: M10 never invokes Borg or providers.
+repository identities. M9 evidence is consumed from SQLite only: M10 never invokes Borg or
+providers. Contradictory provider/account and remote/canonical-account facts fail closed.
 
 Evaluation rows retain bounded ordered reason codes for explainability. Candidate eligibility is not
 deletion authorization; M10 provides no provider mutation or remote deletion interface.

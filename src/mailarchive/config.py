@@ -57,6 +57,13 @@ def _required_nonnegative_int(values: Mapping[object, object], field: str, label
     return value
 
 
+def _required_positive_int(values: Mapping[object, object], field: str, label: str) -> int:
+    value = values.get(field)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ConfigError(f"{label}.{field} must be a positive integer")
+    return value
+
+
 def _retention_days(value: object, label: str) -> int | None:
     if value == "never":
         return None
@@ -340,7 +347,7 @@ def load_config(path: Path) -> AppConfig:
                 ),
                 remote_deletion_enabled=remote_deletion_enabled,
                 required_verified_backups=(
-                    _required_nonnegative_int(account, "required_verified_backups", label)
+                    _required_positive_int(account, "required_verified_backups", label)
                     if "required_verified_backups" in account
                     else default_backups
                 ),

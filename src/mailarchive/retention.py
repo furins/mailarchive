@@ -3,7 +3,6 @@
 ``eligible`` is a reporting result only.  It is never authorization to mutate a
 provider, and this module deliberately has no provider or Borg adapter imports.
 """
-# ruff: noqa: E501
 
 from __future__ import annotations
 
@@ -23,7 +22,9 @@ REASON_CODES = (
     "REMOTE_NOT_PRESENT",
     "REMOTE_IDENTITY_UNPROVEN",
     "REMOTE_IDENTITY_INCOMPLETE",
+    "REMOTE_IDENTITY_INCOHERENT",
     "REMOTE_LINK_MISSING",
+    "REMOTE_LINK_INCOHERENT",
     "CANONICAL_MISSING",
     "CANONICAL_NOT_ARCHIVED",
     "QUARANTINED",
@@ -47,11 +48,13 @@ class RetentionFacts:
     account: str
     account_enabled: bool
     provider_kind: str | None
+    account_kind: str | None
     remote_present: bool
     identity_confidence: str | None
     identity_complete: bool
     canonical_id: str | None
     link_count: int
+    link_account_coherent: bool
     canonical_exists: bool
     storage_state: str | None
     archived_at: str | None
@@ -103,8 +106,12 @@ def evaluate(
         reasons.append("REMOTE_IDENTITY_UNPROVEN")
     if not facts.identity_complete:
         reasons.append("REMOTE_IDENTITY_INCOMPLETE")
+    if facts.provider_kind != facts.account_kind:
+        reasons.append("REMOTE_IDENTITY_INCOHERENT")
     if facts.link_count != 1:
         reasons.append("REMOTE_LINK_MISSING")
+    if not facts.link_account_coherent:
+        reasons.append("REMOTE_LINK_INCOHERENT")
     if not facts.canonical_exists:
         reasons.append("CANONICAL_MISSING")
     if facts.storage_state != "archived":
@@ -193,10 +200,28 @@ def evaluate_all(
         if run.lastrowid is None:
             raise RuntimeError("SQLite did not return an evaluation run identifier")
         run_id = int(run.lastrowid)
-        sql = """SELECT r.*,a.name account,a.enabled account_enabled,c.id canonical_id,c.sha256,c.local_path,c.storage_state,c.archived_at,c.integrity_status,
-        rc.keep_online,rc.legal_hold,(SELECT COUNT(*) FROM remote_canonical_links l WHERE l.remote_message_id=r.id) link_count,
-        (SELECT COUNT(DISTINCT br.id) FROM remote_canonical_links l JOIN message_backup_evidence e ON e.canonical_message_id=l.canonical_message_id JOIN backup_runs b ON b.id=e.backup_run_id JOIN backup_repositories br ON br.id=b.repository_id WHERE l.remote_message_id=r.id AND e.covered=1 AND e.verified=1 AND b.status='succeeded' AND b.verification_status='verified' AND b.verified_at IS NOT NULL AND br.repository_identity IS NOT NULL) verified_repositories
-        FROM remote_messages r JOIN accounts a ON a.id=r.account_id LEFT JOIN remote_canonical_links l ON l.remote_message_id=r.id LEFT JOIN canonical_messages c ON c.id=l.canonical_message_id LEFT JOIN retention_controls rc ON rc.canonical_message_id=c.id"""
+        sql = """
+        SELECT r.*, a.name AS account, a.kind AS account_kind, a.enabled AS account_enabled,
+               c.id AS canonical_id, c.account_id AS canonical_account_id, c.sha256,
+               c.local_path, c.storage_state, c.archived_at, c.integrity_status,
+               rc.keep_online, rc.legal_hold,
+               (SELECT COUNT(*) FROM remote_canonical_links l WHERE l.remote_message_id=r.id)
+                   AS link_count,
+               (SELECT COUNT(DISTINCT br.repository_identity)
+                FROM remote_canonical_links l
+                JOIN message_backup_evidence e ON e.canonical_message_id=l.canonical_message_id
+                JOIN backup_runs b ON b.id=e.backup_run_id
+                JOIN backup_repositories br ON br.id=b.repository_id
+                WHERE l.remote_message_id=r.id AND e.covered=1 AND e.verified=1
+                  AND b.status='succeeded' AND b.verification_status='verified'
+                  AND b.verified_at IS NOT NULL AND br.repository_identity IS NOT NULL)
+                   AS verified_repositories
+        FROM remote_messages r
+        JOIN accounts a ON a.id=r.account_id
+        LEFT JOIN remote_canonical_links l ON l.remote_message_id=r.id
+        LEFT JOIN canonical_messages c ON c.id=l.canonical_message_id
+        LEFT JOIN retention_controls rc ON rc.canonical_message_id=c.id
+        """
         params: tuple[object, ...] = ()
         if account is not None:
             sql += " WHERE a.name=?"
@@ -217,11 +242,14 @@ def evaluate_all(
                 str(row["account"]),
                 bool(row["account_enabled"]),
                 row["provider_kind"],
+                row["account_kind"],
                 bool(row["remote_present"]),
                 row["identity_confidence"],
                 _identity_complete(row),
                 None if row["canonical_id"] is None else str(row["canonical_id"]),
                 int(row["link_count"]),
+                row["canonical_account_id"] is not None
+                and int(row["account_id"]) == int(row["canonical_account_id"]),
                 row["canonical_id"] is not None,
                 row["storage_state"],
                 row["archived_at"],
@@ -240,7 +268,10 @@ def evaluate_all(
                 managed_mail_root=config.archive.root / "mail",
             )
             db.execute(
-                "INSERT INTO deletion_evaluations(evaluation_run_id,remote_message_id,canonical_message_id,evaluated_at,eligible,reason_codes_json,policy_version,remote_retention_days,required_verified_backups,verified_repository_count,retention_deadline) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO deletion_evaluations("
+                "evaluation_run_id,remote_message_id,canonical_message_id,evaluated_at,eligible,"
+                "reason_codes_json,policy_version,remote_retention_days,required_verified_backups,"
+                "verified_repository_count,retention_deadline) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     run_id,
                     facts.remote_message_id,
@@ -311,7 +342,9 @@ def set_control(
             raise ValueError("unknown canonical ID")
         if enabled:
             db.execute(
-                f"INSERT INTO retention_controls(canonical_message_id,{column},reason,updated_at) VALUES(?,1,?,?) ON CONFLICT(canonical_message_id) DO UPDATE SET {column}=1,reason=excluded.reason,updated_at=excluded.updated_at",
+                f"INSERT INTO retention_controls(canonical_message_id,{column},reason,updated_at) "
+                f"VALUES(?,1,?,?) ON CONFLICT(canonical_message_id) DO UPDATE SET {column}=1,"
+                "reason=excluded.reason,updated_at=excluded.updated_at",
                 (canonical_id, reason, utc_now()),
             )
         else:

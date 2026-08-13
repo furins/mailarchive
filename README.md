@@ -82,7 +82,8 @@ configuration. Configuration summaries redact `config_ref` values.
 are local policy reports only. A candidate is one proven remote identity linked to a canonical
 object; `eligible: true` never authorizes deletion (`execution_authorized` is always false in M10).
 The retention clock is 365 days from `archived_at` by default, requires two distinct currently
-verified Borg repository identities, and checks the current canonical file SHA-256. Local holds use
+verified Borg repository identities (not configured repository names), and checks the current
+canonical file SHA-256. Local holds use
 `mailarchive retention hold|release --canonical-id ID --kind keep-online|legal-hold --reason TEXT`.
 No report, control, or status command contacts a provider or Borg.
 
