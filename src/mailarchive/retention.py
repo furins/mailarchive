@@ -315,14 +315,22 @@ def set_control(
                 (canonical_id, reason, utc_now()),
             )
         else:
-            db.execute(
-                f"UPDATE retention_controls SET {column}=0,reason=?,updated_at=? WHERE canonical_message_id=?",
-                (reason, utc_now(), canonical_id),
-            )
-            db.execute(
-                "DELETE FROM retention_controls WHERE canonical_message_id=? AND keep_online=0 AND legal_hold=0",
+            other_column = "legal_hold" if column == "keep_online" else "keep_online"
+            other = db.execute(
+                f"SELECT {other_column} FROM retention_controls WHERE canonical_message_id=?",
                 (canonical_id,),
-            )
+            ).fetchone()
+            if other is not None and bool(other[0]):
+                db.execute(
+                    f"UPDATE retention_controls SET {column}=0,reason=?,updated_at=? "
+                    "WHERE canonical_message_id=?",
+                    (reason, utc_now(), canonical_id),
+                )
+            else:
+                db.execute(
+                    "DELETE FROM retention_controls WHERE canonical_message_id=?",
+                    (canonical_id,),
+                )
         insert_audit_event(
             db,
             actor="mailarchive.retention",
