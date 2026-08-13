@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -207,15 +208,17 @@ def test_distinct_evidence_and_canonical_controls(config_file: Path) -> None:
     assert report["verified_repository_count"] == 2
     assert report["eligible"] is True
     set_control(config, message.id, "keep-online", "operator request", enabled=True)
-    assert "KEEP_ONLINE" in evaluate_all(config, now=now)[0]["reason_codes"]
+    assert "KEEP_ONLINE" in cast(list[str], evaluate_all(config, now=now)[0]["reason_codes"])
     set_control(config, message.id, "keep-online", "operator release", enabled=False)
     assert evaluate_all(config, now=now)[0]["eligible"] is True
     with connect(config.database.path) as db:
-        db.execute("UPDATE backup_repositories SET repository_identity='same' WHERE name IN ('one','two')")
+        db.execute(
+            "UPDATE backup_repositories SET repository_identity='same' WHERE name IN ('one','two')"
+        )
         db.commit()
     duplicate_identity = evaluate_all(config, now=now)[0]
     assert duplicate_identity["verified_repository_count"] == 1
-    assert "BACKUPS_INSUFFICIENT" in duplicate_identity["reason_codes"]
+    assert "BACKUPS_INSUFFICIENT" in cast(list[str], duplicate_identity["reason_codes"])
 
 
 @pytest.mark.parametrize(
