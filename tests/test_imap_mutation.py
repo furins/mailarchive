@@ -29,6 +29,7 @@ class ScriptedImap:
         self.expunge_result = "OK"
         self.store_raises = False
         self.expunge_raises = False
+        self.fetch_raises = False
 
     def login(self, _user: str, _password: str) -> tuple[str, list[bytes]]:
         return "OK", [b"logged"]
@@ -46,6 +47,8 @@ class ScriptedImap:
     def uid(self, command: str, *args: str) -> tuple[str, list[object]]:
         self.commands.append((command, args))
         if command == "FETCH":
+            if self.fetch_raises:
+                raise OSError("unobservable")
             if self.raw is None:
                 return "OK", [None]
             flags = b"\\Deleted" if self.deleted else b""
@@ -183,6 +186,23 @@ def test_store_rejection_reobserves_clean_target(
     assert _mutations(client) == [("STORE", ("9", "+FLAGS.SILENT", r"(\Deleted)"))]
 
 
+def test_malformed_predelete_fetch_fails_closed_before_mutation(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = ScriptedImap(b"target")
+    original = client.uid
+
+    def malformed(command: str, *args: str) -> tuple[str, list[object]]:
+        if command == "FETCH":
+            return "OK", [b"not a FETCH literal"]
+        return original(command, *args)
+
+    client.uid = malformed  # type: ignore[method-assign]
+    adapter, target = _adapter(config_file, monkeypatch, client)
+    assert adapter.delete(target).error_code == "PROVIDER_REJECTED"
+    assert _mutations(client) == []
+
+
 @pytest.mark.parametrize(
     ("deleted", "expected"), [(False, "PROVIDER_REJECTED"), (True, "TRANSPORT_UNKNOWN")]
 )
@@ -228,6 +248,24 @@ def test_uid_expunge_failure_is_observed_without_retry(
         assert result.outcome == "success-confirmed" and result.confirmed_absent
     else:
         assert result.error_code == expected
+    assert len([item for item in _mutations(client) if item[0] == "EXPUNGE"]) == 1
+
+
+def test_uid_expunge_unobservable_is_unknown_without_retry(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = ScriptedImap(b"target")
+    client.expunge_raises = True
+    original = client.uid
+
+    def unobservable(command: str, *args: str) -> tuple[str, list[object]]:
+        if command == "EXPUNGE":
+            client.fetch_raises = True
+        return original(command, *args)
+
+    client.uid = unobservable  # type: ignore[method-assign]
+    adapter, target = _adapter(config_file, monkeypatch, client)
+    assert adapter.delete(target).error_code == "TRANSPORT_UNKNOWN"
     assert len([item for item in _mutations(client) if item[0] == "EXPUNGE"]) == 1
 
 
