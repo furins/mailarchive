@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -27,11 +28,22 @@ class FakeGmail:
         self.delete_error = False
         self.unobservable = False
         self.auth_after_delete = False
+        self.profile_authorization = False
+        self.message_authorization = False
+        self.returned_id: str | None = None
+        self.malformed_raw = False
+        self.calls: list[str] = []
 
     def profile(self) -> dict[str, object]:
+        self.calls.append("profile")
+        if self.profile_authorization:
+            raise MutationAuthorizationError("auth")
         return {"emailAddress": self.profile_email}
 
     def get_raw(self, message_id: str) -> dict[str, object] | None:
+        self.calls.append("get_raw")
+        if self.message_authorization:
+            raise MutationAuthorizationError("auth")
         if self.auth_after_delete and self.deletes:
             self.auth_after_delete = False
             raise MutationAuthorizationError("auth")
@@ -40,9 +52,14 @@ class FakeGmail:
         raw = self.messages.get(message_id)
         if raw is None:
             return None
-        return {"id": message_id, "raw": base64.urlsafe_b64encode(raw).decode().rstrip("=")}
+        encoded = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+        return {
+            "id": self.returned_id or message_id,
+            "raw": "not valid!" if self.malformed_raw else encoded,
+        }
 
     def delete_message_once(self, message_id: str) -> None:
+        self.calls.append("delete")
         self.deletes.append(message_id)
         if self.delete_error:
             raise OSError("lost")
@@ -258,6 +275,134 @@ def test_post_delete_auth_refresh_retries_only_observation(
     result = adapter.delete(target)
     assert (result.outcome if expected == "success-confirmed" else result.error_code) == expected
     assert fake.deletes == ["target"] and refreshed["count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("setup", "expected"),
+    [
+        ("absent", "confirmed-absent"),
+        ("present", "confirmed-present-match"),
+        ("sha", "identity-conflict"),
+        ("returned-id", "identity-conflict"),
+        ("profile", "identity-conflict"),
+        ("malformed", "unknown"),
+        ("network", "unknown"),
+    ],
+)
+def test_observe_exact_gmail_message_is_read_only(
+    config_file: Path, tmp_path: Path, setup: str, expected: str
+) -> None:
+    fake = FakeGmail({"target": b"target"})
+    adapter, target = _adapter(config_file, tmp_path, fake)
+    readonly = Path(adapter.account.config_ref[5:])
+    readonly.write_bytes(b"readonly-original")
+    if setup == "absent":
+        fake.messages.clear()
+    elif setup == "sha":
+        fake.messages["target"] = b"other"
+    elif setup == "returned-id":
+        fake.returned_id = "different-id"
+    elif setup == "profile":
+        fake.profile_email = "wrong@example.test"
+    elif setup == "malformed":
+        fake.malformed_raw = True
+    elif setup == "network":
+        fake.unobservable = True
+    assert adapter.observe(target).state == expected
+    assert fake.deletes == []
+    assert readonly.read_bytes() == b"readonly-original"
+
+
+def test_observe_invalid_target_never_constructs_transport(
+    config_file: Path, tmp_path: Path
+) -> None:
+    adapter, target = _adapter(config_file, tmp_path, FakeGmail({"target": b"target"}))
+    calls = 0
+
+    def unexpected_transport(_credentials: object) -> FakeGmail:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("transport must not be constructed")
+
+    adapter = GmailMutationAdapter(
+        adapter.config,
+        "test",
+        transport_factory=unexpected_transport,
+    )
+    invalid = replace(target, provider_message_id="invalid id")
+    assert adapter.observe(invalid).state == "identity-conflict"
+    assert calls == 0
+
+
+def test_observe_refreshes_only_mutation_token_before_provider_access(
+    config_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeGmail({"target": b"target"})
+    adapter, target = _adapter(config_file, tmp_path, fake)
+    readonly = Path(adapter.account.config_ref[5:])
+    readonly.write_bytes(b"readonly-original")
+    assert adapter.account.gmail is not None
+    mutation_token = adapter.account.gmail.remote_delete_token_file
+    assert mutation_token is not None
+    before = mutation_token.read_bytes()
+    monkeypatch.setattr(type(adapter.credentials), "valid", property(lambda _self: False))
+
+    def refresh(_request: object) -> None:
+        fake.calls.append("refresh")
+
+    monkeypatch.setattr(adapter.credentials, "refresh", refresh)
+    monkeypatch.setattr(
+        adapter.credentials, "to_json", lambda: json.dumps({"scopes": [GMAIL_DELETE_SCOPE]})
+    )
+    assert adapter.observe(target).state == "confirmed-present-match"
+    assert fake.calls[:2] == ["refresh", "profile"]
+    assert mutation_token.read_bytes() != before
+    assert mutation_token.stat().st_mode & 0o777 == 0o600
+    assert readonly.read_bytes() == b"readonly-original"
+    assert fake.deletes == []
+
+
+@pytest.mark.parametrize(
+    ("after", "expected"),
+    [
+        ("absent", "confirmed-absent"),
+        ("present", "confirmed-present-match"),
+        ("unknown", "unknown"),
+    ],
+)
+def test_observe_retries_read_only_get_once_after_authorization_failure(
+    config_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, after: str, expected: str
+) -> None:
+    initial = FakeGmail({"target": b"target"})
+    initial.message_authorization = True
+    retry = FakeGmail({} if after == "absent" else {"target": b"target"})
+    retry.unobservable = after == "unknown"
+    adapter, target = _adapter(config_file, tmp_path, initial)
+    readonly = Path(adapter.account.config_ref[5:])
+    readonly.write_bytes(b"readonly-original")
+    transports = [initial, retry]
+    factory_calls = 0
+
+    def transport_factory(_credentials: object) -> FakeGmail:
+        nonlocal factory_calls
+        current = transports[factory_calls]
+        factory_calls += 1
+        return current
+
+    adapter = GmailMutationAdapter(adapter.config, "test", transport_factory=transport_factory)
+    refreshed = {"count": 0}
+
+    def refresh(_request: object) -> None:
+        refreshed["count"] += 1
+
+    monkeypatch.setattr(adapter.credentials, "refresh", refresh)
+    monkeypatch.setattr(
+        adapter.credentials, "to_json", lambda: json.dumps({"scopes": [GMAIL_DELETE_SCOPE]})
+    )
+    assert adapter.observe(target).state == expected
+    assert refreshed["count"] == 1 and factory_calls == 2
+    assert initial.deletes == [] and retry.deletes == []
+    assert readonly.read_bytes() == b"readonly-original"
 
 
 def test_gmail_acquisition_stays_readonly_and_mutation_is_narrow() -> None:

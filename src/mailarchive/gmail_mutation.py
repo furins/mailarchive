@@ -26,7 +26,12 @@ from mailarchive.gmail import (
     gmail_lock,
 )
 from mailarchive.models import AccountConfig, AppConfig
-from mailarchive.remote_mutation import DeletionTarget, MutationResult, ProviderDeletionTarget
+from mailarchive.remote_mutation import (
+    DeletionTarget,
+    MutationResult,
+    ObservationResult,
+    ProviderDeletionTarget,
+)
 
 GMAIL_DELETE_SCOPE = "https://mail.google.com/"
 _BASE_URL = "https://gmail.googleapis.com/gmail/v1/users/me"
@@ -233,6 +238,54 @@ class GmailMutationAdapter:
             return "authorization", False
         except Exception:
             return "unobservable", False
+
+    def _observe_read_only(
+        self, transport: MutationTransport, target: ProviderDeletionTarget
+    ) -> str:
+        """Profile and exact RAW GET only; callers own credential-refresh policy."""
+        assert self.account.gmail is not None
+        try:
+            profile = _valid_id(transport.profile().get("emailAddress"), "profile email")
+        except MutationAuthorizationError:
+            return "authorization"
+        except Exception:
+            return "unknown"
+        if profile.casefold() != self.account.gmail.account_email.casefold():
+            return "identity-conflict"
+        state, proven = self._observe(transport, target)
+        if state == "absent":
+            return "confirmed-absent"
+        if state == "present" and proven:
+            return "confirmed-present-match"
+        if state == "conflict":
+            return "identity-conflict"
+        if state == "authorization":
+            return "authorization"
+        return "unknown"
+
+    def observe(self, target: DeletionTarget) -> ObservationResult:
+        """Read-only proof about one exact Gmail Message.id and RAW byte object."""
+        exact = self._target(target)
+        if exact is None or not self.account.enabled or self.account.gmail is None:
+            return ObservationResult("identity-conflict")
+        with gmail_lock(self.config, self.account, "sync"):
+            refreshed = not self.credentials.valid
+            if refreshed and not self._refresh_if_needed():
+                return ObservationResult("unknown")
+            try:
+                state = self._observe_read_only(self.transport_factory(self.credentials), exact)
+            except Exception:
+                state = "unknown"
+            if state == "authorization" and not refreshed:
+                if not self._refresh_if_needed(force=True):
+                    return ObservationResult("unknown")
+                try:
+                    state = self._observe_read_only(self.transport_factory(self.credentials), exact)
+                except Exception:
+                    state = "unknown"
+            if state in {"confirmed-absent", "confirmed-present-match", "identity-conflict"}:
+                return ObservationResult(state)
+            return ObservationResult("unknown")
 
     def _confirmation(
         self, transport: MutationTransport, target: ProviderDeletionTarget
