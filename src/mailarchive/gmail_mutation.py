@@ -38,6 +38,10 @@ class MutationTransport(Protocol):
     def delete_message_once(self, message_id: str) -> None: ...
 
 
+class MutationAuthorizationError(GmailAuthError):
+    """A read-only observation cannot authenticate; safe to refresh and repeat GET."""
+
+
 class _GoogleMutationTransport:
     """Fixed-host minimal HTTP surface; DELETE is intentionally one request."""
 
@@ -56,6 +60,8 @@ class _GoogleMutationTransport:
         )
         if response.status_code == 404:
             return None
+        if response.status_code in {401, 403}:
+            raise MutationAuthorizationError("Gmail deletion observation authorization failed")
         if response.status_code != 200:
             raise GmailAuthError("Gmail deletion observation failed")
         data = response.json()
@@ -223,11 +229,27 @@ class GmailMutationAdapter:
                 if hashlib.sha256(raw).hexdigest() == target.canonical_sha256
                 else ("conflict", False)
             )
+        except MutationAuthorizationError:
+            return "authorization", False
         except Exception:
             return "unobservable", False
 
-    def _refresh_if_needed(self) -> bool:
-        if not self.credentials.expired:
+    def _confirmation(
+        self, transport: MutationTransport, target: ProviderDeletionTarget
+    ) -> MutationResult:
+        state, proven = self._observe(transport, target)
+        if state == "authorization":
+            if not self._refresh_if_needed(force=True):
+                return self._unknown()
+            state, proven = self._observe(self.transport_factory(self.credentials), target)
+        if state == "absent":
+            return MutationResult("success-confirmed", confirmed_absent=True)
+        if state == "present" and proven:
+            return self._failure("PROVIDER_REJECTED")
+        return self._unknown()
+
+    def _refresh_if_needed(self, *, force: bool = False) -> bool:
+        if not force and self.credentials.valid:
             return True
         try:
             self.credentials.refresh(GoogleRequest())
@@ -263,9 +285,4 @@ class GmailMutationAdapter:
                 transport.delete_message_once(exact.provider_message_id)
             except Exception:
                 pass  # request may have reached Gmail: observe, never retry DELETE
-            state, proven = self._observe(transport, exact)
-            if state == "absent":
-                return MutationResult("success-confirmed", confirmed_absent=True)
-            if state == "present" and proven:
-                return self._failure("PROVIDER_REJECTED")
-            return self._unknown()
+            return self._confirmation(transport, exact)

@@ -10,7 +10,11 @@ import yaml
 
 from mailarchive.config import ConfigError, load_config
 from mailarchive.db import account_id, connect, initialize
-from mailarchive.gmail_mutation import GMAIL_DELETE_SCOPE, GmailMutationAdapter
+from mailarchive.gmail_mutation import (
+    GMAIL_DELETE_SCOPE,
+    GmailMutationAdapter,
+    MutationAuthorizationError,
+)
 from mailarchive.remote_mutation import ProviderDeletionTarget
 
 
@@ -20,11 +24,15 @@ class FakeGmail:
         self.deletes: list[str] = []
         self.delete_error = False
         self.unobservable = False
+        self.auth_after_delete = False
 
     def profile(self) -> dict[str, object]:
         return {"emailAddress": self.profile_email}
 
     def get_raw(self, message_id: str) -> dict[str, object] | None:
+        if self.auth_after_delete and self.deletes:
+            self.auth_after_delete = False
+            raise MutationAuthorizationError("auth")
         if self.unobservable:
             raise OSError("unobservable")
         raw = self.messages.get(message_id)
@@ -195,6 +203,7 @@ def test_expired_delete_credential_refreshes_before_delete(
     readonly_before.write_text("readonly")
     refreshed = {"done": False}
     monkeypatch.setattr(type(adapter.credentials), "expired", property(lambda _self: True))
+
     def refresh(_request: object) -> None:
         refreshed.update(done=True)
 
@@ -207,6 +216,46 @@ def test_expired_delete_credential_refreshes_before_delete(
     assert adapter.account.gmail is not None
     token_path = adapter.account.gmail.remote_delete_token_file
     assert token_path is not None and token_path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize(
+    ("after", "expected"),
+    [
+        ("absent", "success-confirmed"),
+        ("present", "PROVIDER_REJECTED"),
+        ("unknown", "TRANSPORT_UNKNOWN"),
+    ],
+)
+def test_post_delete_auth_refresh_retries_only_observation(
+    config_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, after: str, expected: str
+) -> None:
+    fake = FakeGmail({"target": b"target"})
+    adapter, target = _adapter(config_file, tmp_path, fake)
+    fake.auth_after_delete = True
+    original_delete = fake.delete_message_once
+
+    def deleted(identifier: str) -> None:
+        if after == "absent":
+            fake.messages.pop(identifier, None)
+        elif after == "unknown":
+            fake.unobservable = True
+        if after != "present":
+            original_delete(identifier)
+        else:
+            fake.deletes.append(identifier)
+
+    fake.delete_message_once = deleted  # type: ignore[method-assign]
+    refreshed = {"count": 0}
+    def refresh(_request: object) -> None:
+        refreshed.update(count=1)
+
+    monkeypatch.setattr(adapter.credentials, "refresh", refresh)
+    monkeypatch.setattr(
+        adapter.credentials, "to_json", lambda: json.dumps({"scopes": [GMAIL_DELETE_SCOPE]})
+    )
+    result = adapter.delete(target)
+    assert (result.outcome if expected == "success-confirmed" else result.error_code) == expected
+    assert fake.deletes == ["target"] and refreshed["count"] == 1
 
 
 def test_gmail_acquisition_stays_readonly_and_mutation_is_narrow() -> None:
