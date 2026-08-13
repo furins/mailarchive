@@ -12,11 +12,12 @@ from mailarchive.config import load_config
 from mailarchive.db import account_id, connect, initialize
 from mailarchive.pop3 import Pop3Adapter, Pop3SyncBusyError, pop3_lock
 from mailarchive.pop3_mutation import (
+    Pop3IdentityConflictError,
     Pop3MutationAdapter,
     Pop3MutationError,
     _MutationWire,  # pyright: ignore[reportPrivateUsage]
 )
-from mailarchive.remote_mutation import MutationResult, ProviderDeletionTarget
+from mailarchive.remote_mutation import MutationResult, ObservationResult, ProviderDeletionTarget
 
 
 def _config(tmp_path: Path) -> Path:
@@ -69,7 +70,9 @@ class FakeWire:
 
     def open(self) -> None:
         self.server.sessions += 1
-        if self.server.mode.endswith("unobservable") and self.server.sessions > 1:
+        if self.server.mode == "observe-unobservable" or (
+            self.server.mode.endswith("unobservable") and self.server.sessions > 1
+        ):
             raise OSError("unobservable")
 
     def authenticate(self, username: str, password: str) -> None:
@@ -78,7 +81,7 @@ class FakeWire:
 
     def uidls(self) -> dict[int, str]:
         if self.server.mode == "ambiguous":
-            raise Pop3MutationError("ambiguous")
+            raise Pop3IdentityConflictError("ambiguous")
         return {number: uidl for number, uidl in enumerate(self.server.messages, start=7)}
 
     def retr(self, number: int) -> bytes:
@@ -189,6 +192,235 @@ def test_pop3_mutation_unobservable_outcomes_never_retry_dele(
     result = adapter.delete(target)
     assert result.outcome == "outcome-unknown"
     assert server.dele_calls == [7] and server.quit_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("mode", "messages", "target_hash", "expected"),
+    [
+        ("success", {"U2": b"other\r\n"}, None, "confirmed-absent"),
+        ("success", {"U1": b"target\r\n"}, None, "confirmed-present-match"),
+        ("success", {"U1": b"other\r\n"}, "0" * 64, "identity-conflict"),
+        ("ambiguous", {"U1": b"target\r\n"}, None, "identity-conflict"),
+        ("observe-unobservable", {"U1": b"target\r\n"}, None, "unknown"),
+    ],
+)
+def test_pop3_public_observe_is_read_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    messages: dict[str, bytes],
+    target_hash: str | None,
+    expected: str,
+) -> None:
+    server = FakeServer(messages, mode)
+    adapter, target = _adapter(tmp_path, monkeypatch, server)
+    if target_hash is not None:
+        target = replace(target, canonical_sha256=target_hash)
+    assert adapter.observe(target).state == expected
+    assert server.dele_calls == [] and server.quit_calls == 0
+
+
+def test_pop3_observe_missing_secret_invalid_target_and_busy_lock_never_open_wire(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = FakeServer({"U1": b"target\r\n"})
+    adapter, target = _adapter(tmp_path, monkeypatch, server)
+    monkeypatch.delenv("POP_TEST_PASSWORD")
+    assert adapter.observe(target).state == "unknown" and server.sessions == 0
+    monkeypatch.setenv("POP_TEST_PASSWORD", "never-log")
+    invalid = replace(target, provider_message_id="bad uidl")
+    assert adapter.observe(invalid).state == "identity-conflict"
+    assert server.sessions == 0
+    with pop3_lock(adapter.config, adapter.account):
+        assert adapter.observe(target).state == "unknown"
+    assert server.sessions == 0 and server.dele_calls == [] and server.quit_calls == 0
+
+
+def test_pop3_observe_resolves_message_number_freshly_each_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base, target = _adapter(tmp_path, monkeypatch, FakeServer({"U1": b"target\r\n"}))
+    retr_numbers: list[int] = []
+    sessions = [{7: "U1"}, {11: "U1"}]
+
+    class RebindingWire:
+        def __init__(self, listing: dict[int, str]) -> None:
+            self.listing = listing
+
+        def open(self) -> None:
+            return None
+
+        def authenticate(self, _username: str, _password: str) -> None:
+            return None
+
+        def uidls(self) -> dict[int, str]:
+            return self.listing
+
+        def retr(self, number: int) -> bytes:
+            retr_numbers.append(number)
+            return b"target\r\n"
+
+        def dele(self, _number: int) -> None:
+            raise AssertionError("observe must never DELE")
+
+        def abort_without_quit(self) -> None:
+            return None
+
+        def quit_and_commit(self) -> None:
+            raise AssertionError("observe must never QUIT")
+
+    adapter = Pop3MutationAdapter(
+        base.config,
+        "pop",
+        wire_factory=lambda _settings: RebindingWire(sessions.pop(0)),  # type: ignore[arg-type]
+    )
+    assert adapter.observe(target).state == "confirmed-present-match"
+    assert adapter.observe(target).state == "confirmed-present-match"
+    assert retr_numbers == [7, 11]
+
+
+def test_pop3_observe_holds_shared_lock_until_read_only_session_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = FakeServer({"U1": b"target\r\n"})
+    base, target = _adapter(tmp_path, monkeypatch, server)
+    entered, release = threading.Event(), threading.Event()
+
+    class BlockingWire(FakeWire):
+        def uidls(self) -> dict[int, str]:
+            entered.set()
+            assert release.wait(timeout=5)
+            return super().uidls()
+
+    adapter = Pop3MutationAdapter(
+        base.config,
+        "pop",
+        wire_factory=lambda _settings: BlockingWire(server),
+    )
+    acquisition_wires = 0
+
+    def unexpected_acquisition_wire(_settings: object) -> object:
+        nonlocal acquisition_wires
+        acquisition_wires += 1
+        raise AssertionError("sync must not construct a wire while observe owns lock")
+
+    monkeypatch.setattr("mailarchive.pop3._Pop3Wire", unexpected_acquisition_wire)
+    result: list[ObservationResult] = []
+    thread = threading.Thread(target=lambda: result.append(adapter.observe(target)))
+    thread.start()
+    assert entered.wait(timeout=5)
+    with pytest.raises(Pop3SyncBusyError):
+        Pop3Adapter(base.config).sync("pop")
+    assert acquisition_wires == 0
+    release.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive() and result[0].state == "confirmed-present-match"
+
+
+@pytest.mark.parametrize(
+    ("messages", "target_sha", "expected"),
+    [
+        ({"U1": b"target\r\n", "U2": b"unrelated\r\n"}, None, "confirmed-present-match"),
+        ({"U2": b"unrelated\r\n"}, None, "confirmed-absent"),
+        ({"U1": b"target\r\n", "U2": b"unrelated\r\n"}, "0" * 64, "identity-conflict"),
+    ],
+)
+def test_loopback_pop3_public_observe_is_transport_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    messages: dict[str, bytes],
+    target_sha: str | None,
+    expected: str,
+) -> None:
+    commands: list[str] = []
+    before = dict(messages)
+
+    def multiline(raw: bytes) -> bytes:
+        return raw + b".\r\n"
+
+    class Handler(socketserver.StreamRequestHandler):
+        def handle(self) -> None:
+            self.wfile.write(b"+OK test\r\n")
+            while line := self.rfile.readline().decode("ascii").strip():
+                command, *arguments = line.split()
+                commands.append(command)
+                if command == "UIDL":
+                    self.wfile.write(b"+OK\r\n")
+                    for number, uidl in enumerate(messages, start=1):
+                        self.wfile.write(f"{number} {uidl}\r\n".encode())
+                    self.wfile.write(b".\r\n")
+                elif command == "RETR":
+                    uidl = list(messages)[int(arguments[0]) - 1]
+                    self.wfile.write(b"+OK\r\n" + multiline(messages[uidl]))
+                else:
+                    self.wfile.write(b"+OK\r\n")
+
+    server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        path = _config(tmp_path)
+        path.write_text(
+            path.read_text().replace("port: 11110", f"port: {server.server_address[1]}")
+        )
+        config = load_config(path)
+        initialize(config.database.path, config.accounts)
+        monkeypatch.setenv("POP_TEST_PASSWORD", "local-only")
+        with connect(config.database.path) as db:
+            aid = account_id(db, "pop")
+        assert aid is not None
+        target = ProviderDeletionTarget(
+            "historical",
+            "canonical",
+            aid,
+            "pop",
+            "pop3",
+            target_sha or hashlib.sha256(b"target\r\n").hexdigest(),
+            "U1",
+        )
+        assert Pop3MutationAdapter(config, "pop").observe(target).state == expected
+        assert commands.count("DELE") == 0 and commands.count("QUIT") == 0
+        assert messages == before and messages.get("U2") == before.get("U2")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_loopback_pop3_public_observe_ambiguous_uidl_is_identity_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commands: list[str] = []
+
+    class Handler(socketserver.StreamRequestHandler):
+        def handle(self) -> None:
+            self.wfile.write(b"+OK test\r\n")
+            while line := self.rfile.readline().decode("ascii").strip():
+                commands.append(line.split()[0])
+                if line == "UIDL":
+                    self.wfile.write(b"+OK\r\n1 U1\r\n1 U2\r\n.\r\n")
+                else:
+                    self.wfile.write(b"+OK\r\n")
+
+    server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        path = _config(tmp_path)
+        path.write_text(
+            path.read_text().replace("port: 11110", f"port: {server.server_address[1]}")
+        )
+        config = load_config(path)
+        initialize(config.database.path, config.accounts)
+        monkeypatch.setenv("POP_TEST_PASSWORD", "local-only")
+        with connect(config.database.path) as db:
+            aid = account_id(db, "pop")
+        assert aid is not None
+        target = ProviderDeletionTarget("r", "c", aid, "pop", "pop3", "0" * 64, "U1")
+        assert Pop3MutationAdapter(config, "pop").observe(target).state == "identity-conflict"
+        assert commands == ["USER", "PASS", "UIDL"]
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_shared_pop3_lock_blocks_mutation_before_wire_construction(

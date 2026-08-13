@@ -17,11 +17,20 @@ from mailarchive.db import account_id, connect
 from mailarchive.imap import credential_variable
 from mailarchive.models import AppConfig, Pop3Config
 from mailarchive.pop3 import Pop3SyncBusyError, pop3_lock
-from mailarchive.remote_mutation import DeletionTarget, MutationResult, ProviderDeletionTarget
+from mailarchive.remote_mutation import (
+    DeletionTarget,
+    MutationResult,
+    ObservationResult,
+    ProviderDeletionTarget,
+)
 
 
 class Pop3MutationError(RuntimeError):
     """Bounded local/protocol failure; details are never persisted."""
+
+
+class Pop3IdentityConflictError(Pop3MutationError):
+    """A UIDL listing proves the POP3 identity namespace is ambiguous."""
 
 
 class Pop3MutationWire(Protocol):
@@ -137,7 +146,7 @@ class _MutationWire:
                 or number in result
                 or uidl in seen
             ):
-                raise Pop3MutationError("POP3 UIDL response is ambiguous")
+                raise Pop3IdentityConflictError("POP3 UIDL response is ambiguous")
             result[number] = uidl
             seen.add(uidl)
         if not result and data:
@@ -216,23 +225,50 @@ class Pop3MutationAdapter:
         wire.authenticate(self.account.pop3.username, password)
         return wire
 
-    def _observe(self, target: ProviderDeletionTarget, password: str) -> MutationResult:
-        """Fresh read-only provider proof after an attempted operation."""
+    def _observe_unlocked(
+        self, target: ProviderDeletionTarget, password: str
+    ) -> ObservationResult:
+        """Fresh read-only proof without acquiring the shared account lock."""
         wire: Pop3MutationWire | None = None
         try:
             wire = self._session(password)
             inverse = {uidl: number for number, uidl in wire.uidls().items()}
             number = inverse.get(target.provider_message_id)
             if number is None:
-                return MutationResult("success-confirmed", confirmed_absent=True)
+                return ObservationResult("confirmed-absent")
             if hashlib.sha256(wire.retr(number)).hexdigest() == target.canonical_sha256:
-                return self._failure("PROVIDER_REJECTED")
-            return self._unknown()
+                return ObservationResult("confirmed-present-match")
+            return ObservationResult("identity-conflict")
+        except Pop3IdentityConflictError:
+            return ObservationResult("identity-conflict")
         except (OSError, Pop3MutationError):
-            return self._unknown()
+            return ObservationResult("unknown")
         finally:
             if wire is not None:
                 wire.abort_without_quit()
+
+    def _observe(self, target: ProviderDeletionTarget, password: str) -> MutationResult:
+        """M12-D post-attempt mapping; the caller already owns pop3_lock."""
+        observed = self._observe_unlocked(target, password)
+        if observed.state == "confirmed-absent":
+            return MutationResult("success-confirmed", confirmed_absent=True)
+        if observed.state == "confirmed-present-match":
+            return self._failure("PROVIDER_REJECTED")
+        return self._unknown()
+
+    def observe(self, target: DeletionTarget) -> ObservationResult:
+        """Read-only proof about an exact UIDL, using a fresh session mapping."""
+        exact = self._target(target)
+        if exact is None:
+            return ObservationResult("identity-conflict")
+        password = os.environ.get(self.credential_variable)
+        if not password:
+            return ObservationResult("unknown")
+        try:
+            with pop3_lock(self.config, self.account):
+                return self._observe_unlocked(exact, password)
+        except Pop3SyncBusyError:
+            return ObservationResult("unknown")
 
     def delete(self, target: DeletionTarget) -> MutationResult:
         exact = self._target(target)
