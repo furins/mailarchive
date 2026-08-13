@@ -341,6 +341,37 @@ def _historical_target(db: sqlite3.Connection, mutation_id: int) -> DeletionTarg
     )
 
 
+def _update_current_presence_if_historical_identity_matches(
+    db: sqlite3.Connection, target: DeletionTarget, present: int
+) -> None:
+    """Atomically avoid applying proof about an old identity to a drifted row."""
+    if isinstance(target, ImapDeletionTarget):
+        db.execute(
+            """UPDATE remote_messages SET remote_present=? WHERE id=? AND account_id=?
+            AND provider_kind='imap' AND remote_folder=? AND uidvalidity=? AND remote_uid=?""",
+            (
+                present,
+                target.remote_message_id,
+                target.account_id,
+                target.remote_folder,
+                target.uidvalidity,
+                target.remote_uid,
+            ),
+        )
+    else:
+        db.execute(
+            """UPDATE remote_messages SET remote_present=? WHERE id=? AND account_id=?
+            AND provider_kind=? AND provider_message_id=?""",
+            (
+                present,
+                target.remote_message_id,
+                target.account_id,
+                target.provider_kind,
+                target.provider_message_id,
+            ),
+        )
+
+
 class ReconciliationError(RuntimeError):
     """A local production-run reconciliation precondition failed."""
 
@@ -397,10 +428,7 @@ def reconcile_production_run(
                     "UPDATE remote_mutations SET status='succeeded',completed_at=?,reconciled_at=?,provider_response_summary='confirmed-absent',error_code='NONE' WHERE id=?",
                     (now, now, mutation_id),
                 )
-                db.execute(
-                    "UPDATE remote_messages SET remote_present=0 WHERE id=?",
-                    (target.remote_message_id,),
-                )
+                _update_current_presence_if_historical_identity_matches(db, target, 0)
                 event, result = "remote_mutation.reconcile.absent", "success"
                 counts["resolved_absent"] += 1
             elif state == "confirmed-present-match":
@@ -408,10 +436,7 @@ def reconcile_production_run(
                     "UPDATE remote_mutations SET status='failed',completed_at=?,reconciled_at=?,provider_response_summary='confirmed-no-mutation',error_code='RECONCILED_PRESENT' WHERE id=?",
                     (now, now, mutation_id),
                 )
-                db.execute(
-                    "UPDATE remote_messages SET remote_present=1 WHERE id=?",
-                    (target.remote_message_id,),
-                )
+                _update_current_presence_if_historical_identity_matches(db, target, 1)
                 event, result = "remote_mutation.reconcile.present", "failed"
                 counts["resolved_present"] += 1
             else:

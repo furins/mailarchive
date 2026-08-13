@@ -26,6 +26,7 @@ from mailarchive.remote_mutation import (
     ObservationResult,
     ProductionPlanError,
     ProviderDeletionTarget,
+    ReconciliationError,
     RemoteMutationAdapter,
     _normalize_result,  # pyright: ignore[reportPrivateUsage]
     execute_fake,
@@ -1263,11 +1264,11 @@ def test_acquisition_sources_remain_without_provider_write_path() -> None:
 @pytest.mark.parametrize(
     ("initial", "state", "expected", "remote_present", "reconciled"),
     [
-        ("started", "confirmed-absent", "succeeded", 0, True),
+        ("started", "confirmed-absent", "succeeded", 1, True),
         ("started", "confirmed-present-match", "failed", 1, True),
         ("started", "unknown", "unknown", 1, False),
         ("started", "identity-conflict", "unknown", 1, False),
-        ("unknown", "confirmed-absent", "succeeded", 0, True),
+        ("unknown", "confirmed-absent", "succeeded", 1, True),
         ("unknown", "confirmed-present-match", "failed", 1, True),
         ("unknown", "unknown", "unknown", 1, False),
         ("unknown", "identity-conflict", "unknown", 1, False),
@@ -1343,6 +1344,57 @@ def test_reconciliation_invalid_result_and_exception_are_bounded(config_file: Pa
         assert b"token=secret" not in config.database.path.read_bytes()
 
 
+def test_reconciliation_imap_snapshot_drift_does_not_change_current_presence(config_file: Path) -> None:
+    config, _ = eligible_remote(config_file, provider_kind="imap", remote_uid=9)
+    config = production_enabled(config)
+    source = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
+    run = execute_production_plan(
+        config,
+        source,
+        "test",
+        adapter_factory=ProductionFactory(FakeAdapter(MutationResult("outcome-unknown"))),
+    )
+    with connect(config.database.path) as db:
+        db.execute("UPDATE remote_messages SET remote_uid=10,remote_present=1")
+        db.commit()
+    observer = FakeObserver("confirmed-absent")
+    reconcile_production_run(config, run, observer_factory=lambda _config, _account: observer)
+    assert isinstance(observer.targets[0], ImapDeletionTarget)
+    assert (observer.targets[0].remote_folder, observer.targets[0].uidvalidity, observer.targets[0].remote_uid) == ("INBOX", 7, 9)
+    with connect(config.database.path) as db:
+        assert db.execute("SELECT remote_present FROM remote_messages").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("kind", ["missing", "dry-run", "completed-production"])
+def test_reconciliation_rejects_invalid_runs_without_constructing_observer(
+    config_file: Path, kind: str
+) -> None:
+    config, _ = eligible_remote(config_file)
+    config = production_enabled(config)
+    source = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
+    calls = 0
+
+    def factory(_config: AppConfig, _account: str) -> FakeObserver:
+        nonlocal calls
+        calls += 1
+        return FakeObserver("confirmed-absent")
+
+    if kind == "missing":
+        run = 99999
+    elif kind == "dry-run":
+        run = source
+    else:
+        run = execute_production_plan(
+            config,
+            source,
+            "test",
+            adapter_factory=ProductionFactory(FakeAdapter(MutationResult("success-confirmed", True))),
+        )
+    with pytest.raises(ReconciliationError):
+        reconcile_production_run(config, run, observer_factory=factory)
+    assert calls == 0
+
+
 def test_reconciliation_never_resumes_later_planned_mutations(config_file: Path) -> None:
     config, _ = eligible_remote(
         config_file, provider_kind="pop3", remote_id="a", provider_message_id="a"
@@ -1365,3 +1417,30 @@ def test_reconciliation_never_resumes_later_planned_mutations(config_file: Path)
         assert [str(row[0]) for row in rows] == ["succeeded", "planned"]
         assert db.execute("SELECT status FROM remote_mutation_runs WHERE id=?", (run,)).fetchone()[0] == "halted"
     assert len(deletion.calls) == 1
+
+
+def test_reconciliation_preserves_local_graph_on_conclusive_absence(config_file: Path) -> None:
+    config, canonical_id = eligible_remote(config_file)
+    config = production_enabled(config)
+    source = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
+    run = execute_production_plan(
+        config,
+        source,
+        "test",
+        adapter_factory=ProductionFactory(FakeAdapter(MutationResult("outcome-unknown"))),
+    )
+    with connect(config.database.path) as db:
+        path = Path(db.execute("SELECT local_path FROM canonical_messages WHERE id=?", (canonical_id,)).fetchone()[0])
+        before = path.read_bytes()
+        attachments = [tuple(row) for row in db.execute("SELECT * FROM attachments")]
+        links = [tuple(row) for row in db.execute("SELECT * FROM message_attachments")]
+        evidence = [tuple(row) for row in db.execute("SELECT * FROM message_backup_evidence")]
+        assert attachments and links and evidence
+    reconcile_production_run(
+        config, run, observer_factory=lambda _config, _account: FakeObserver("confirmed-absent")
+    )
+    with connect(config.database.path) as db:
+        assert [tuple(row) for row in db.execute("SELECT * FROM attachments")] == attachments
+        assert [tuple(row) for row in db.execute("SELECT * FROM message_attachments")] == links
+        assert [tuple(row) for row in db.execute("SELECT * FROM message_backup_evidence")] == evidence
+    assert path.read_bytes() == before
