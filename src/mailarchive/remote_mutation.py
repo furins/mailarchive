@@ -77,31 +77,35 @@ class MutationResult:
     error_code: str | None = None
 
 
-_OUTCOME_STATUS = {
-    "success-confirmed": ("succeeded", "confirmed-absent"),
-    "failure-confirmed-no-mutation": ("failed", "confirmed-no-mutation"),
-    "outcome-unknown": ("unknown", "outcome-uncertain"),
-}
-_ERROR_CODES = {
-    "NONE",
-    "TARGET_NOT_FOUND",
-    "IDENTITY_MISMATCH",
-    "PROVIDER_REJECTED",
-    "TRANSPORT_UNKNOWN",
-    "ADAPTER_EXCEPTION",
-    "STALE_PLAN",
-    "INVALID_ADAPTER_RESULT",
-}
+_FAILURE_ERROR_CODES = {"TARGET_NOT_FOUND", "IDENTITY_MISMATCH", "PROVIDER_REJECTED"}
+_INTERNAL_ERROR_CODES = {"ADAPTER_EXCEPTION", "STALE_PLAN", "INVALID_ADAPTER_RESULT"}
 
 
-def _normalize_result(result: MutationResult) -> tuple[str, str, str]:
-    """Return only closed result categories; never retain adapter-supplied text."""
-    outcome = _OUTCOME_STATUS.get(result.outcome)
+def _normalize_result(
+    result: MutationResult, *, internal_error_code: str | None = None
+) -> tuple[str, str, str]:
+    """Enforce the closed adapter coherence matrix; never retain adapter text."""
+    if internal_error_code is not None:
+        allowed_internal = _INTERNAL_ERROR_CODES - {"STALE_PLAN", "INVALID_ADAPTER_RESULT"}
+        if internal_error_code not in allowed_internal:
+            raise ValueError("invalid internal mutation error code")
+        return "unknown", "outcome-uncertain", internal_error_code
     code = result.error_code or "NONE"
-    if outcome is None or code not in _ERROR_CODES - {"STALE_PLAN", "INVALID_ADAPTER_RESULT"}:
-        return "unknown", "outcome-uncertain", "INVALID_ADAPTER_RESULT"
-    status, summary = outcome
-    return status, summary, code
+    if result.outcome == "success-confirmed" and result.confirmed_absent and code == "NONE":
+        return "succeeded", "confirmed-absent", "NONE"
+    if (
+        result.outcome == "failure-confirmed-no-mutation"
+        and not result.confirmed_absent
+        and code in _FAILURE_ERROR_CODES
+    ):
+        return "failed", "confirmed-no-mutation", code
+    if (
+        result.outcome == "outcome-unknown"
+        and not result.confirmed_absent
+        and code == "TRANSPORT_UNKNOWN"
+    ):
+        return "unknown", "outcome-uncertain", code
+    return "unknown", "outcome-uncertain", "INVALID_ADAPTER_RESULT"
 
 
 class RemoteMutationAdapter(Protocol):
@@ -335,10 +339,17 @@ def execute_fake(config: AppConfig, run_id: int, adapter: RemoteMutationAdapter)
             db.commit()
         try:
             result = adapter.delete(target)
+            status = _record_outcome(config, run_id, int(row["id"]), target, result)
         except Exception:
             # Provider exception text can contain remote data; retain only a bounded category.
-            result = MutationResult("outcome-unknown", error_code="ADAPTER_EXCEPTION")
-        status = _record_outcome(config, run_id, int(row["id"]), target, result)
+            status = _record_outcome(
+                config,
+                run_id,
+                int(row["id"]),
+                target,
+                MutationResult("outcome-unknown"),
+                internal_error_code="ADAPTER_EXCEPTION",
+            )
         if status != "succeeded":
             return
 
@@ -366,9 +377,15 @@ def _halt_stale(config: AppConfig, run_id: int, mutation_id: int) -> None:
 
 
 def _record_outcome(
-    config: AppConfig, run_id: int, mutation_id: int, target: DeletionTarget, result: MutationResult
+    config: AppConfig,
+    run_id: int,
+    mutation_id: int,
+    target: DeletionTarget,
+    result: MutationResult,
+    *,
+    internal_error_code: str | None = None,
 ) -> str:
-    status, summary, error_code = _normalize_result(result)
+    status, summary, error_code = _normalize_result(result, internal_error_code=internal_error_code)
     with connect(config.database.path) as db:
         now = utc_now()
         db.execute(

@@ -6,6 +6,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
+import pytest
+
 from mailarchive.classification import ClassificationResult, apply_classification
 from mailarchive.config import load_config
 from mailarchive.db import account_id, connect, initialize
@@ -16,6 +18,7 @@ from mailarchive.remote_mutation import (
     ImapDeletionTarget,
     MutationResult,
     ProviderDeletionTarget,
+    _normalize_result,  # pyright: ignore[reportPrivateUsage]
     execute_fake,
     plan_dry_run,
 )
@@ -308,7 +311,9 @@ def test_fake_unknown_halts_and_does_not_claim_absence(config_file: Path) -> Non
     config, _ = eligible_remote(config_file)
     run_id = int(cast(int, plan_dry_run(config)["run_id"]))
     execute_fake(
-        config, run_id, FakeAdapter(MutationResult("outcome-unknown", error_code="TRANSPORT"))
+        config,
+        run_id,
+        FakeAdapter(MutationResult("outcome-unknown", error_code="TRANSPORT_UNKNOWN")),
     )
     with connect(config.database.path) as db:
         assert db.execute("SELECT status FROM remote_mutations").fetchone()[0] == "unknown"
@@ -380,6 +385,84 @@ def test_invalid_adapter_result_is_unknown_and_raw_exception_is_not_persisted(
         )
         assert "super-secret" not in persisted
         assert "private@example.test" not in persisted
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        (
+            MutationResult("success-confirmed", confirmed_absent=True),
+            ("succeeded", "confirmed-absent", "NONE"),
+        ),
+        (
+            MutationResult("success-confirmed", confirmed_absent=False),
+            ("unknown", "outcome-uncertain", "INVALID_ADAPTER_RESULT"),
+        ),
+        (
+            MutationResult(
+                "success-confirmed", confirmed_absent=True, error_code="ADAPTER_EXCEPTION"
+            ),
+            ("unknown", "outcome-uncertain", "INVALID_ADAPTER_RESULT"),
+        ),
+        (
+            MutationResult(
+                "failure-confirmed-no-mutation",
+                confirmed_absent=True,
+                error_code="PROVIDER_REJECTED",
+            ),
+            ("unknown", "outcome-uncertain", "INVALID_ADAPTER_RESULT"),
+        ),
+        (
+            MutationResult(
+                "outcome-unknown", confirmed_absent=True, error_code="TRANSPORT_UNKNOWN"
+            ),
+            ("unknown", "outcome-uncertain", "INVALID_ADAPTER_RESULT"),
+        ),
+        (
+            MutationResult("failure-confirmed-no-mutation", error_code="ADAPTER_EXCEPTION"),
+            ("unknown", "outcome-uncertain", "INVALID_ADAPTER_RESULT"),
+        ),
+        (
+            MutationResult("outcome-unknown", error_code="STALE_PLAN"),
+            ("unknown", "outcome-uncertain", "INVALID_ADAPTER_RESULT"),
+        ),
+        (
+            MutationResult("outcome-unknown", error_code="INVALID_ADAPTER_RESULT"),
+            ("unknown", "outcome-uncertain", "INVALID_ADAPTER_RESULT"),
+        ),
+        (
+            MutationResult("failure-confirmed-no-mutation", error_code="TARGET_NOT_FOUND"),
+            ("failed", "confirmed-no-mutation", "TARGET_NOT_FOUND"),
+        ),
+        (
+            MutationResult("outcome-unknown", error_code="TRANSPORT_UNKNOWN"),
+            ("unknown", "outcome-uncertain", "TRANSPORT_UNKNOWN"),
+        ),
+    ],
+)
+def test_mutation_result_coherence_matrix(
+    result: MutationResult, expected: tuple[str, str, str]
+) -> None:
+    assert _normalize_result(result) == expected
+
+
+def test_invalid_success_result_halts_before_later_fake_mutation(config_file: Path) -> None:
+    config, _ = eligible_remote(config_file, remote_id="first", body=b"first")
+    eligible_remote(config_file, remote_id="second", body=b"second", remote_uid=10)
+    run_id = int(cast(int, plan_dry_run(config)["run_id"]))
+    adapter = FakeAdapter(MutationResult("success-confirmed", confirmed_absent=False))
+    execute_fake(config, run_id, adapter)
+    assert [target.remote_message_id for target in adapter.calls] == ["first"]
+    with connect(config.database.path) as db:
+        rows = db.execute(
+            "SELECT remote_message_id,status,error_code FROM remote_mutations ORDER BY id"
+        ).fetchall()
+        assert tuple(rows[0]) == ("first", "unknown", "INVALID_ADAPTER_RESULT")
+        assert tuple(rows[1][1:]) == ("dry-run", None)
+        assert (
+            db.execute("SELECT remote_present FROM remote_messages WHERE id='first'").fetchone()[0]
+            == 1
+        )
 
 
 def test_exception_after_fake_call_is_unknown_started_first_and_stops_later_rows(
