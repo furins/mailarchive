@@ -89,11 +89,20 @@ class AccountConfig:
 
 
 @dataclass(frozen=True)
+class RetentionConfig:
+    """Defaults used to resolve per-account local retention policy."""
+
+    remote_retention_days_default: int = 365
+    required_verified_backups_default: int = 2
+
+
+@dataclass(frozen=True)
 class AppConfig:
     archive: ArchiveConfig
     database: DatabaseConfig
     accounts: tuple[AccountConfig, ...]
     backup_repositories: tuple[BackupRepositoryConfig, ...] = ()
+    retention: RetentionConfig = RetentionConfig()
 
 
 @dataclass(frozen=True)

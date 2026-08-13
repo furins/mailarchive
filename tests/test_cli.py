@@ -33,8 +33,9 @@ def test_config_check_exit_status(config_file: Path, capsys: pytest.CaptureFixtu
 
 def test_no_destructive_remote_command_appears() -> None:
     help_text = build_parser().format_help()
-    assert "delete" not in help_text.lower()
-    assert "remote" not in help_text.lower()
+    assert "deletion-candidates" in help_text
+    assert "remote-delete" not in help_text.lower()
+    assert "remote mutation" not in help_text.lower()
 
 
 def test_db_init_and_status(config_file: Path, capsys: pytest.CaptureFixture[str]) -> None:

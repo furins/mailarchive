@@ -134,6 +134,15 @@ Boundary tests:
 
 Property-based tests are encouraged.
 
+### M10 retention reporting
+
+Table-driven tests cover exact archived-at boundaries, all fail-closed identity/lifecycle/integrity
+conditions, canonical controls, `never`, and deterministic multiple reason codes. Repository counts
+must use distinct currently verified Borg repository identities: multiple configured names or runs
+bound to one physical identity count as one and revoked evidence counts as zero. Retention
+report/control commands must be proven local-only; contradictory provider/account and remote/canonical
+account facts must fail closed.
+
 ## 5. Fast-path tests
 
 Use a fake event source or disposable IMAP server.

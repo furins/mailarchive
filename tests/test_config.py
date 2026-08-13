@@ -42,6 +42,27 @@ def test_negative_retention_rejected(config_file: Path) -> None:
         load_config(config_file)
 
 
+@pytest.mark.parametrize("value", [0, -1, True, "2"])
+def test_required_verified_backups_must_be_positive(config_file: Path, value: object) -> None:
+    values = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    values["accounts"]["test"]["required_verified_backups"] = value
+    config_file.write_text(yaml.safe_dump(values), encoding="utf-8")
+    with pytest.raises(ConfigError, match="required_verified_backups"):
+        load_config(config_file)
+
+
+@pytest.mark.parametrize("value", [0, -1, True, "2"])
+def test_retention_default_required_backups_must_be_positive(
+    config_file: Path, value: object
+) -> None:
+    values = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    values["retention"] = {"required_verified_backups_default": value}
+    values["accounts"]["test"].pop("required_verified_backups")
+    config_file.write_text(yaml.safe_dump(values), encoding="utf-8")
+    with pytest.raises(ConfigError, match="required_verified_backups_default"):
+        load_config(config_file)
+
+
 def test_never_delete_is_explicit(config_file: Path) -> None:
     values = yaml.safe_load(config_file.read_text(encoding="utf-8"))
     values["accounts"]["test"]["remote_retention_days"] = "never"
