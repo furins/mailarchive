@@ -97,12 +97,21 @@ class RetentionConfig:
 
 
 @dataclass(frozen=True)
+class RemoteDeletionConfig:
+    """M11 planning-only blast-radius limits; production mutation is unavailable."""
+
+    max_per_run: int = 10
+    max_per_account: int = 10
+
+
+@dataclass(frozen=True)
 class AppConfig:
     archive: ArchiveConfig
     database: DatabaseConfig
     accounts: tuple[AccountConfig, ...]
     backup_repositories: tuple[BackupRepositoryConfig, ...] = ()
     retention: RetentionConfig = RetentionConfig()
+    remote_deletion: RemoteDeletionConfig = RemoteDeletionConfig()
 
 
 @dataclass(frozen=True)

@@ -9,6 +9,11 @@ retention:
   remote_retention_days_default: 365
   required_verified_backups_default: 2
 
+remote_deletion:
+  # M11 dry-run selection limits only. Production remote execution is unavailable before M12.
+  max_per_run: 10
+  max_per_account: 10
+
 accounts:
   personal:
     kind: imap

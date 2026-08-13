@@ -17,8 +17,139 @@ def test_database_initializes_idempotently(config_file: Path) -> None:
     initialize(config.database.path, config.accounts)
     initialize(config.database.path, config.accounts)
     with connect(config.database.path) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 11
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 12
         assert connection.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 1
+
+
+def test_real_populated_v11_upgrades_to_v12_without_rewriting_history(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M11 migration regression: begin with an actual complete v11 database."""
+    config = load_config(config_file)
+    original = database.MIGRATIONS
+    monkeypatch.setattr(database, "MIGRATIONS", original[:11])
+    initialize(config.database.path, config.accounts)
+    now = utc_now()
+    with connect(config.database.path) as db:
+        aid = account_id(db, "test")
+        assert aid is not None
+        digest = "d" * 64
+        db.execute(
+            """INSERT INTO canonical_messages(id,account_id,sha256,local_path,size_bytes,downloaded_at,
+            archived_at,storage_state,quarantined_at,integrity_status,integrity_verified_at,created_at)
+            VALUES('v11-canonical',?,?,?,1,? ,?,'archived',NULL,'verified',?,?)""",
+            (aid, digest, "/tmp/v11.eml", now, now, now, now),
+        )
+        db.execute(
+            """INSERT INTO remote_messages(id,account_id,provider_kind,remote_folder,uidvalidity,
+            remote_uid,first_seen_at,last_seen_at,remote_present,identity_confidence)
+            VALUES('v11-remote',?,'imap','INBOX',1,2,?,?,1,'proven')""",
+            (aid, now, now),
+        )
+        db.execute(
+            "INSERT INTO remote_canonical_links VALUES('v11-remote','v11-canonical','fixture',?)",
+            (now,),
+        )
+        db.execute(
+            "INSERT INTO attachments(id,sha256,size_bytes,content_path,first_seen_at) VALUES(?,?,?,?,?)",
+            ("e" * 64, "e" * 64, 1, "/tmp/v11-attachment", now),
+        )
+        db.execute(
+            "INSERT INTO message_attachments VALUES('v11-canonical',?,0,'x','attachment','text/plain')",
+            ("e" * 64,),
+        )
+        db.execute(
+            """INSERT INTO attachment_extractions(canonical_message_id,source_sha256,status,
+            attachment_count,extracted_at,last_error_kind,updated_at) VALUES(?,?,'success',1,?,NULL,?)""",
+            ("v11-canonical", digest, now, now),
+        )
+        db.execute(
+            """INSERT INTO backup_repositories(name,kind,repository_ref,repository_identity,enabled,
+            encryption_mode,verification_policy,created_at,updated_at)
+            VALUES('v11-repo','borg','/tmp/v11-borg','physical-v11',1,'none','borg-archive-data-v1',?,?)""",
+            (now, now),
+        )
+        repository_id = db.execute(
+            "SELECT id FROM backup_repositories WHERE name='v11-repo'"
+        ).fetchone()[0]
+        db.execute(
+            """INSERT INTO backup_runs(id,repository_id,started_at,completed_at,status,archive_name,
+            verification_status,verified_at) VALUES('v11-run',?,?,?,'succeeded','v11','verified',?)""",
+            (repository_id, now, now, now),
+        )
+        db.execute(
+            "INSERT INTO message_backup_evidence VALUES('v11-canonical','v11-run',1,1,?)", (now,)
+        )
+        db.execute(
+            "INSERT INTO backup_restore_tests(backup_run_id,started_at,completed_at,status) VALUES('v11-run',?,?,'succeeded')",
+            (now, now),
+        )
+        db.execute(
+            "INSERT INTO retention_controls VALUES('v11-canonical',1,0,'fixture hold',?)", (now,)
+        )
+        evaluation_run = db.execute(
+            "INSERT INTO deletion_evaluation_runs(evaluated_at,policy_version) VALUES(?, 'retention-v1')",
+            (now,),
+        )
+        db.execute(
+            """INSERT INTO deletion_evaluations(evaluation_run_id,remote_message_id,canonical_message_id,
+            evaluated_at,eligible,reason_codes_json,policy_version,remote_retention_days,
+            required_verified_backups,verified_repository_count,retention_deadline)
+            VALUES(?,'v11-remote','v11-canonical',?,1,'[]','retention-v1',365,2,2,?)""",
+            (evaluation_run.lastrowid, now, now),
+        )
+        db.commit()
+    monkeypatch.setattr(database, "MIGRATIONS", original)
+    initialize(config.database.path, config.accounts)
+    initialize(config.database.path, config.accounts)
+    with connect(config.database.path) as db:
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 12
+        assert (
+            db.execute("SELECT sha256 FROM canonical_messages WHERE id='v11-canonical'").fetchone()[
+                0
+            ]
+            == digest
+        )
+        assert (
+            db.execute("SELECT remote_uid FROM remote_messages WHERE id='v11-remote'").fetchone()[0]
+            == 2
+        )
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM message_attachments WHERE canonical_message_id='v11-canonical'"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            db.execute(
+                "SELECT repository_identity FROM backup_repositories WHERE name='v11-repo'"
+            ).fetchone()[0]
+            == "physical-v11"
+        )
+        assert (
+            db.execute(
+                "SELECT verified FROM message_backup_evidence WHERE backup_run_id='v11-run'"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            db.execute(
+                "SELECT keep_online FROM retention_controls WHERE canonical_message_id='v11-canonical'"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            db.execute(
+                "SELECT eligible FROM deletion_evaluations WHERE remote_message_id='v11-remote'"
+            ).fetchone()[0]
+            == 1
+        )
+        for table in ("remote_mutation_runs", "remote_mutations"):
+            assert db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+        assert db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 def test_real_v9_to_v10_preserves_m8_attachment_graph(
@@ -64,7 +195,7 @@ def test_real_v9_to_v10_preserves_m8_attachment_graph(
     initialize(config.database.path, config.accounts)
     initialize(config.database.path, config.accounts)
     with connect(config.database.path) as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 11
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 12
         assert db.execute("SELECT COUNT(*) FROM attachments").fetchone()[0] == 1
         assert db.execute("SELECT COUNT(*) FROM message_attachments").fetchone()[0] == 1
         assert db.execute("SELECT status FROM attachment_extractions").fetchone()[0] == "success"
@@ -143,7 +274,7 @@ def test_real_v10_to_v11_preserves_m9_evidence_and_identity_graph(
     initialize(config.database.path, config.accounts)
     initialize(config.database.path, config.accounts)
     with connect(config.database.path) as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 11
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 12
         assert (
             db.execute(
                 "SELECT repository_identity FROM backup_repositories WHERE name='v10'"
@@ -204,7 +335,7 @@ def test_m3_schema_v4_upgrades_to_v5_without_changing_remote_links(
     initialize(config.database.path, config.accounts)
     initialize(config.database.path, config.accounts)
     with connect(config.database.path) as connection:
-        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 11
+        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 12
         assert connection.execute(
             "SELECT name FROM sqlite_master WHERE name='fast_path_health'"
         ).fetchone()
@@ -247,7 +378,7 @@ def test_real_v5_to_v6_preserves_imap_identity_links_and_health(
     initialize(config.database.path, config.accounts)
     initialize(config.database.path, config.accounts)
     with connect(config.database.path) as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 11
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 12
         assert tuple(
             db.execute(
                 "SELECT id,provider_kind,remote_folder,uidvalidity,remote_uid FROM remote_messages"
@@ -315,7 +446,7 @@ def test_v7_rebuild_preserves_gmail_label_foreign_key_graph(
     monkeypatch.setattr(database, "MIGRATIONS", original)
     initialize(config.database.path, config.accounts)
     with connect(config.database.path) as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 11
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 12
         assert tuple(
             db.execute(
                 "SELECT remote_message_id,account_id,label_id FROM gmail_message_labels"
@@ -422,7 +553,7 @@ def test_v8_to_v9_preserves_state_and_adds_attachment_constraints(
     initialize(config.database.path, config.accounts)
     initialize(config.database.path, config.accounts)
     with connect(config.database.path) as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 11
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 12
         assert db.execute("SELECT id FROM canonical_messages").fetchone()[0] == "v8-message"
         assert db.execute("SELECT classification FROM classifications").fetchone()[0] == "ham"
         assert db.execute("SELECT name FROM sqlite_master WHERE name='attachments'").fetchone()

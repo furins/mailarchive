@@ -31,11 +31,10 @@ def test_config_check_exit_status(config_file: Path, capsys: pytest.CaptureFixtu
     assert result.value.code == 2
 
 
-def test_no_destructive_remote_command_appears() -> None:
+def test_remote_delete_is_explicit_dry_run_only() -> None:
     help_text = build_parser().format_help()
     assert "deletion-candidates" in help_text
-    assert "remote-delete" not in help_text.lower()
-    assert "remote mutation" not in help_text.lower()
+    assert "remote-delete" in help_text.lower()
 
 
 def test_db_init_and_status(config_file: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -226,7 +225,7 @@ def test_ingest_json_output(
     assert '"canonical_message_id"' in output
 
 
-def test_cli_has_no_remote_or_network_command() -> None:
+def test_cli_has_no_execute_remote_command() -> None:
     help_text = build_parser().format_help().lower()
-    assert "remote" not in help_text
+    assert "--execute" not in help_text
     assert "network" not in help_text

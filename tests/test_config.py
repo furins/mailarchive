@@ -30,7 +30,7 @@ def test_deletion_enablement_is_rejected_in_m0(config_file: Path) -> None:
     values = yaml.safe_load(config_file.read_text(encoding="utf-8"))
     values["accounts"]["test"]["remote_deletion_enabled"] = True
     config_file.write_text(yaml.safe_dump(values), encoding="utf-8")
-    with pytest.raises(ConfigError, match="unsupported in M0"):
+    with pytest.raises(ConfigError, match="unavailable before M12"):
         load_config(config_file)
 
 

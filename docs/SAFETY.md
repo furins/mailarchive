@@ -93,6 +93,14 @@ reports never contact a provider or Borg and always expose `execution_authorized
 remote deletion remains a future M11/M12 operation requiring a separate explicit execution switch,
 dry-run behavior, provider-specific safeguards, and auditability.
 
+### M11 planning is not production execution authorization
+
+M11 requires `remote-delete --dry-run`, freshly reruns M10 from current local state, and records
+only a local target snapshot. Production execution is unavailable before M12. Before a future
+destructive call begins, a committed `started` row must exist. If completion cannot be proven,
+the row is `unknown`, later work stops, automatic retry is forbidden, and operator reconciliation
+is required.
+
 ## 7. Rate limiting and blast-radius control
 
 When remote deletion is eventually enabled:

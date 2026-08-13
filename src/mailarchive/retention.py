@@ -267,7 +267,7 @@ def evaluate_all(
                 required_verified_backups=required,
                 managed_mail_root=config.archive.root / "mail",
             )
-            db.execute(
+            evaluation_row = db.execute(
                 "INSERT INTO deletion_evaluations("
                 "evaluation_run_id,remote_message_id,canonical_message_id,evaluated_at,eligible,"
                 "reason_codes_json,policy_version,remote_retention_days,required_verified_backups,"
@@ -288,6 +288,8 @@ def evaluate_all(
                     else result.retention_deadline.isoformat(),
                 ),
             )
+            if evaluation_row.lastrowid is None:
+                raise RuntimeError("SQLite did not return a deletion evaluation identifier")
             reports.append(
                 {
                     "remote_message_id": facts.remote_message_id,
@@ -295,6 +297,7 @@ def evaluate_all(
                     "account": facts.account,
                     "provider_kind": facts.provider_kind,
                     "eligible": result.eligible,
+                    "deletion_evaluation_id": int(evaluation_row.lastrowid),
                     "execution_authorized": False,
                     "reason_codes": list(result.reason_codes),
                     "archived_at": facts.archived_at,

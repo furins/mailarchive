@@ -204,6 +204,10 @@ Deliver:
 
 Production execution remains disabled by default.
 
+Implemented as schema v12 local-only dry-run planning with versioned target fingerprints,
+deterministic global/per-account limits and append-only mutation history. Fake in-process
+adapters exercise the state machine; no production mutation adapter or execute CLI exists.
+
 ## M12 — Controlled production enablement
 
 Deliver:
