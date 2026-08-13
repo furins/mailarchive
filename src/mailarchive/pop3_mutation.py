@@ -129,9 +129,15 @@ class _MutationWire:
                 uidl = fields[1].decode("ascii", "strict")
             except UnicodeDecodeError as error:
                 raise Pop3MutationError("POP3 UIDL response is malformed") from error
-            if not uidl or any(char.isspace() for char in uidl) or uidl in seen:
+            number = int(fields[0])
+            if (
+                not uidl
+                or any(char.isspace() for char in uidl)
+                or number in result
+                or uidl in seen
+            ):
                 raise Pop3MutationError("POP3 UIDL response is ambiguous")
-            result[int(fields[0])] = uidl
+            result[number] = uidl
             seen.add(uidl)
         if not result and data:
             raise Pop3MutationError("POP3 UIDL response is malformed")

@@ -10,7 +10,11 @@ import pytest
 
 from mailarchive.config import load_config
 from mailarchive.db import account_id, connect, initialize
-from mailarchive.pop3_mutation import Pop3MutationAdapter, Pop3MutationError
+from mailarchive.pop3_mutation import (
+    Pop3MutationAdapter,
+    Pop3MutationError,
+    _MutationWire,  # pyright: ignore[reportPrivateUsage]
+)
 from mailarchive.remote_mutation import ProviderDeletionTarget
 
 
@@ -186,17 +190,56 @@ def test_pop3_mutation_unobservable_outcomes_never_retry_dele(
     assert server.dele_calls == [7] and server.quit_calls == 0
 
 
-def test_loopback_pop3_dele_commits_only_on_explicit_quit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("listing", [b"1 U1\r\n1 U2\r\n", b"1 U1\r\n2 U1\r\n"])
+def test_real_mutation_uidl_parser_rejects_duplicate_number_or_uidl(
+    tmp_path: Path, listing: bytes
+) -> None:
+    config = load_config(_config(tmp_path))
+
+    class Socket:
+        def __init__(self) -> None:
+            self.fragments = [b"+OK\r\n" + listing + b".\r\n"]
+
+        def recv(self, _size: int) -> bytes:
+            return self.fragments.pop(0) if self.fragments else b""
+
+        def sendall(self, _data: bytes) -> None:
+            return None
+
+    wire = _MutationWire(config.accounts[0].pop3)  # type: ignore[arg-type]
+    wire.sock = Socket()  # type: ignore[assignment]
+    with pytest.raises(Pop3MutationError, match="ambiguous"):
+        wire.uidls()
+    assert wire.commands == ["UIDL"]
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected", "quit_count", "target_present"),
+    [
+        ("success", "success-confirmed", 1, False),
+        ("dele-lost", "failure-confirmed-no-mutation", 0, True),
+        ("quit-lost", "success-confirmed", 1, False),
+    ],
+)
+def test_loopback_pop3_dele_commit_and_uncertainty_semantics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    expected: str,
+    quit_count: int,
+    target_present: bool,
 ) -> None:
     messages = {"U1": b"target\r\n", "U2": b"unrelated\r\n"}
     commands: list[str] = []
 
     def multiline(raw: bytes) -> bytes:
-        return b"".join(
-            (b"." + line if line.startswith(b".") else line) + b"\r\n"
-            for line in raw.removesuffix(b"\r\n").split(b"\r\n")
-        ) + b".\r\n"
+        return (
+            b"".join(
+                (b"." + line if line.startswith(b".") else line) + b"\r\n"
+                for line in raw.removesuffix(b"\r\n").split(b"\r\n")
+            )
+            + b".\r\n"
+        )
 
     class Handler(socketserver.StreamRequestHandler):
         def handle(self) -> None:
@@ -215,10 +258,14 @@ def test_loopback_pop3_dele_commits_only_on_explicit_quit(
                     self.wfile.write(b"+OK\r\n" + multiline(messages[uidl]))
                 elif command == "DELE":
                     pending = list(messages)[int(arguments[0]) - 1]
+                    if mode == "dele-lost":
+                        return
                     self.wfile.write(b"+OK\r\n")
                 elif command == "QUIT":
                     if pending is not None:
                         del messages[pending]
+                    if mode == "quit-lost":
+                        return
                     self.wfile.write(b"+OK\r\n")
                     return
                 else:
@@ -248,9 +295,10 @@ def test_loopback_pop3_dele_commits_only_on_explicit_quit(
             "U1",
         )
         result = Pop3MutationAdapter(config, "pop").delete(target)
-        assert result.outcome == "success-confirmed"
-        assert commands.count("DELE") == 1 and commands.count("QUIT") == 1
-        assert "U1" not in messages and messages["U2"] == b"unrelated\r\n"
+        assert result.outcome == expected
+        assert commands.count("DELE") == 1 and commands.count("QUIT") == quit_count
+        assert ("U1" in messages) is target_present
+        assert messages["U2"] == b"unrelated\r\n"
     finally:
         server.shutdown()
         server.server_close()

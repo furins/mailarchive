@@ -315,3 +315,7 @@ dedicated injected mutation wire offers only explicit `quit_and_commit()` and
 identity; each session resolves UIDL freshly, RETRs exact bytes, and hashes them before one DELE.
 Fresh UIDL observation is required after QUIT or any uncertainty, and no attempt retries DELE.
 Default production wiring and reconciliation remain M12-E work.
+
+Before M12-E makes the POP3 production factory reachable, POP3 acquisition and
+deletion must be serialized per account. Otherwise an M6 sync holding an older
+UIDL snapshot could restore `remote_present=1` after a deletion is confirmed.
