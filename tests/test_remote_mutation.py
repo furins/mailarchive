@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,6 +13,7 @@ import pytest
 from mailarchive.classification import ClassificationResult, apply_classification
 from mailarchive.config import load_config
 from mailarchive.db import account_id, connect, initialize, utc_now
+from mailarchive.gmail_mutation import GmailMutationAdapter
 from mailarchive.ingest import ingest_bytes
 from mailarchive.models import AppConfig
 from mailarchive.remote_mutation import (
@@ -233,6 +235,147 @@ def production_enabled(config: AppConfig) -> AppConfig:
             replace(account, remote_deletion_enabled=True) for account in config.accounts
         ),
     )
+
+
+class EngineGmail:
+    def __init__(
+        self,
+        database: Path,
+        messages: dict[str, bytes],
+        *,
+        uncertain: bool = False,
+        keep_present: bool = False,
+    ) -> None:
+        self.database = database
+        self.messages = messages
+        self.uncertain = uncertain
+        self.keep_present = keep_present
+        self.deletes: list[str] = []
+        self.started = False
+
+    def profile(self) -> dict[str, object]:
+        return {"emailAddress": "user@example.test"}
+
+    def get_raw(self, message_id: str) -> dict[str, object] | None:
+        if self.uncertain and self.deletes:
+            raise OSError("unobservable")
+        raw = self.messages.get(message_id)
+        if raw is None:
+            return None
+        import base64
+        return {"id": message_id, "raw": base64.urlsafe_b64encode(raw).decode().rstrip("=")}
+
+    def delete_message_once(self, message_id: str) -> None:
+        with connect(self.database) as db:
+            self.started = db.execute("SELECT status FROM remote_mutations WHERE dry_run=0").fetchone()[0] == "started"
+        self.deletes.append(message_id)
+        if not self.uncertain and not self.keep_present:
+            self.messages.pop(message_id, None)
+
+
+def gmail_engine_config(config_file: Path, tmp_path: Path) -> None:
+    import yaml
+
+    values = yaml.safe_load(config_file.read_text())
+    readonly = tmp_path / "readonly.json"
+    readonly.write_text('{"scopes":["https://www.googleapis.com/auth/gmail.readonly"]}')
+    readonly.chmod(0o600)
+    token = tmp_path / "delete.json"
+    token.write_text(
+        '{"token":"x","refresh_token":"y","token_uri":"https://x","client_id":"x",'
+        '"client_secret":"y","scopes":["https://mail.google.com/"],'
+        '"expiry":"2099-01-01T00:00:00Z"}'
+    )
+    token.chmod(0o600)
+    values["accounts"]["test"].update(
+        {
+            "kind": "gmail",
+            "remote_deletion_enabled": True,
+            "config_ref": f"file:{readonly}",
+        }
+    )
+    values["accounts"]["test"]["gmail"] = {
+        "account_email": "user@example.test",
+        "oauth_client_secret_file": "/tmp/client.json",
+        "remote_delete_token_file": str(token),
+    }
+    config_file.write_text(yaml.safe_dump(values))
+
+
+def gmail_factory(fake: EngineGmail) -> Callable[[AppConfig, str], RemoteMutationAdapter]:
+    def factory(config: AppConfig, name: str) -> RemoteMutationAdapter:
+        return GmailMutationAdapter(config, name, transport_factory=lambda _credentials: fake)
+
+    return factory
+
+
+def test_gmail_adapter_executes_through_production_engine_preserving_local_graph(
+    config_file: Path, tmp_path: Path
+) -> None:
+    gmail_engine_config(config_file, tmp_path)
+    config, canonical = eligible_remote(config_file, provider_kind="gmail", remote_id="gmail-target", provider_message_id="target", body=b"target")
+    source = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
+    with connect(config.database.path) as db:
+        before_attachments = [tuple(row) for row in db.execute("SELECT * FROM message_attachments")]
+        before_evidence = [tuple(row) for row in db.execute("SELECT * FROM message_backup_evidence")]
+        canonical_path = Path(db.execute("SELECT local_path FROM canonical_messages WHERE id=?", (canonical,)).fetchone()[0])
+        bytes_before = canonical_path.read_bytes()
+    fake = EngineGmail(config.database.path, {"target": bytes_before, "other": b"other"})
+    run = execute_production_plan(config, source, "test", adapter_factory=gmail_factory(fake))
+    assert fake.started and fake.deletes == ["target"] and "other" in fake.messages
+    with connect(config.database.path) as db:
+        assert db.execute("SELECT status FROM remote_mutation_runs WHERE id=?", (source,)).fetchone()[0] == "completed"
+        mutation = db.execute("SELECT status,source_plan_mutation_id FROM remote_mutations WHERE mutation_run_id=?", (run,)).fetchone()
+        assert tuple(mutation) == ("succeeded", mutation[1]) and mutation[1] is not None
+        assert db.execute("SELECT remote_present FROM remote_messages WHERE id='gmail-target'").fetchone()[0] == 0
+        assert [tuple(row) for row in db.execute("SELECT * FROM message_attachments")] == before_attachments
+        assert [tuple(row) for row in db.execute("SELECT * FROM message_backup_evidence")] == before_evidence
+    assert canonical_path.read_bytes() == bytes_before
+
+
+@pytest.mark.parametrize(("uncertain", "expected"), [(False, "failed"), (True, "unknown")])
+def test_gmail_adapter_engine_halts_failure_or_unknown(
+    config_file: Path, tmp_path: Path, uncertain: bool, expected: str
+) -> None:
+    gmail_engine_config(config_file, tmp_path)
+    config, _ = eligible_remote(
+        config_file,
+        provider_kind="gmail",
+        remote_id="a-target",
+        provider_message_id="target",
+        body=b"target",
+    )
+    _config, _ = eligible_remote(
+        config_file,
+        provider_kind="gmail",
+        remote_id="b-later",
+        provider_message_id="later",
+        body=b"later",
+    )
+    source = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
+    fake = EngineGmail(
+        config.database.path,
+        {"target": b"From: test\r\n\r\ntarget", "later": b"From: test\r\n\r\nlater"},
+        uncertain=uncertain,
+        keep_present=not uncertain,
+    )
+    production = execute_production_plan(config, source, "test", adapter_factory=gmail_factory(fake))
+    assert fake.started and fake.deletes == ["target"]
+    with connect(config.database.path) as db:
+        assert db.execute("SELECT status FROM remote_mutation_runs WHERE id=?", (production,)).fetchone()[0] == "halted"
+        rows = db.execute(
+            "SELECT remote_message_id,status FROM remote_mutations WHERE mutation_run_id=? ORDER BY remote_message_id",
+            (production,),
+        ).fetchall()
+        assert [tuple(row) for row in rows] == [("a-target", expected), ("b-later", "planned")]
+        assert db.execute("SELECT remote_present FROM remote_messages WHERE id='a-target'").fetchone()[0] == 1
+    with pytest.raises(ProductionPlanError):
+        execute_production_plan(config, source, "test", adapter_factory=gmail_factory(fake))
+    if uncertain:
+        fresh = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
+        with pytest.raises(ProductionPlanError, match="unresolved"):
+            execute_production_plan(config, fresh, "test", adapter_factory=gmail_factory(fake))
+    assert fake.deletes == ["target"]
 
 
 def test_production_executes_only_filtered_source_plan_and_preserves_history(

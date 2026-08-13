@@ -14,6 +14,7 @@ from mailarchive.cli import build_parser, main
 from mailarchive.config import load_config
 from mailarchive.db import account_id, connect, initialize
 from mailarchive.ingest import ingest_bytes
+from mailarchive.models import AccountConfig
 
 
 def test_cli_help_works(capsys: pytest.CaptureFixture[str]) -> None:
@@ -35,6 +36,52 @@ def test_remote_delete_is_explicit_dry_run_only() -> None:
     help_text = build_parser().format_help()
     assert "deletion-candidates" in help_text
     assert "remote-delete" in help_text.lower()
+
+
+def test_gmail_auth_and_auth_delete_use_separate_authorizers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "gmail.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "archive": {"root": str(tmp_path / "archive"), "timezone": "UTC"},
+                "database": {"path": str(tmp_path / "state.db")},
+                "accounts": {
+                    "gmail": {
+                        "kind": "gmail",
+                        "enabled": True,
+                        "remote_retention_days": 365,
+                        "required_verified_backups": 2,
+                        "config_ref": f"file:{tmp_path / 'readonly.json'}",
+                        "gmail": {
+                            "account_email": "user@example.test",
+                            "oauth_client_secret_file": "/tmp/client.json",
+                            "remote_delete_token_file": str(tmp_path / "delete.json"),
+                        },
+                    }
+                },
+            }
+        )
+    )
+    calls: list[str] = []
+
+    def readonly_authorize(_account: AccountConfig) -> str:
+        calls.append("readonly")
+        return "user@example.test"
+
+    def delete_authorize(_account: AccountConfig) -> str:
+        calls.append("delete")
+        return "user@example.test"
+
+    monkeypatch.setattr(
+        cli_module, "authorize", readonly_authorize
+    )
+    monkeypatch.setattr(cli_module, "authorize_delete", delete_authorize)
+    assert main(["gmail", "auth", "--account", "gmail", "--config", str(config_path)]) == 0
+    assert calls == ["readonly"]
+    assert main(["gmail", "auth-delete", "--account", "gmail", "--config", str(config_path)]) == 0
+    assert calls == ["readonly", "delete"]
 
 
 def test_db_init_and_status(config_file: Path, capsys: pytest.CaptureFixture[str]) -> None:
