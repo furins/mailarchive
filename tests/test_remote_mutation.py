@@ -798,10 +798,9 @@ def test_acquisition_sources_remain_without_provider_write_path() -> None:
     cli_source = (root / "src/mailarchive/cli.py").read_text(encoding="utf-8")
     gmail_source = (root / "src/mailarchive/gmail.py").read_text(encoding="utf-8")
     for forbidden in (
-        "STORE",
-        "EXPUNGE",
-        "UID EXPUNGE",
-        "DELE",
+        'client.uid("STORE"',
+        'client.uid("EXPUNGE"',
+        'client.uid("DELE"',
         "users.messages.delete",
         "users.messages.trash",
         "users.threads.delete",

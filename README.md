@@ -102,6 +102,11 @@ account's explicit `remote_deletion_enabled: true` setting, expires plans after 
 creates an immutable separate execution run, and stops on the first non-success. Provider-writing
 adapters are deliberately not implemented in this checkpoint.
 
+M12-B adds a dedicated injectable IMAP adapter only. It is still not selected by the default
+production factory. The adapter requires UIDPLUS and exact BODY.PEEK[] SHA-256 validation, then
+uses only an exact UID STORE of `\\Deleted` and exact UID EXPUNGE; global EXPUNGE and CLOSE are
+forbidden. Uncertain results are not retried.
+
 M1 stores each account's byte-unique message at
 `<archive.root>/mail/<account>/cur/<sha256>.eml`. The source is read in binary mode and
 the canonical file has precisely the same bytes. Reingesting identical bytes within an

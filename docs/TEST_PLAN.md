@@ -231,6 +231,14 @@ must touch only configuration, SQLite and canonical local files. Injected in-mem
 success, confirmed no-mutation failure, unknown-after-call halt, and stale plan rejection before
 an adapter call. No production provider is a test fixture.
 
+### M12-B IMAP injected adapter
+
+Scripted IMAP transports cover UIDPLUS refusal, exact UIDVALIDITY and remote hash checks,
+preexisting `\\Deleted`, exact UID STORE/UID EXPUNGE, already absent confirmation, and uncertain
+STORE/EXPUNGE observations. Disposable loopback Dovecot proves that an exact target disappears
+while unrelated normal and already-deleted messages survive, and local canonical/backup facts do
+not change. Default CLI wiring remains unavailable.
+
 ## 9. Recovery tests
 
 Periodically prove:

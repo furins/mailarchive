@@ -287,3 +287,14 @@ The fake state machine commits `started` before calling a fake adapter. Confirme
 failure and unknown outcomes are distinct; unknown is never retried and halts the run. A local
 fresh-policy and fingerprint revalidation rejects stale targets before a fake call. M12 exclusively
 owns any discussion or implementation of real provider writes.
+
+# ADR-022: Dedicated M12-B IMAP mutation capability
+
+M12-A remains frozen at `94acb8e02caf0f3336206025d0901ce9985504e4`. M12-B isolates the
+production-capable IMAP operation in `imap_mutation.py`; M3/M4 acquisition remains read-only.
+Construction performs local configuration and credential-reference validation only. The injected
+adapter takes the existing account/folder lock across connection through confirmation, requires
+UIDPLUS, validates UIDVALIDITY and exact BODY.PEEK[] SHA-256, and refuses a preexisting
+`\\Deleted` target. It may only issue UID STORE for the one planned UID followed by UID EXPUNGE
+for that UID. Global EXPUNGE and CLOSE are prohibited. The M12-A default production factory stays
+fail-closed until M12-E adds wiring and reconciliation.

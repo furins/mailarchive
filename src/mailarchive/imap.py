@@ -103,6 +103,11 @@ def _parse_uidvalidity(client: imaplib.IMAP4) -> int:
     return value
 
 
+def parse_uidvalidity(client: imaplib.IMAP4) -> int:
+    """Public strict UIDVALIDITY parser shared with the separate mutation adapter."""
+    return _parse_uidvalidity(client)
+
+
 @contextmanager
 def folder_lock(config: AppConfig, account: AccountConfig, folder: str) -> Generator[None]:
     import fcntl

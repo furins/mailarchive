@@ -18,16 +18,19 @@ from typing import cast
 import pytest
 import yaml
 
+from mailarchive.classification import ClassificationResult, apply_classification
 from mailarchive.config import load_config
 from mailarchive.db import connect
 from mailarchive.fastpath import FastPathWatcher, fast_path_status
 from mailarchive.imap import ImapAdapter, encode_mailbox_name
+from mailarchive.imap_mutation import ImapMutationAdapter
 from mailarchive.notmuch import (
     NotmuchAdapter,
     NotmuchError,
     SearchResult,
     search_canonical_messages,
 )
+from mailarchive.remote_mutation import execute_production_plan, plan_dry_run
 
 
 def _free_port() -> int:
@@ -191,6 +194,17 @@ def _snapshot(
             flags = tuple(flag for flag in imaplib.ParseFlags(metadata) if flag != b"\\Recent")
             result[int(uid)] = (flags, raw)
         return uidvalidity, result
+    finally:
+        client.logout()
+
+
+def _mark_deleted_fixture(port: int, uid: int) -> None:
+    """Fixture-only setup of an unrelated deleted message; never MailArchive code."""
+    client = imaplib.IMAP4("127.0.0.1", port)
+    try:
+        assert client.login("fixture", "fixture-password")[0] == "OK"
+        assert client.select('"INBOX"', readonly=False)[0] == "OK"
+        assert client.uid("STORE", str(uid), "+FLAGS.SILENT", r"(\Deleted)")[0] == "OK"
     finally:
         client.logout()
 
@@ -366,3 +380,103 @@ def test_dovecot_idle_fast_path_acquires_and_indexes_without_poll(
     thread.join(timeout=5)
     assert not thread.is_alive()
     assert fast_path_status(config)[0].effective_mode == "stopped"
+
+
+def test_dovecot_uidplus_exact_production_delete_preserves_unrelated_deleted(
+    config_file: Path, dovecot_loopback: tuple[int, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M12-B accepts only disposable loopback Dovecot through injected wiring."""
+    port, mail, _ = dovecot_loopback
+    target_raw = _raw("<target@test>", "target")
+    normal_raw = _raw("<normal@test>", "normal")
+    deleted_raw = _raw("<deleted@test>", "deleted")
+    for name, raw in (("target", target_raw), ("normal", normal_raw), ("deleted", deleted_raw)):
+        (mail / "new" / name).write_bytes(raw)
+    _uidvalidity, before = _snapshot(port)
+    deleted_uid = next(uid for uid, (_flags, raw) in before.items() if raw == deleted_raw)
+    _mark_deleted_fixture(port, deleted_uid)
+    values = yaml.safe_load(config_file.read_text())
+    values["accounts"]["test"]["remote_deletion_enabled"] = True
+    values["accounts"]["test"]["imap"] = {
+        "host": "127.0.0.1",
+        "port": port,
+        "username": "fixture",
+        "tls_mode": "INSECURE_LOOPBACK",
+        "folders": ["INBOX"],
+    }
+    config_file.write_text(yaml.safe_dump(values))
+    monkeypatch.setenv("MAILARCHIVE_TEST_SECRET", "fixture-password")
+    config = load_config(config_file)
+    acquired = ImapAdapter(config).sync("test", "INBOX")
+    target = next(
+        item.canonical_message
+        for item in acquired
+        if item.canonical_message.local_path.read_bytes() == target_raw
+    )
+    target = apply_classification(
+        config, target, ClassificationResult("ham", None, "fixture", "pytest")
+    )
+    local_before = target.local_path.read_bytes()
+    with connect(config.database.path) as db:
+        db.execute(
+            "UPDATE canonical_messages SET archived_at='2025-01-01T00:00:00+00:00' WHERE id=?",
+            (target.id,),
+        )
+        now = "2026-08-13T00:00:00+00:00"
+        for name in ("m12b-one", "m12b-two"):
+            db.execute(
+                """INSERT INTO backup_repositories(
+                name,kind,repository_ref,repository_identity,enabled,encryption_mode,
+                verification_policy,created_at,updated_at)
+                VALUES(?,'borg',?,?,1,'none','borg-archive-data-v1',?,?)""",
+                (name, f"/tmp/{name}", name, now, now),
+            )
+            repository = db.execute(
+                "SELECT id FROM backup_repositories WHERE name=?", (name,)
+            ).fetchone()[0]
+            db.execute(
+                """INSERT INTO backup_runs(
+                id,repository_id,started_at,completed_at,status,archive_name,
+                verification_status,verified_at)
+                VALUES(?,?,?,?,'succeeded',?,'verified',?)""",
+                (f"{name}-run", repository, now, now, name, now),
+            )
+            db.execute(
+                "INSERT INTO message_backup_evidence VALUES(?,?,1,1,?)",
+                (target.id, f"{name}-run", now),
+            )
+        db.commit()
+    client = imaplib.IMAP4("127.0.0.1", port)
+    try:
+        assert client.login("fixture", "fixture-password")[0] == "OK"
+        assert b"UIDPLUS" in b" ".join(cast(list[bytes], client.capability()[1])).upper()
+    finally:
+        client.logout()
+    source = int(cast(int, plan_dry_run(config, account="test", limit=1)["run_id"]))
+    run = execute_production_plan(
+        config, source, "test", adapter_factory=lambda cfg, name: ImapMutationAdapter(cfg, name)
+    )
+    _validity, after = _snapshot(port)
+    raws = [raw for _flags, raw in after.values()]
+    assert target_raw not in raws and normal_raw in raws and deleted_raw in raws
+    assert target.local_path.read_bytes() == local_before
+    with connect(config.database.path) as db:
+        deleted_remote = db.execute(
+            """SELECT r.remote_present,m.status,m.error_code
+            FROM remote_messages r JOIN remote_mutations m ON m.remote_message_id=r.id
+            WHERE m.mutation_run_id=?""",
+            (run,),
+        ).fetchone()
+        assert deleted_remote is not None and deleted_remote[0] == 0, tuple(deleted_remote or ())
+        assert (
+            db.execute("SELECT status FROM remote_mutation_runs WHERE id=?", (run,)).fetchone()[0]
+            == "completed"
+        )
+        assert db.execute("SELECT COUNT(*) FROM message_attachments").fetchone()[0] == 0
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM message_backup_evidence WHERE canonical_message_id=?",
+                (target.id,),
+            ).fetchone()[0]
+            == 2
+        )

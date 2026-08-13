@@ -108,6 +108,15 @@ It needs per-account opt-in, expires after 60 minutes, repeats M10 safety evalua
 and before each call, records `started` before a call, and halts on any non-success. M12-A has no
 provider-writing adapter, so explicit execution fails closed until later provider phases.
 
+### M12-B IMAP adapter checkpoint
+
+M12-A is frozen at `94acb8e02caf0f3336206025d0901ce9985504e4`. M12-B adds a dedicated,
+injectable IMAP mutation adapter but does not wire it into the default production CLI factory.
+It requires UIDPLUS, validates exact UIDVALIDITY, UID, and BODY.PEEK[] SHA-256 before one exact
+UID STORE of `\\Deleted` followed by UID EXPUNGE for that same UID. Global EXPUNGE and CLOSE after
+writable SELECT are forbidden. A preexisting `\\Deleted` target is a conflict; uncertain results
+are never retried automatically.
+
 ## 7. Rate limiting and blast-radius control
 
 When remote deletion is eventually enabled:

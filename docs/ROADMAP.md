@@ -220,7 +220,10 @@ Deliver:
 
 M12-A implements the provider-neutral authority chain only: explicit account opt-in, a 60-minute
 source-plan TTL, immutable production execution runs, fresh M10 revalidation, and serial
-started-before-call state transitions. Provider mutation adapters remain out of scope for M12-A.
+started-before-call state transitions. It is frozen at `94acb8e02caf0f3336206025d0901ce9985504e4`.
+M12-B adds an injectable dedicated IMAP adapter: UIDPLUS is mandatory, remote BODY.PEEK[] SHA-256
+must match before exact UID STORE/UID EXPUNGE, and global EXPUNGE/CLOSE are forbidden. Default CLI
+wiring remains fail-closed; Gmail, POP3, and reconciliation are later checkpoints.
 
 ## M13 — Operations
 
