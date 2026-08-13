@@ -304,7 +304,11 @@ def execute_fake(config: AppConfig, run_id: int, adapter: RemoteMutationAdapter)
                 details_json="{}",
             )
             db.commit()
-        result = adapter.delete(target)
+        try:
+            result = adapter.delete(target)
+        except Exception:
+            # Provider exception text can contain remote data; retain only a bounded category.
+            result = MutationResult("outcome-unknown", error_code="ADAPTER_EXCEPTION")
         _record_outcome(config, run_id, int(row["id"]), target, result)
         if result.outcome != "success-confirmed":
             return
