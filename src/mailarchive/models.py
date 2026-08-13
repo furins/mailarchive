@@ -9,6 +9,7 @@ from typing import Literal
 AccountKind = Literal["imap", "gmail", "pop3"]
 TlsMode = Literal["IMAPS", "STARTTLS", "INSECURE_LOOPBACK"]
 Pop3TlsMode = Literal["POP3S", "STARTTLS", "INSECURE_LOOPBACK"]
+BackupEncryptionMode = Literal["repokey", "repokey-blake2", "none"]
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,19 @@ class Pop3Config:
 
 
 @dataclass(frozen=True)
+class BackupRepositoryConfig:
+    """A named Borg 1.x destination; credentials remain environment references."""
+
+    name: str
+    enabled: bool
+    repository_ref: str
+    encryption_mode: BackupEncryptionMode
+    passphrase_env: str | None
+    verification_policy: str
+    command_timeout_seconds: int
+
+
+@dataclass(frozen=True)
 class AccountConfig:
     name: str
     kind: AccountKind
@@ -79,6 +93,7 @@ class AppConfig:
     archive: ArchiveConfig
     database: DatabaseConfig
     accounts: tuple[AccountConfig, ...]
+    backup_repositories: tuple[BackupRepositoryConfig, ...] = ()
 
 
 @dataclass(frozen=True)

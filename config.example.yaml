@@ -82,11 +82,20 @@ search:
   recoll_enabled: true
 
 backup:
-  required_verified_copies_default: 2
   repositories:
     local:
+      kind: borg
       enabled: true
-      repository_ref: external-secret-or-config
-    secondary:
+      repository_ref: /mnt/mailarchive-backup
+      encryption_mode: repokey-blake2
+      passphrase_env: MAILARCHIVE_BORG_LOCAL_PASSPHRASE
+      verification_policy: borg-archive-data-v1
+      command_timeout_seconds: 21600
+    remote:
+      kind: borg
       enabled: true
-      repository_ref: external-secret-or-config
+      repository_ref: ssh://backup@example.net/./mailarchive
+      encryption_mode: repokey-blake2
+      passphrase_env: MAILARCHIVE_BORG_REMOTE_PASSPHRASE
+      verification_policy: borg-archive-data-v1
+      command_timeout_seconds: 21600

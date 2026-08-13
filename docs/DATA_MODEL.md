@@ -180,7 +180,9 @@ verification_policy
 created_at
 ```
 
-Secrets SHALL not be embedded in `repository_ref` if avoidable.
+M9 adds `repository_identity`, `encryption_mode`, and `updated_at`. A configured name is bound
+to the real Borg repository ID on init/probe and cannot silently move to another repository.
+Secrets SHALL not be embedded in `repository_ref`.
 
 ## 11. backup_runs
 
@@ -197,6 +199,9 @@ verified_at
 details_json
 ```
 
+M9 additionally stores `manifest_sha256` and bounded failure details. A successful create is
+`unverified`; only a targeted inventory and Borg data check may make it `verified`.
+
 ## 12. message_backup_evidence
 
 If message-level evidence is needed:
@@ -210,6 +215,9 @@ recorded_at
 ```
 
 Implementation MAY optimize evidence by snapshot/range/inventory if it remains possible to prove whether a message was protected.
+
+M9 evidence is true only for a covered canonical object in a currently verified run. Evidence
+is per run; future retention logic must count distinct repositories, not runs.
 
 ## 13. deletion_evaluations
 

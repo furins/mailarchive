@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import NoReturn
 
 from mailarchive.attachments import AttachmentError, reconcile_attachments
+from mailarchive.borg import BorgError, backup_run, repo_init, restore_test, verify_run
+from mailarchive.borg import status as backup_status
 from mailarchive.classification import ClassificationResult, apply_classification
 from mailarchive.config import ConfigError, display_config, load_config
 from mailarchive.db import account_id, connect, initialize
@@ -158,6 +160,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     attachment_search.add_argument("--config", required=True)
     attachment_search.add_argument("--json", action="store_true")
+    backup = subcommands.add_parser("backup", help="Borg 1.x backup and verification")
+    backup_subcommands = backup.add_subparsers(dest="backup_command", required=True)
+    backup_repo = backup_subcommands.add_parser("repo", help="explicit Borg repository operations")
+    backup_repo_subcommands = backup_repo.add_subparsers(dest="backup_repo_command", required=True)
+    backup_init = backup_repo_subcommands.add_parser(
+        "init", help="initialize or safely probe one repository"
+    )
+    backup_init.add_argument("--repository", required=True)
+    backup_init.add_argument("--config", required=True)
+    backup_init.add_argument("--json", action="store_true")
+    backup_run_command = backup_subcommands.add_parser(
+        "run", help="create one controlled local snapshot archive"
+    )
+    backup_run_command.add_argument("--repository", required=True)
+    backup_run_command.add_argument("--config", required=True)
+    backup_run_command.add_argument("--json", action="store_true")
+    backup_verify = backup_subcommands.add_parser(
+        "verify", help="verify the exact archive anchored by one run"
+    )
+    backup_verify.add_argument("--run-id", required=True)
+    backup_verify.add_argument("--config", required=True)
+    backup_verify.add_argument("--json", action="store_true")
+    backup_restore = backup_subcommands.add_parser(
+        "restore-test", help="extract and validate into an empty directory"
+    )
+    backup_restore.add_argument("--run-id", required=True)
+    backup_restore.add_argument("--destination", required=True)
+    backup_restore.add_argument("--config", required=True)
+    backup_restore.add_argument("--json", action="store_true")
+    backup_local_status = backup_subcommands.add_parser(
+        "status", help="show local backup facts only"
+    )
+    backup_local_status.add_argument("--config", required=True)
+    backup_local_status.add_argument("--json", action="store_true")
     return parser
 
 
@@ -174,7 +210,7 @@ def main(argv: list[str] | None = None) -> int:
             _emit({"valid": True, "config": display_config(config)}, args.json)
             return 0
         if args.command == "db":
-            initialize(config.database.path, config.accounts)
+            initialize(config.database.path, config.accounts, config.backup_repositories)
             _emit({"initialized": True, "database_path": str(config.database.path)}, args.json)
             return 0
         if args.command == "status":
@@ -372,6 +408,30 @@ def main(argv: list[str] | None = None) -> int:
                 args.json,
             )
             return 0
+        if args.command == "backup":
+            if args.backup_command == "status":
+                _emit(backup_status(config), args.json)
+                return 0
+            if args.backup_command == "repo":
+                _emit(
+                    {
+                        "repository": args.repository,
+                        "repository_identity": repo_init(config, args.repository),
+                    },
+                    args.json,
+                )
+                return 0
+            if args.backup_command == "run":
+                run_id = backup_run(config, args.repository)
+                _emit({"run_id": run_id, "created": True, "verified": False}, args.json)
+                return 0
+            if args.backup_command == "verify":
+                verify_run(config, args.run_id)
+                _emit({"run_id": args.run_id, "verified": True}, args.json)
+                return 0
+            restore_test(config, args.run_id, Path(args.destination))
+            _emit({"run_id": args.run_id, "restore_test": "succeeded"}, args.json)
+            return 0
         if args.command == "attachments":
             initialize(config.database.path, config.accounts)
             if args.attachments_command == "extract":
@@ -534,6 +594,7 @@ def main(argv: list[str] | None = None) -> int:
         NotmuchError,
         AttachmentError,
         RecollError,
+        BorgError,
         OSError,
         sqlite3.DatabaseError,
     ) as error:

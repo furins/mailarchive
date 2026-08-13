@@ -17,8 +17,68 @@ def test_database_initializes_idempotently(config_file: Path) -> None:
     initialize(config.database.path, config.accounts)
     initialize(config.database.path, config.accounts)
     with connect(config.database.path) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 9
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 10
         assert connection.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 1
+
+
+def test_real_v9_to_v10_preserves_m8_attachment_graph(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Upgrade an already-existing complete M8 v9 database, rather than a fresh database."""
+    config = load_config(config_file)
+    original = database.MIGRATIONS
+    monkeypatch.setattr(database, "MIGRATIONS", original[:9])
+    initialize(config.database.path, config.accounts)
+    now = utc_now()
+    with connect(config.database.path) as db:
+        account = account_id(db, "test")
+        assert account is not None
+        digest = "a" * 64
+        db.execute(
+            """INSERT INTO canonical_messages(id,account_id,sha256,local_path,size_bytes,downloaded_at,
+            archived_at,storage_state,quarantined_at,integrity_status,integrity_verified_at,created_at)
+            VALUES(?,?,?,?,?,?,?,'archived',NULL,'verified',?,?)""",
+            ("m8-canonical", account, digest, "/tmp/m8.eml", 1, now, now, now, now),
+        )
+        db.execute(
+            "INSERT INTO attachments(id,sha256,size_bytes,content_path,first_seen_at) VALUES(?,?,?,?,?)",
+            ("b" * 64, "b" * 64, 2, "/tmp/blob", now),
+        )
+        db.execute(
+            "INSERT INTO message_attachments VALUES(?,?,?,?,?,?)",
+            ("m8-canonical", "b" * 64, 0, "fixture.bin", "attachment", "application/octet-stream"),
+        )
+        db.execute(
+            """INSERT INTO attachment_extractions(canonical_message_id,source_sha256,status,
+            attachment_count,extracted_at,last_error_kind,updated_at) VALUES(?,?,'success',1,?,NULL,?)""",
+            ("m8-canonical", digest, now, now),
+        )
+        db.execute(
+            """INSERT INTO classifications(canonical_message_id,classification,reason,classifier,
+            manual_override,classified_at) VALUES(?,'ham','fixture','pytest',0,?)""",
+            ("m8-canonical", now),
+        )
+        insert_audit_event(db, actor="pytest", event_type="fixture.v9", result="success")
+        db.commit()
+    monkeypatch.setattr(database, "MIGRATIONS", original)
+    initialize(config.database.path, config.accounts)
+    initialize(config.database.path, config.accounts)
+    with connect(config.database.path) as db:
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 10
+        assert db.execute("SELECT COUNT(*) FROM attachments").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM message_attachments").fetchone()[0] == 1
+        assert db.execute("SELECT status FROM attachment_extractions").fetchone()[0] == "success"
+        for table in (
+            "backup_repositories",
+            "backup_runs",
+            "message_backup_evidence",
+            "backup_restore_tests",
+        ):
+            assert db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+        assert db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 def test_m3_schema_v4_upgrades_to_v5_without_changing_remote_links(
@@ -49,7 +109,7 @@ def test_m3_schema_v4_upgrades_to_v5_without_changing_remote_links(
     initialize(config.database.path, config.accounts)
     initialize(config.database.path, config.accounts)
     with connect(config.database.path) as connection:
-        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 9
+        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 10
         assert connection.execute(
             "SELECT name FROM sqlite_master WHERE name='fast_path_health'"
         ).fetchone()
@@ -92,7 +152,7 @@ def test_real_v5_to_v6_preserves_imap_identity_links_and_health(
     initialize(config.database.path, config.accounts)
     initialize(config.database.path, config.accounts)
     with connect(config.database.path) as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 9
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 10
         assert tuple(
             db.execute(
                 "SELECT id,provider_kind,remote_folder,uidvalidity,remote_uid FROM remote_messages"
@@ -160,7 +220,7 @@ def test_v7_rebuild_preserves_gmail_label_foreign_key_graph(
     monkeypatch.setattr(database, "MIGRATIONS", original)
     initialize(config.database.path, config.accounts)
     with connect(config.database.path) as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 9
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 10
         assert tuple(
             db.execute(
                 "SELECT remote_message_id,account_id,label_id FROM gmail_message_labels"
@@ -267,11 +327,13 @@ def test_v8_to_v9_preserves_state_and_adds_attachment_constraints(
     initialize(config.database.path, config.accounts)
     initialize(config.database.path, config.accounts)
     with connect(config.database.path) as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 9
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 10
         assert db.execute("SELECT id FROM canonical_messages").fetchone()[0] == "v8-message"
         assert db.execute("SELECT classification FROM classifications").fetchone()[0] == "ham"
         assert db.execute("SELECT name FROM sqlite_master WHERE name='attachments'").fetchone()
-        assert db.execute("SELECT name FROM sqlite_master WHERE name='message_attachments'").fetchone()
+        assert db.execute(
+            "SELECT name FROM sqlite_master WHERE name='message_attachments'"
+        ).fetchone()
         assert db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert not db.execute("PRAGMA foreign_key_check").fetchall()
 

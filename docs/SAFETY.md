@@ -63,6 +63,13 @@ A backup SHALL count toward deletion safety only when the system has evidence th
 
 The design SHOULD support at least two independently tracked verified backup destinations.
 
+M9 binds each configured Borg name to its physical repository identity. It backs up only finalized
+archived/quarantined canonical bytes, their referenced attachment blobs, and an online SQLite
+snapshot. Pending objects and rebuildable indexes are excluded. Verification anchors a deterministic
+manifest SHA-256, checks every regular archive file SHA-256, and runs Borg verify-data. Any later
+failed re-verification revokes positive message evidence. Borg keys and passphrases are operator
+recovery material and are never backed up into that same MailArchive dataset.
+
 ## 6. Separation of duties in CLI
 
 Candidate computation and deletion execution SHALL be different commands and code paths.
