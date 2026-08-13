@@ -1,8 +1,4 @@
-"""M11 local planning plus an injected-fake-only mutation state machine.
-
-No production network-writing adapter exists here.  The CLI calls ``plan_dry_run``
-only; tests may pass an in-memory adapter to ``execute_fake`` directly.
-"""
+"""M11 planning and M12-A provider-neutral production execution foundation."""
 # ruff: noqa: E501
 
 from __future__ import annotations
@@ -18,10 +14,6 @@ from typing import Protocol, cast
 from mailarchive.db import connect, insert_audit_event, utc_now
 from mailarchive.models import AppConfig
 from mailarchive.retention import POLICY_VERSION, evaluate_all
-
-
-class ProductionExecutionUnavailable(RuntimeError):
-    """Production deletion is intentionally not constructible in M11."""
 
 
 @dataclass(frozen=True)
@@ -123,12 +115,8 @@ class ProductionPlanError(RuntimeError):
 
 
 def production_adapter_factory(config: AppConfig, account_name: str) -> RemoteMutationAdapter:
-    """M12-A deliberately has no production provider-writing adapter."""
+    """M12-A deliberately has no provider adapter; factories must be local/no-network."""
     raise ProductionPlanError("production provider adapter not implemented in M12-A")
-
-
-def production_adapter() -> RemoteMutationAdapter:
-    raise ProductionExecutionUnavailable("production remote deletion is unavailable before M12")
 
 
 def _target(row: sqlite3.Row) -> DeletionTarget:
@@ -289,8 +277,17 @@ def _planned_target(db: sqlite3.Connection, mutation_id: int) -> DeletionTarget:
     return _target(row)
 
 
-def _still_current(config: AppConfig, target: DeletionTarget, fingerprint: str) -> bool:
-    fresh = {str(item["remote_message_id"]): item for item in evaluate_all(config)}
+def _still_current(
+    config: AppConfig,
+    target: DeletionTarget,
+    fingerprint: str,
+    fresh_report: dict[str, object] | None = None,
+) -> bool:
+    fresh = (
+        {str(item["remote_message_id"]): item for item in evaluate_all(config)}
+        if fresh_report is None
+        else {target.remote_message_id: fresh_report}
+    )
     report = fresh.get(target.remote_message_id)
     if report is None or not bool(report["eligible"]):
         return False
@@ -307,6 +304,8 @@ def _still_current(config: AppConfig, target: DeletionTarget, fingerprint: str) 
     return (
         row is not None
         and bool(row["remote_present"])
+        and str(report.get("remote_message_id")) == target.remote_message_id
+        and str(report.get("canonical_id")) == target.canonical_message_id
         and _target(row).fingerprint() == fingerprint
     )
 
@@ -393,13 +392,32 @@ def execute_production_plan(
             raise ProductionPlanError(
                 "source plan is not explicitly limited to the requested account"
             )
-        requested_at = datetime.fromisoformat(str(source["requested_at"])).astimezone(UTC)
-        if now - requested_at > PLAN_TTL:
+        if db.execute(
+            "SELECT 1 FROM remote_mutation_runs WHERE mode='production-execute' AND source_plan_run_id=?",
+            (source_plan_run_id,),
+        ).fetchone() is not None:
+            raise ProductionPlanError("source plan already has a production execution")
+        try:
+            requested_at = datetime.fromisoformat(str(source["requested_at"]))
+        except ValueError as error:
+            raise ProductionPlanError("source plan has an invalid requested_at timestamp") from error
+        if requested_at.tzinfo is None or requested_at.astimezone(UTC) > now:
+            raise ProductionPlanError("source plan has an invalid requested_at timestamp")
+        if now - requested_at.astimezone(UTC) > PLAN_TTL:
             raise ProductionPlanError("source plan expired; create a new dry-run")
-        if int(source["selected_count"]) > min(
-            int(source["effective_max_per_run"]), config.remote_deletion.max_per_run
+        selected = int(source["selected_count"])
+        limits = (
+            int(source["effective_max_per_run"]),
+            int(source["effective_max_per_account"]),
+            config.remote_deletion.max_per_run,
+            config.remote_deletion.max_per_account,
+        )
+        if any(selected > limit for limit in limits) or (
+            int(source["effective_max_per_run"]) > config.remote_deletion.max_per_run
+            or int(source["effective_max_per_account"])
+            > config.remote_deletion.max_per_account
         ):
-            raise ProductionPlanError("source plan exceeds current global safety limit")
+            raise ProductionPlanError("source plan exceeds current safety limit")
         rows = db.execute(
             "SELECT * FROM remote_mutations WHERE mutation_run_id=? ORDER BY id",
             (source_plan_run_id,),
@@ -414,6 +432,15 @@ def execute_production_plan(
         configured_account_id = int(account_row[0])
         if any(int(row["account_id"]) != configured_account_id for row in rows):
             raise ProductionPlanError("source plan contains another account")
+        placeholders = ",".join("?" for _ in rows)
+        unresolved = db.execute(
+            f"""SELECT 1 FROM remote_mutations m JOIN remote_mutation_runs r ON r.id=m.mutation_run_id
+            WHERE r.mode='production-execute' AND m.remote_message_id IN ({placeholders})
+              AND m.status IN ('started','unknown')""",
+            tuple(str(row["remote_message_id"]) for row in rows),
+        ).fetchone()
+        if unresolved is not None:
+            raise ProductionPlanError("target has unresolved destructive production state")
         # Fresh M10 before cloning; never reuse prior plan eligibility.
         fresh = {
             str(item["remote_message_id"]): item
@@ -423,6 +450,17 @@ def execute_production_plan(
             not bool(fresh.get(str(row["remote_message_id"]), {}).get("eligible")) for row in rows
         ):
             raise ProductionPlanError("source plan became stale or ineligible")
+        for row in rows:
+            target = _planned_target(db, int(row["id"]))
+            report = fresh[str(row["remote_message_id"])]
+            if (
+                not _still_current(
+                    config, target, str(row["target_fingerprint_sha256"]), report
+                )
+            ):
+                raise ProductionPlanError("source plan target fingerprint or identity is stale")
+        # Required to be a local, non-network factory preflight in all future phases.
+        adapter = adapter_factory(config, account_name)
         created = utc_now()
         run = db.execute(
             """INSERT INTO remote_mutation_runs(requested_at,mode,status,account_filter,
@@ -477,7 +515,6 @@ def execute_production_plan(
             ),
         )
         db.commit()
-    adapter = adapter_factory(config, account_name)
     _execute_serial(config, production_run_id, adapter)
     return production_run_id
 

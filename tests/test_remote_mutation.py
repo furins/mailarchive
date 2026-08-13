@@ -20,6 +20,7 @@ from mailarchive.remote_mutation import (
     MutationResult,
     ProductionPlanError,
     ProviderDeletionTarget,
+    RemoteMutationAdapter,
     _normalize_result,  # pyright: ignore[reportPrivateUsage]
     execute_fake,
     execute_production_plan,
@@ -77,7 +78,7 @@ class UnknownAfterCallAdapter:
         with connect(self.database_path) as db:
             self.started_was_committed = (
                 db.execute(
-                    "SELECT status FROM remote_mutations WHERE remote_message_id=?",
+                    "SELECT status FROM remote_mutations WHERE remote_message_id=? ORDER BY dry_run ASC LIMIT 1",
                     (target.remote_message_id,),
                 ).fetchone()[0]
                 == "started"
@@ -127,10 +128,10 @@ class ProductionAdapter:
 
 
 class ProductionFactory:
-    def __init__(self, adapter: ProductionAdapter) -> None:
+    def __init__(self, adapter: RemoteMutationAdapter) -> None:
         self.adapter = adapter
 
-    def __call__(self, config: AppConfig, account_name: str) -> ProductionAdapter:
+    def __call__(self, config: AppConfig, account_name: str) -> RemoteMutationAdapter:
         return self.adapter
 
 
@@ -318,6 +319,71 @@ def test_production_failure_halts_and_does_not_call_later_target(config_file: Pa
             ).fetchone()[0]
             == 1
         )
+
+
+def test_production_unknown_is_started_first_halts_and_blocks_new_plan(config_file: Path) -> None:
+    config, _ = eligible_remote(config_file, remote_id="first", body=b"first")
+    eligible_remote(config_file, remote_id="second", body=b"second", remote_uid=10)
+    config = production_enabled(config)
+    source_id = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
+    adapter = UnknownAfterCallAdapter(config.database.path)
+    production_id = execute_production_plan(
+        config, source_id, "test", adapter_factory=ProductionFactory(adapter)
+    )
+    assert adapter.started_was_committed and [target.remote_message_id for target in adapter.calls] == ["first"]
+    with connect(config.database.path) as db:
+        assert db.execute("SELECT status FROM remote_mutation_runs WHERE id=?", (production_id,)).fetchone()[0] == "halted"
+        assert db.execute("SELECT error_code FROM remote_mutations WHERE mutation_run_id=? ORDER BY id", (production_id,)).fetchone()[0] == "ADAPTER_EXCEPTION"
+        assert db.execute("SELECT remote_present FROM remote_messages WHERE id='first'").fetchone()[0] == 1
+    fresh_plan = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
+    with pytest.raises(ProductionPlanError, match="unresolved"):
+        execute_production_plan(config, fresh_plan, "test", adapter_factory=ProductionFactory(adapter))
+
+
+@pytest.mark.parametrize("field,value", [("remote_uid", 10), ("provider_message_id", "changed")])
+def test_production_preflight_rejects_changed_target_without_run(
+    config_file: Path, field: str, value: object
+) -> None:
+    kind = "imap" if field == "remote_uid" else "gmail"
+    config, _ = eligible_remote(
+        config_file, provider_kind=kind, provider_message_id="gmail-a" if kind == "gmail" else ""
+    )
+    config = production_enabled(config)
+    source_id = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
+    with connect(config.database.path) as db:
+        db.execute(f"UPDATE remote_messages SET {field}=?", (value,))
+        db.commit()
+    adapter = ProductionAdapter(config.database.path, MutationResult("success-confirmed", True))
+    with pytest.raises(ProductionPlanError, match="fingerprint"):
+        execute_production_plan(config, source_id, "test", adapter_factory=ProductionFactory(adapter))
+    assert adapter.calls == []
+    with connect(config.database.path) as db:
+        assert db.execute("SELECT COUNT(*) FROM remote_mutation_runs WHERE mode='production-execute'").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("limit_field", ["max_per_run", "max_per_account"])
+def test_production_rejects_current_stricter_limit(config_file: Path, limit_field: str) -> None:
+    config, _ = eligible_remote(config_file, remote_id="first", body=b"first")
+    eligible_remote(config_file, remote_id="second", body=b"second", remote_uid=10)
+    config = production_enabled(config)
+    source_id = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
+    config = replace(config, remote_deletion=replace(config.remote_deletion, **{limit_field: 1}))
+    adapter = ProductionAdapter(config.database.path, MutationResult("success-confirmed", True))
+    with pytest.raises(ProductionPlanError, match="safety limit"):
+        execute_production_plan(config, source_id, "test", adapter_factory=ProductionFactory(adapter))
+    assert adapter.calls == []
+    with connect(config.database.path) as db:
+        assert db.execute("SELECT COUNT(*) FROM remote_mutation_runs WHERE mode='production-execute'").fetchone()[0] == 0
+
+
+def test_default_m12_a_factory_does_not_consume_plan(config_file: Path) -> None:
+    config, _ = eligible_remote(config_file)
+    config = production_enabled(config)
+    source_id = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
+    with pytest.raises(ProductionPlanError, match="not implemented"):
+        execute_production_plan(config, source_id, "test")
+    with connect(config.database.path) as db:
+        assert db.execute("SELECT COUNT(*) FROM remote_mutation_runs WHERE mode='production-execute'").fetchone()[0] == 0
 
 
 def test_dry_run_anchors_fresh_evaluation_and_exact_imap_target(config_file: Path) -> None:

@@ -174,19 +174,7 @@ def _gmail_config(account: Mapping[object, object], label: str, archive_root: Pa
     poll = values.get("poll_interval_seconds", 90)
     if isinstance(poll, bool) or not isinstance(poll, int) or not 60 <= poll <= 120:
         raise ConfigError(f"{label}.gmail.poll_interval_seconds must be 60..120")
-    delete_token = values.get("remote_delete_token_file")
-    if delete_token is not None and not isinstance(delete_token, str):
-        raise ConfigError(f"{label}.gmail.remote_delete_token_file must be a path string")
-    return GmailConfig(
-        email,
-        client_file,
-        poll,
-        None
-        if delete_token is None
-        else _absolute_secret_path(
-            delete_token, f"{label}.gmail.remote_delete_token_file", archive_root
-        ),
-    )
+    return GmailConfig(email, client_file, poll)
 
 
 def _pop3_config(account: Mapping[object, object], label: str) -> Pop3Config:

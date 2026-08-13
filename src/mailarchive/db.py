@@ -529,6 +529,19 @@ def _migration_12(connection: sqlite3.Connection) -> None:
 
 def _migration_13(connection: sqlite3.Connection) -> None:
     """M12 explicit production-plan traceability and account-local opt-in."""
+    # Keep child FK declarations pointing to the final ``accounts`` name.  The
+    # migration runner has disabled FK enforcement for this replacement.
+    connection.execute("""CREATE TABLE accounts_v13_replacement (
+        id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+        kind TEXT NOT NULL CHECK(kind IN ('imap','gmail','pop3')),
+        enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+        remote_retention_days INTEGER CHECK(remote_retention_days IS NULL OR remote_retention_days >= 0),
+        remote_deletion_enabled INTEGER NOT NULL DEFAULT 0 CHECK(remote_deletion_enabled IN (0,1)),
+        required_verified_backups INTEGER NOT NULL CHECK(required_verified_backups >= 0),
+        config_ref TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+    connection.execute("INSERT INTO accounts_v13_replacement SELECT * FROM accounts")
+    connection.execute("DROP TABLE accounts")
+    connection.execute("ALTER TABLE accounts_v13_replacement RENAME TO accounts")
     # SQLite cannot add these constraints/foreign keys in place.  Renaming the
     # originals preserves every M11 row while replacement tables add v13 facts.
     connection.execute("ALTER TABLE remote_mutations RENAME TO remote_mutations_v12")
@@ -682,12 +695,12 @@ def initialize(
                 INSERT INTO accounts (
                     name, kind, enabled, remote_retention_days, remote_deletion_enabled,
                     required_verified_backups, config_ref, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     kind = excluded.kind,
                     enabled = excluded.enabled,
                     remote_retention_days = excluded.remote_retention_days,
-                    remote_deletion_enabled = 0,
+                    remote_deletion_enabled = excluded.remote_deletion_enabled,
                     required_verified_backups = excluded.required_verified_backups,
                     config_ref = excluded.config_ref,
                     updated_at = excluded.updated_at
@@ -697,6 +710,7 @@ def initialize(
                     account.kind,
                     account.enabled,
                     account.remote_retention_days,
+                    account.remote_deletion_enabled,
                     account.required_verified_backups,
                     account.config_ref,
                     now,

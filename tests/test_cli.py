@@ -225,7 +225,43 @@ def test_ingest_json_output(
     assert '"canonical_message_id"' in output
 
 
-def test_cli_has_no_execute_remote_command() -> None:
-    help_text = build_parser().format_help().lower()
-    assert "--execute" not in help_text
-    assert "network" not in help_text
+def test_remote_delete_cli_requires_one_explicit_mode(config_file: Path) -> None:
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["remote-delete", "--config", str(config_file)])
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["remote-delete", "--dry-run", "--execute-plan", "1", "--config", str(config_file)]
+        )
+    with pytest.raises(SystemExit):
+        main(["remote-delete", "--execute-plan", "1", "--config", str(config_file)])
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "remote-delete", "--execute-plan", "1", "--account", "test", "--limit", "1",
+                "--config", str(config_file),
+            ]
+        )
+    assert main(["remote-delete", "--dry-run", "--limit", "1", "--config", str(config_file)]) == 0
+
+
+def test_execute_plan_default_m12_a_factory_leaves_no_production_run(
+    config_file: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mailarchive.remote_mutation import plan_dry_run
+
+    config = load_config(config_file)
+    initialize(config.database.path, config.accounts)
+    # An empty source plan is enough to prove parser gate behavior, while provider
+    # construction is separately covered by the production-engine test.
+    source = plan_dry_run(config, account="test")
+    with pytest.raises(SystemExit) as result:
+        main(
+            [
+                "remote-delete", "--execute-plan", str(source["run_id"]), "--account", "test",
+                "--config", str(config_file),
+            ]
+        )
+    assert result.value.code == 2
+    error = capsys.readouterr().err.lower()
+    assert "production" in error or "source" in error
