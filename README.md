@@ -87,6 +87,13 @@ canonical file SHA-256. Local holds use
 `mailarchive retention hold|release --canonical-id ID --kind keep-online|legal-hold --reason TEXT`.
 No report, control, or status command contacts a provider or Borg.
 
+## M11 remote-delete dry run
+
+`mailarchive remote-delete --dry-run --config CONFIG` performs a fresh local M10
+evaluation and appends an exact, rate-limited target snapshot. It cannot execute a
+provider mutation: M11 has no `--execute` command, write-capable adapter, or Gmail
+write scope. `remote_deletion.max_per_run` and `max_per_account` both default to 10.
+
 M1 stores each account's byte-unique message at
 `<archive.root>/mail/<account>/cur/<sha256>.eml`. The source is read in binary mode and
 the canonical file has precisely the same bytes. Reingesting identical bytes within an

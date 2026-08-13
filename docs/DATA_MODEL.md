@@ -257,6 +257,14 @@ provider_response_summary
 error_code
 ```
 
+### M11 mutation plans
+
+Schema v12 adds `remote_mutation_runs` and expands `remote_mutations` into an append-only
+target snapshot. Rows retain the exact eligible M10 `deletion_evaluation_id`, account/canonical
+identity, provider identity fields, canonical SHA-256 and a versioned target fingerprint. Run
+modes are `dry-run` and test-only `fake-execute`; production authorization is not stored because
+it is always false in M11. Status is bounded to planned/dry-run/started/succeeded/failed/unknown.
+
 ## 15. audit_events
 
 ```text

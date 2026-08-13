@@ -21,6 +21,7 @@ from mailarchive.models import (
     GmailConfig,
     ImapConfig,
     Pop3Config,
+    RemoteDeletionConfig,
     RetentionConfig,
 )
 from mailarchive.safety import REMOTE_DELETION_DEFAULT, redact_secret_reference
@@ -324,7 +325,10 @@ def load_config(path: Path) -> AppConfig:
             account, "remote_deletion_enabled", label, REMOTE_DELETION_DEFAULT
         )
         if remote_deletion_enabled:
-            raise ConfigError(f"{label}.remote_deletion_enabled is unsupported in M0")
+            raise ConfigError(
+                f"{label}.remote_deletion_enabled: production remote deletion is unavailable "
+                "before M12"
+            )
         config_ref = _required_string(account, "config_ref", label)
         gmail = None
         pop3 = None
@@ -359,12 +363,24 @@ def load_config(path: Path) -> AppConfig:
         )
     if not accounts:
         raise ConfigError("accounts must contain at least one account")
+    remote_deletion_values = _mapping(values.get("remote_deletion", {}), "remote_deletion")
+    max_per_run = remote_deletion_values.get("max_per_run", 10)
+    max_per_account = remote_deletion_values.get("max_per_account", 10)
+    if isinstance(max_per_run, bool) or not isinstance(max_per_run, int) or max_per_run < 1:
+        raise ConfigError("remote_deletion.max_per_run must be a positive integer")
+    if (
+        isinstance(max_per_account, bool)
+        or not isinstance(max_per_account, int)
+        or max_per_account < 1
+    ):
+        raise ConfigError("remote_deletion.max_per_account must be a positive integer")
     return AppConfig(
         archive=ArchiveConfig(root=archive_root, timezone=timezone),
         database=DatabaseConfig(path=Path(_required_string(database_values, "path", "database"))),
         accounts=tuple(accounts),
         backup_repositories=_backup_repositories(values, archive_root),
         retention=RetentionConfig(default_days, default_backups),
+        remote_deletion=RemoteDeletionConfig(max_per_run, max_per_account),
     )
 
 
@@ -377,6 +393,10 @@ def display_config(config: AppConfig) -> dict[str, object]:
         "retention": {
             "remote_retention_days_default": config.retention.remote_retention_days_default,
             "required_verified_backups_default": config.retention.required_verified_backups_default,
+        },
+        "remote_deletion": {
+            "max_per_run": config.remote_deletion.max_per_run,
+            "max_per_account": config.remote_deletion.max_per_account,
         },
         "accounts": [
             {

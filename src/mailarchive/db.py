@@ -492,6 +492,36 @@ def _migration_11(connection: sqlite3.Connection) -> None:
     connection.execute("CREATE INDEX deletion_evaluations_run_remote ON deletion_evaluations(evaluation_run_id, remote_message_id)")
 
 
+def _migration_12(connection: sqlite3.Connection) -> None:
+    """M11 append-only dry-run/fake execution state, with no authorization switch."""
+    connection.execute("""CREATE TABLE remote_mutation_runs (
+        id INTEGER PRIMARY KEY, requested_at TEXT NOT NULL, completed_at TEXT,
+        mode TEXT NOT NULL CHECK(mode IN ('dry-run','fake-execute')),
+        status TEXT NOT NULL CHECK(status IN ('planned','completed','halted')),
+        account_filter TEXT, requested_limit INTEGER,
+        effective_max_per_run INTEGER NOT NULL CHECK(effective_max_per_run>=1),
+        effective_max_per_account INTEGER NOT NULL CHECK(effective_max_per_account>=1),
+        eligible_count INTEGER NOT NULL CHECK(eligible_count>=0), selected_count INTEGER NOT NULL CHECK(selected_count>=0),
+        skipped_limit_count INTEGER NOT NULL CHECK(skipped_limit_count>=0), policy_version TEXT NOT NULL
+    )""")
+    connection.execute("""CREATE TABLE remote_mutations (
+        id INTEGER PRIMARY KEY, mutation_run_id INTEGER NOT NULL REFERENCES remote_mutation_runs(id),
+        deletion_evaluation_id INTEGER NOT NULL REFERENCES deletion_evaluations(id),
+        account_id INTEGER NOT NULL REFERENCES accounts(id), remote_message_id TEXT NOT NULL REFERENCES remote_messages(id),
+        canonical_message_id TEXT NOT NULL REFERENCES canonical_messages(id), provider_kind TEXT NOT NULL CHECK(provider_kind IN ('imap','gmail','pop3')),
+        operation TEXT NOT NULL CHECK(operation='delete'), remote_folder TEXT, uidvalidity INTEGER, remote_uid INTEGER,
+        provider_message_id TEXT, canonical_sha256 TEXT NOT NULL CHECK(length(canonical_sha256)=64),
+        target_fingerprint_sha256 TEXT NOT NULL CHECK(length(target_fingerprint_sha256)=64), dry_run INTEGER NOT NULL CHECK(dry_run IN (0,1)),
+        requested_at TEXT NOT NULL, started_at TEXT, completed_at TEXT,
+        status TEXT NOT NULL CHECK(status IN ('planned','dry-run','started','succeeded','failed','unknown')),
+        provider_response_summary TEXT, error_code TEXT,
+        UNIQUE(mutation_run_id,remote_message_id),
+        CHECK((provider_kind='imap' AND remote_folder IS NOT NULL AND uidvalidity IS NOT NULL AND remote_uid IS NOT NULL AND provider_message_id IS NULL)
+           OR (provider_kind IN ('gmail','pop3') AND provider_message_id IS NOT NULL AND remote_folder IS NULL AND uidvalidity IS NULL AND remote_uid IS NULL))
+    )""")
+    connection.execute("CREATE INDEX remote_mutations_run_status ON remote_mutations(mutation_run_id,status)")
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _migration_1),
     (2, _migration_2),
@@ -504,6 +534,7 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (9, _migration_9),
     (10, _migration_10),
     (11, _migration_11),
+    (12, _migration_12),
 )
 
 

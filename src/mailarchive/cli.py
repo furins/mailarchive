@@ -26,6 +26,7 @@ from mailarchive.ingest import IngestError, ingest_file
 from mailarchive.notmuch import NotmuchAdapter, NotmuchError, search_canonical_messages
 from mailarchive.pop3 import Pop3Adapter, Pop3Error
 from mailarchive.recoll import RecollAdapter, RecollError, search_attachments
+from mailarchive.remote_mutation import plan_dry_run
 from mailarchive.retention import evaluate_all, set_control
 
 
@@ -201,6 +202,16 @@ def build_parser() -> argparse.ArgumentParser:
     candidates.add_argument("--config", required=True)
     candidates.add_argument("--account")
     candidates.add_argument("--json", action="store_true")
+    remote_delete = subcommands.add_parser(
+        "remote-delete", help="plan local-only remote deletion dry-run"
+    )
+    remote_delete.add_argument(
+        "--dry-run", action="store_true", help="required; creates no provider connection"
+    )
+    remote_delete.add_argument("--account")
+    remote_delete.add_argument("--limit", type=int)
+    remote_delete.add_argument("--config", required=True)
+    remote_delete.add_argument("--json", action="store_true")
     retention = subcommands.add_parser(
         "retention", help="local-only retention policy controls and reports"
     )
@@ -247,6 +258,14 @@ def main(argv: list[str] | None = None) -> int:
                 item for item in evaluate_all(config, account=args.account) if item["eligible"]
             ]
             _emit(results, args.json)
+            return 0
+        if args.command == "remote-delete":
+            if not args.dry_run:
+                _error(
+                    "--dry-run is required; production remote deletion is unavailable before M12"
+                )
+            initialize(config.database.path, config.accounts, config.backup_repositories)
+            _emit(plan_dry_run(config, account=args.account, limit=args.limit), args.json)
             return 0
         if args.command == "retention":
             initialize(config.database.path, config.accounts, config.backup_repositories)

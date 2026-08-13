@@ -273,3 +273,17 @@ providers. Contradictory provider/account and remote/canonical-account facts fai
 
 Evaluation rows retain bounded ordered reason codes for explainability. Candidate eligibility is not
 deletion authorization; M10 provides no provider mutation or remote deletion interface.
+
+# ADR-021: M11 remote deletion is dry-run planning only
+
+M10 eligibility, M11 planned targets and production execution authorization are separate facts.
+Every M11 plan freshly re-evaluates M10, then records a deterministic versioned SHA-256 fingerprint
+of account/canonical identity and provider identity (IMAP folder/UIDVALIDITY/UID, Gmail Message.id,
+or POP3 UIDL). Limits are deterministic: account name plus remote ID ordering, max 10 per run and
+per account by default. Production execution is always unavailable in M11: there is no execute
+CLI, write OAuth scope, or network-writing adapter. Tests inject disposable in-process fakes only.
+
+The fake state machine commits `started` before calling a fake adapter. Confirmed no-mutation
+failure and unknown outcomes are distinct; unknown is never retried and halts the run. A local
+fresh-policy and fingerprint revalidation rejects stale targets before a fake call. M12 exclusively
+owns any discussion or implementation of real provider writes.

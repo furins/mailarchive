@@ -223,6 +223,14 @@ Verify:
 - retry does not delete an unrelated message;
 - crash recovery can determine prior outcome.
 
+### M11 dry-run and fake execution
+
+Assert each plan uses a fresh M10 evaluation and deterministic global/per-account limits, with
+versioned IMAP UIDVALIDITY+UID, Gmail Message.id, or POP3 UIDL target fingerprints. CLI dry-run
+must touch only configuration, SQLite and canonical local files. Injected in-memory adapters cover
+success, confirmed no-mutation failure, unknown-after-call halt, and stale plan rejection before
+an adapter call. No production provider is a test fixture.
+
 ## 9. Recovery tests
 
 Periodically prove:
