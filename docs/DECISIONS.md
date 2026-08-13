@@ -306,3 +306,12 @@ archive uses only `https://mail.google.com/` as Gmail mailbox scope. Its adapter
 profile at authorization and execution, addresses only exact Message.id, compares decoded RAW with
 the canonical SHA-256, issues at most one DELETE, and confirms absence with GET. Default CLI
 wiring remains deferred to M12-E.
+
+# ADR-024: Dedicated M12-D POP3 mutation session
+
+M12-D must not reuse M6's acquisition wire after DELE because its normal close sends QUIT. The
+dedicated injected mutation wire offers only explicit `quit_and_commit()` and
+`abort_without_quit()` lifecycle operations. It treats UIDL, not POP3 message number, as durable
+identity; each session resolves UIDL freshly, RETRs exact bytes, and hashes them before one DELE.
+Fresh UIDL observation is required after QUIT or any uncertainty, and no attempt retries DELE.
+Default production wiring and reconciliation remain M12-E work.

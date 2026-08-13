@@ -227,6 +227,10 @@ wiring remains fail-closed; Gmail, POP3, and reconciliation are later checkpoint
 M12-C adds an injectable Gmail adapter with a separate `https://mail.google.com/` credential;
 M5 remains `gmail.readonly`. It validates profile, Message.id and RAW SHA before one DELETE and
 mandatory GET confirmation. Default factory wiring remains disabled.
+M12-D adds an injectable dedicated POP3 adapter. It uses UIDL as exact identity, resolves the
+session-local message number freshly, requires RETR SHA-256 equality, then sends one DELE followed
+only by an explicit QUIT commit. Abort paths never send QUIT; fresh UIDL observation proves the
+outcome. Default production-factory wiring remains deferred to M12-E.
 
 ## M13 — Operations
 

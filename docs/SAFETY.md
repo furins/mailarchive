@@ -125,6 +125,15 @@ uses a separate optional 0600 token outside `archive.root` for `https://mail.goo
 injected adapter verifies profile identity and exact Message.id RAW SHA before one DELETE and GET
 confirmation; ambiguous requests are never retried. The default factory remains fail-closed.
 
+### M12-D POP3 adapter checkpoint
+
+M12-D keeps M6 acquisition read-only and adds a separate, injectable POP3 mutation wire. UIDL is
+the durable identity; a message number is resolved from a fresh UIDL listing in every session.
+The adapter RETRs and hashes that exact current number before one DELE. It commits only through an
+explicit QUIT, while `abort_without_quit()` closes transport without sending QUIT. A fresh UIDL
+observation is mandatory after the attempt, including a lost QUIT response; DELE is never retried.
+The default production factory remains fail-closed pending M12-E.
+
 ## 7. Rate limiting and blast-radius control
 
 When remote deletion is eventually enabled:
