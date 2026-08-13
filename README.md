@@ -76,6 +76,16 @@ uv run mailarchive status --config ./your-config.yaml --json
 provider implementation. `remote_retention_days: never` is the explicit never-delete
 configuration. Configuration summaries redact `config_ref` values.
 
+## M10 retention reports
+
+`mailarchive deletion-candidates --config CONFIG` and `mailarchive retention report --config CONFIG`
+are local policy reports only. A candidate is one proven remote identity linked to a canonical
+object; `eligible: true` never authorizes deletion (`execution_authorized` is always false in M10).
+The retention clock is 365 days from `archived_at` by default, requires two distinct currently
+verified Borg repository identities, and checks the current canonical file SHA-256. Local holds use
+`mailarchive retention hold|release --canonical-id ID --kind keep-online|legal-hold --reason TEXT`.
+No report, control, or status command contacts a provider or Borg.
+
 M1 stores each account's byte-unique message at
 `<archive.root>/mail/<account>/cur/<sha256>.eml`. The source is read in binary mode and
 the canonical file has precisely the same bytes. Reingesting identical bytes within an

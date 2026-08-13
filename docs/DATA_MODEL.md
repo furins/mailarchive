@@ -275,6 +275,13 @@ Audit events SHALL be append-oriented.
 
 ## 16. integrity invariants
 
+### M10 retention records
+
+`retention_controls` is a canonical-level local control row with `keep_online`, `legal_hold`, a
+bounded reason and timestamp. `deletion_evaluation_runs` and `deletion_evaluations` are append-only
+history, keyed by remote identity and recording policy inputs, ordered reason codes, deadline and
+the distinct verified repository count. M10 does not create `remote_mutations`.
+
 ## 17. fast_path_health (M4)
 
 One local operational row per `(account_id, remote_folder)` records only bounded safe facts:

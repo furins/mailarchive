@@ -5,6 +5,10 @@ archive:
 database:
   path: /srv/mailarchive/state/mailarchive.sqlite3
 
+retention:
+  remote_retention_days_default: 365
+  required_verified_backups_default: 2
+
 accounts:
   personal:
     kind: imap

@@ -470,6 +470,28 @@ def _migration_10(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migration_11(connection: sqlite3.Connection) -> None:
+    """M10 local-only retention controls and append-only policy evaluations."""
+    connection.execute("""CREATE TABLE retention_controls (
+        canonical_message_id TEXT PRIMARY KEY REFERENCES canonical_messages(id),
+        keep_online INTEGER NOT NULL DEFAULT 0 CHECK(keep_online IN (0,1)),
+        legal_hold INTEGER NOT NULL DEFAULT 0 CHECK(legal_hold IN (0,1)),
+        reason TEXT NOT NULL CHECK(length(reason) BETWEEN 1 AND 256), updated_at TEXT NOT NULL,
+        CHECK(keep_online=1 OR legal_hold=1))""")
+    connection.execute("""CREATE TABLE deletion_evaluation_runs (
+        id INTEGER PRIMARY KEY, evaluated_at TEXT NOT NULL, policy_version TEXT NOT NULL CHECK(policy_version='retention-v1'))""")
+    connection.execute("""CREATE TABLE deletion_evaluations (
+        id INTEGER PRIMARY KEY, evaluation_run_id INTEGER NOT NULL REFERENCES deletion_evaluation_runs(id),
+        remote_message_id TEXT NOT NULL REFERENCES remote_messages(id),
+        canonical_message_id TEXT REFERENCES canonical_messages(id), evaluated_at TEXT NOT NULL,
+        eligible INTEGER NOT NULL CHECK(eligible IN (0,1)), reason_codes_json TEXT NOT NULL,
+        policy_version TEXT NOT NULL CHECK(policy_version='retention-v1'), remote_retention_days INTEGER,
+        required_verified_backups INTEGER NOT NULL CHECK(required_verified_backups>=1),
+        verified_repository_count INTEGER NOT NULL CHECK(verified_repository_count>=0), retention_deadline TEXT,
+        CHECK(remote_retention_days IS NULL OR remote_retention_days>0))""")
+    connection.execute("CREATE INDEX deletion_evaluations_run_remote ON deletion_evaluations(evaluation_run_id, remote_message_id)")
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _migration_1),
     (2, _migration_2),
@@ -481,6 +503,7 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (8, _migration_8),
     (9, _migration_9),
     (10, _migration_10),
+    (11, _migration_11),
 )
 
 

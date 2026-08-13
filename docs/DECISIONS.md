@@ -259,3 +259,15 @@ later re-check, clears verified evidence. A restore test extracts only to an emp
 and validates manifest objects and SQLite integrity. Runs in one repository are one destination;
 M10 must count distinct verified repositories. There is no retention/deletion work, nor Borg
 prune/delete/compact/repair in M9. Borg key/passphrase recovery remains an external operator duty.
+
+# ADR-020: Local retention candidate policy (M10)
+
+M10 uses a 365-day default calculated exclusively from `archived_at`; the RFC822 Message-Date is
+irrelevant. It evaluates each proven remote identity, not Message-ID or just canonical bytes.
+Canonical-level keep-online and legal-hold controls conservatively block every linked identity, and
+quarantine is a hard blocker. A candidate requires the live archive file to resolve beneath managed
+`mail/` and exactly match its stored SHA-256, plus evidence from distinct currently verified Borg
+repository IDs. M9 evidence is consumed from SQLite only: M10 never invokes Borg or providers.
+
+Evaluation rows retain bounded ordered reason codes for explainability. Candidate eligibility is not
+deletion authorization; M10 provides no provider mutation or remote deletion interface.

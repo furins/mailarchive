@@ -188,6 +188,10 @@ Deliver:
 
 Still no remote deletion.
 
+Implemented as schema v11 local-only policy reporting: per-remote-identity evaluations, bounded
+reason codes, canonical holds, append-only history, exact file SHA-256 validation and distinct M9
+verified repository evidence counting. Candidate eligibility is explicitly not execution authority.
+
 ## M11 — Remote deletion adapter, dry-run first
 
 Deliver:

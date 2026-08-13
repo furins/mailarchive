@@ -26,6 +26,7 @@ from mailarchive.ingest import IngestError, ingest_file
 from mailarchive.notmuch import NotmuchAdapter, NotmuchError, search_canonical_messages
 from mailarchive.pop3 import Pop3Adapter, Pop3Error
 from mailarchive.recoll import RecollAdapter, RecollError, search_attachments
+from mailarchive.retention import evaluate_all, set_control
 
 
 def _emit(value: object, as_json: bool) -> None:
@@ -194,6 +195,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     backup_local_status.add_argument("--config", required=True)
     backup_local_status.add_argument("--json", action="store_true")
+    candidates = subcommands.add_parser(
+        "deletion-candidates", help="report local retention candidates; never deletes"
+    )
+    candidates.add_argument("--config", required=True)
+    candidates.add_argument("--account")
+    candidates.add_argument("--json", action="store_true")
+    retention = subcommands.add_parser(
+        "retention", help="local-only retention policy controls and reports"
+    )
+    retention_subcommands = retention.add_subparsers(dest="retention_command", required=True)
+    report = retention_subcommands.add_parser(
+        "report", help="append and report all local candidate evaluations"
+    )
+    report.add_argument("--config", required=True)
+    report.add_argument("--account")
+    report.add_argument("--eligible-only", action="store_true")
+    report.add_argument("--blocked-only", action="store_true")
+    report.add_argument("--json", action="store_true")
+    for action in ("hold", "release"):
+        command = retention_subcommands.add_parser(
+            action, help="set or release a local canonical retention control"
+        )
+        command.add_argument("--canonical-id", required=True)
+        command.add_argument("--kind", choices=("keep-online", "legal-hold"), required=True)
+        command.add_argument("--reason", required=True)
+        command.add_argument("--config", required=True)
+        command.add_argument("--json", action="store_true")
     return parser
 
 
@@ -212,6 +240,42 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "db":
             initialize(config.database.path, config.accounts, config.backup_repositories)
             _emit({"initialized": True, "database_path": str(config.database.path)}, args.json)
+            return 0
+        if args.command == "deletion-candidates":
+            initialize(config.database.path, config.accounts, config.backup_repositories)
+            results = [
+                item for item in evaluate_all(config, account=args.account) if item["eligible"]
+            ]
+            _emit(results, args.json)
+            return 0
+        if args.command == "retention":
+            initialize(config.database.path, config.accounts, config.backup_repositories)
+            if args.retention_command in {"hold", "release"}:
+                set_control(
+                    config,
+                    args.canonical_id,
+                    args.kind,
+                    args.reason,
+                    enabled=args.retention_command == "hold",
+                )
+                _emit(
+                    {
+                        "canonical_id": args.canonical_id,
+                        "kind": args.kind,
+                        "held": args.retention_command == "hold",
+                        "execution_authorized": False,
+                    },
+                    args.json,
+                )
+                return 0
+            if args.eligible_only and args.blocked_only:
+                _error("--eligible-only and --blocked-only are mutually exclusive")
+            results = evaluate_all(config, account=args.account)
+            if args.eligible_only:
+                results = [item for item in results if item["eligible"]]
+            if args.blocked_only:
+                results = [item for item in results if not item["eligible"]]
+            _emit(results, args.json)
             return 0
         if args.command == "status":
             initialized = config.database.path.exists()

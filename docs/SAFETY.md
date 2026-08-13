@@ -86,6 +86,13 @@ mailarchive remote-delete --execute
 
 A default invocation MUST NOT delete.
 
+### M10 candidate policy is not deletion authorization
+
+M10 computes local candidate-policy eligibility only. Its `deletion-candidates` and retention
+reports never contact a provider or Borg and always expose `execution_authorized=false`. Actual
+remote deletion remains a future M11/M12 operation requiring a separate explicit execution switch,
+dry-run behavior, provider-specific safeguards, and auditability.
+
 ## 7. Rate limiting and blast-radius control
 
 When remote deletion is eventually enabled:
