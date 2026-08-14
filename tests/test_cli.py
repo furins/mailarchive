@@ -124,7 +124,7 @@ def test_remote_mutations_status_is_local_and_global_status_is_truthful(
     assert main(["status", "--config", str(config_file), "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["remote_reconciliation_supported"] is True
-    assert payload["remote_mutation_supported"] is False
+    assert payload["remote_mutation_supported"] is True
     assert payload["remote_deletion_accounts"] == [{"account": "test", "enabled": False}]
 
 
@@ -393,6 +393,22 @@ def test_remote_delete_cli_requires_one_explicit_mode(config_file: Path) -> None
             ]
         )
     assert main(["remote-delete", "--dry-run", "--limit", "1", "--config", str(config_file)]) == 0
+
+
+def test_remote_delete_dry_run_remains_provider_isolated_after_default_factory_wiring(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("dry-run must not construct a provider adapter or access a provider")
+
+    monkeypatch.setattr(remote_mutation_module, "production_adapter_factory", forbidden)
+    monkeypatch.setattr(remote_mutation_module, "observation_adapter_factory", forbidden)
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    monkeypatch.setattr(gmail_mutation_module.requests, "Session", forbidden)
+    assert (
+        main(["remote-delete", "--dry-run", "--account", "test", "--config", str(config_file)])
+        == 0
+    )
 
 
 def test_execute_plan_default_m12_a_factory_leaves_no_production_run(

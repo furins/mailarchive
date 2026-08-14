@@ -141,8 +141,33 @@ class ProductionPlanError(RuntimeError):
 
 
 def production_adapter_factory(config: AppConfig, account_name: str) -> RemoteMutationAdapter:
-    """M12-A deliberately has no provider adapter; factories must be local/no-network."""
-    raise ProductionPlanError("production provider adapter not implemented in M12-A")
+    """Construct one closed, local-only destructive adapter for an opted-in account."""
+    account = next((item for item in config.accounts if item.name == account_name), None)
+    if account is None or not account.enabled or not account.remote_deletion_enabled:
+        raise ProductionPlanError("account is not enabled for production remote deletion")
+    try:
+        # Imports are intentionally local: concrete adapters depend on the
+        # provider-neutral target/result types in this module. Constructors do
+        # local validation only; all provider I/O begins in delete().
+        if account.kind == "imap":
+            from mailarchive.imap_mutation import ImapMutationAdapter
+
+            return ImapMutationAdapter(config, account_name)
+        if account.kind == "gmail":
+            from mailarchive.gmail_mutation import GmailMutationAdapter, google_mutation_transport
+
+            return GmailMutationAdapter(
+                config, account_name, transport_factory=google_mutation_transport
+            )
+        if account.kind == "pop3":
+            from mailarchive.pop3_mutation import Pop3MutationAdapter
+
+            return Pop3MutationAdapter(config, account_name)
+    except Exception as error:
+        # Constructor errors can mention local credential paths; normalize
+        # them before they reach the operator-facing execution boundary.
+        raise ProductionPlanError("production provider adapter local preflight failed") from error
+    raise ProductionPlanError("production provider adapter is unsupported")
 
 
 def _target(row: sqlite3.Row) -> DeletionTarget:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import socket
 import socketserver
@@ -38,6 +39,7 @@ from mailarchive.remote_mutation import (
     execute_production_plan,
     observation_adapter_factory,
     plan_dry_run,
+    production_adapter_factory,
     reconcile_production_run,
     remote_mutation_status,
 )
@@ -340,6 +342,57 @@ class EngineGmail:
             self.messages.pop(message_id, None)
 
 
+class FakeGoogleResponse:
+    def __init__(self, status_code: int, payload: dict[str, object] | None = None) -> None:
+        self.status_code, self.payload = status_code, payload or {}
+
+    def json(self) -> dict[str, object]:
+        return self.payload
+
+
+class FakeGoogleSession:
+    """Narrow requests.Session substitute for default-factory Gmail CLI tests."""
+
+    def __init__(
+        self,
+        database: Path,
+        messages: dict[str, bytes],
+        *,
+        uncertain: bool = False,
+        keep_present: bool = False,
+    ) -> None:
+        self.database, self.messages = database, messages
+        self.uncertain, self.keep_present = uncertain, keep_present
+        self.deletes: list[str] = []
+        self.started = False
+
+    def get(self, url: str, **_kwargs: object) -> FakeGoogleResponse:
+        if self.uncertain and self.deletes:
+            raise OSError("unobservable")
+        if url.endswith("/profile"):
+            return FakeGoogleResponse(200, {"emailAddress": "user@example.test"})
+        message_id = url.rsplit("/", 1)[-1]
+        raw = self.messages.get(message_id)
+        if raw is None:
+            return FakeGoogleResponse(404)
+        return FakeGoogleResponse(
+            200,
+            {"id": message_id, "raw": base64.urlsafe_b64encode(raw).decode().rstrip("=")},
+        )
+
+    def delete(self, url: str, **_kwargs: object) -> FakeGoogleResponse:
+        message_id = url.rsplit("/", 1)[-1]
+        with connect(self.database) as db:
+            self.started = (
+                db.execute("SELECT status FROM remote_mutations WHERE dry_run=0").fetchone()[0]
+                == "started"
+            )
+        self.deletes.append(message_id)
+        if not self.uncertain and not self.keep_present:
+            self.messages.pop(message_id, None)
+        return FakeGoogleResponse(204)
+
+
 def gmail_engine_config(config_file: Path, tmp_path: Path) -> None:
     import yaml
 
@@ -454,7 +507,7 @@ def pop3_engine_config(config_file: Path, port: int) -> None:
 
 
 def test_gmail_adapter_executes_through_production_engine_preserving_local_graph(
-    config_file: Path, tmp_path: Path
+    config_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     gmail_engine_config(config_file, tmp_path)
     config, canonical = eligible_remote(
@@ -464,7 +517,8 @@ def test_gmail_adapter_executes_through_production_engine_preserving_local_graph
         provider_message_id="target",
         body=b"target",
     )
-    source = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
+    readonly = Path(config.accounts[0].config_ref.removeprefix("file:"))
+    readonly_before = readonly.read_bytes()
     with connect(config.database.path) as db:
         before_attachments = [tuple(row) for row in db.execute("SELECT * FROM message_attachments")]
         before_evidence = [
@@ -476,8 +530,41 @@ def test_gmail_adapter_executes_through_production_engine_preserving_local_graph
             ).fetchone()[0]
         )
         bytes_before = canonical_path.read_bytes()
-    fake = EngineGmail(config.database.path, {"target": bytes_before, "other": b"other"})
-    run = execute_production_plan(config, source, "test", adapter_factory=gmail_factory(fake))
+    fake = FakeGoogleSession(config.database.path, {"target": bytes_before, "other": b"other"})
+    import mailarchive.gmail_mutation as gmail_mutation
+
+    monkeypatch.setattr(gmail_mutation.requests, "Session", lambda: fake)
+    assert (
+        main(
+            [
+                "remote-delete",
+                "--dry-run",
+                "--account",
+                "test",
+                "--config",
+                str(config_file),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    source = int(json.loads(capsys.readouterr().out)["run_id"])
+    assert (
+        main(
+            [
+                "remote-delete",
+                "--execute-plan",
+                str(source),
+                "--account",
+                "test",
+                "--config",
+                str(config_file),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    run = int(json.loads(capsys.readouterr().out)["production_run_id"])
     assert fake.started and fake.deletes == ["target"] and "other" in fake.messages
     with connect(config.database.path) as db:
         assert (
@@ -504,10 +591,11 @@ def test_gmail_adapter_executes_through_production_engine_preserving_local_graph
             tuple(row) for row in db.execute("SELECT * FROM message_backup_evidence")
         ] == before_evidence
     assert canonical_path.read_bytes() == bytes_before
+    assert readonly.read_bytes() == readonly_before
 
 
 def test_pop3_adapter_executes_through_production_engine_preserving_local_graph(
-    config_file: Path, monkeypatch: pytest.MonkeyPatch
+    config_file: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     import yaml
 
@@ -525,7 +613,6 @@ def test_pop3_adapter_executes_through_production_engine_preserving_local_graph(
             provider_message_id="U1",
             body=b"target\r\n",
         )
-        source = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
         with connect(config.database.path) as db:
             attachments = [tuple(row) for row in db.execute("SELECT * FROM message_attachments")]
             evidence = [tuple(row) for row in db.execute("SELECT * FROM message_backup_evidence")]
@@ -535,12 +622,37 @@ def test_pop3_adapter_executes_through_production_engine_preserving_local_graph(
                 ).fetchone()[0]
             )
             before = path.read_bytes()
-        production = execute_production_plan(
-            config,
-            source,
-            "test",
-            adapter_factory=lambda cfg, name: Pop3MutationAdapter(cfg, name),
+        assert (
+            main(
+                [
+                    "remote-delete",
+                    "--dry-run",
+                    "--account",
+                    "test",
+                    "--config",
+                    str(config_file),
+                    "--json",
+                ]
+            )
+            == 0
         )
+        source = int(json.loads(capsys.readouterr().out)["run_id"])
+        assert (
+            main(
+                [
+                    "remote-delete",
+                    "--execute-plan",
+                    str(source),
+                    "--account",
+                    "test",
+                    "--config",
+                    str(config_file),
+                    "--json",
+                ]
+            )
+            == 0
+        )
+        production = int(json.loads(capsys.readouterr().out)["production_run_id"])
         assert server.started, server.commands
         assert "U1" not in server.messages and server.messages["U2"] == b"unrelated\r\n"
         with connect(config.database.path) as db:
@@ -568,7 +680,11 @@ def test_pop3_adapter_executes_through_production_engine_preserving_local_graph(
 
 @pytest.mark.parametrize(("mode", "expected"), [("failure", "failed"), ("unknown", "unknown")])
 def test_pop3_adapter_engine_halts_on_failure_or_unknown(
-    config_file: Path, monkeypatch: pytest.MonkeyPatch, mode: str, expected: str
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mode: str,
+    expected: str,
 ) -> None:
     import yaml
 
@@ -598,10 +714,37 @@ def test_pop3_adapter_engine_halts_on_failure_or_unknown(
             provider_message_id="U2",
             body=b"later\r\n",
         )
-        source = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
-        production = execute_production_plan(
-            config, source, "test", adapter_factory=lambda cfg, name: Pop3MutationAdapter(cfg, name)
+        assert (
+            main(
+                [
+                    "remote-delete",
+                    "--dry-run",
+                    "--account",
+                    "test",
+                    "--config",
+                    str(config_file),
+                    "--json",
+                ]
+            )
+            == 0
         )
+        source = int(json.loads(capsys.readouterr().out)["run_id"])
+        assert (
+            main(
+                [
+                    "remote-delete",
+                    "--execute-plan",
+                    str(source),
+                    "--account",
+                    "test",
+                    "--config",
+                    str(config_file),
+                    "--json",
+                ]
+            )
+            == 0
+        )
+        production = int(json.loads(capsys.readouterr().out)["production_run_id"])
         assert server.commands.count("DELE") == 1
         with connect(config.database.path) as db:
             rows = db.execute(
@@ -614,21 +757,15 @@ def test_pop3_adapter_engine_halts_on_failure_or_unknown(
                 == 1
             )
         with pytest.raises(ProductionPlanError):
-            execute_production_plan(
-                config,
-                source,
-                "test",
-                adapter_factory=lambda cfg, name: Pop3MutationAdapter(cfg, name),
-            )
+            execute_production_plan(config, source, "test")
         if mode == "unknown":
+            run_status = cast(
+                list[dict[str, object]], remote_mutation_status(config, run_id=production)["runs"]
+            )[0]
+            assert run_status["reconciliation_required"] is True
             fresh = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
             with pytest.raises(ProductionPlanError, match="unresolved"):
-                execute_production_plan(
-                    config,
-                    fresh,
-                    "test",
-                    adapter_factory=lambda cfg, name: Pop3MutationAdapter(cfg, name),
-                )
+                execute_production_plan(config, fresh, "test")
         assert server.commands.count("DELE") == 1
     finally:
         server.close()
@@ -636,7 +773,12 @@ def test_pop3_adapter_engine_halts_on_failure_or_unknown(
 
 @pytest.mark.parametrize(("uncertain", "expected"), [(False, "failed"), (True, "unknown")])
 def test_gmail_adapter_engine_halts_failure_or_unknown(
-    config_file: Path, tmp_path: Path, uncertain: bool, expected: str
+    config_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    uncertain: bool,
+    expected: str,
 ) -> None:
     gmail_engine_config(config_file, tmp_path)
     config, _ = eligible_remote(
@@ -653,16 +795,46 @@ def test_gmail_adapter_engine_halts_failure_or_unknown(
         provider_message_id="later",
         body=b"later",
     )
-    source = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
-    fake = EngineGmail(
+    fake = FakeGoogleSession(
         config.database.path,
         {"target": b"From: test\r\n\r\ntarget", "later": b"From: test\r\n\r\nlater"},
         uncertain=uncertain,
         keep_present=not uncertain,
     )
-    production = execute_production_plan(
-        config, source, "test", adapter_factory=gmail_factory(fake)
+    import mailarchive.gmail_mutation as gmail_mutation
+
+    monkeypatch.setattr(gmail_mutation.requests, "Session", lambda: fake)
+    assert (
+        main(
+            [
+                "remote-delete",
+                "--dry-run",
+                "--account",
+                "test",
+                "--config",
+                str(config_file),
+                "--json",
+            ]
+        )
+        == 0
     )
+    source = int(json.loads(capsys.readouterr().out)["run_id"])
+    assert (
+        main(
+            [
+                "remote-delete",
+                "--execute-plan",
+                str(source),
+                "--account",
+                "test",
+                "--config",
+                str(config_file),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    production = int(json.loads(capsys.readouterr().out)["production_run_id"])
     assert fake.started and fake.deletes == ["target"]
     with connect(config.database.path) as db:
         assert (
@@ -683,11 +855,15 @@ def test_gmail_adapter_engine_halts_failure_or_unknown(
             == 1
         )
     with pytest.raises(ProductionPlanError):
-        execute_production_plan(config, source, "test", adapter_factory=gmail_factory(fake))
+        execute_production_plan(config, source, "test")
     if uncertain:
+        run_status = cast(
+            list[dict[str, object]], remote_mutation_status(config, run_id=production)["runs"]
+        )[0]
+        assert run_status["reconciliation_required"] is True
         fresh = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
         with pytest.raises(ProductionPlanError, match="unresolved"):
-            execute_production_plan(config, fresh, "test", adapter_factory=gmail_factory(fake))
+            execute_production_plan(config, fresh, "test")
     assert fake.deletes == ["target"]
 
 
@@ -1049,11 +1225,11 @@ def test_production_rejects_current_stricter_limit(config_file: Path, limit_fiel
         )
 
 
-def test_default_m12_a_factory_does_not_consume_plan(config_file: Path) -> None:
+def test_default_factory_local_preflight_does_not_consume_plan(config_file: Path) -> None:
     config, _ = eligible_remote(config_file)
     config = production_enabled(config)
     source_id = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
-    with pytest.raises(ProductionPlanError, match="not implemented"):
+    with pytest.raises(ProductionPlanError, match="local preflight"):
         execute_production_plan(config, source_id, "test")
     with connect(config.database.path) as db:
         assert (
@@ -1062,6 +1238,108 @@ def test_default_m12_a_factory_does_not_consume_plan(config_file: Path) -> None:
             ).fetchone()[0]
             == 0
         )
+
+
+def test_production_factory_is_closed_and_constructor_work_is_zero_network(
+    config_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """E2b factory selection is exact and never reaches a provider in construction."""
+    import mailarchive.gmail_mutation as gmail_mutation
+    import mailarchive.imap_mutation as imap_mutation
+    import mailarchive.pop3_mutation as pop3_mutation
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("factory construction must not access a provider")
+
+    # IMAP
+    import yaml
+
+    values = yaml.safe_load(config_file.read_text())
+    values["accounts"]["test"]["imap"] = {
+        "host": "127.0.0.1",
+        "port": 1,
+        "username": "fixture",
+        "tls_mode": "INSECURE_LOOPBACK",
+        "folders": ["INBOX"],
+    }
+    config_file.write_text(yaml.safe_dump(values))
+    config, _ = eligible_remote(config_file)
+    config = production_enabled(config)
+    monkeypatch.setattr(imap_mutation.imaplib, "IMAP4", forbidden)
+    monkeypatch.setattr(imap_mutation.imaplib, "IMAP4_SSL", forbidden)
+    assert isinstance(production_adapter_factory(config, "test"), ImapMutationAdapter)
+
+    # Gmail has a separate, safe local mutation credential; Session construction
+    # itself is forbidden to prove no HTTP/OAuth transport is reached.
+    values = yaml.safe_load(config_file.read_text())
+    values["accounts"]["test"].pop("imap")
+    config_file.write_text(yaml.safe_dump(values))
+    gmail_engine_config(config_file, tmp_path)
+    config, _ = eligible_remote(
+        config_file,
+        provider_kind="gmail",
+        remote_id="gmail-factory",
+        provider_message_id="factory",
+        body=b"gmail factory",
+    )
+    monkeypatch.setattr(gmail_mutation.requests, "Session", forbidden)
+    assert isinstance(production_adapter_factory(config, "test"), GmailMutationAdapter)
+
+    # POP3 construction validates only local configuration and account state.
+    values = yaml.safe_load(config_file.read_text())
+    values["accounts"]["test"].pop("gmail")
+    config_file.write_text(yaml.safe_dump(values))
+    pop3_engine_config(config_file, 1)
+    config, _ = eligible_remote(
+        config_file,
+        provider_kind="pop3",
+        remote_id="pop3-factory",
+        provider_message_id="U1",
+        body=b"pop3 factory",
+    )
+    monkeypatch.setattr(pop3_mutation.socket, "create_connection", forbidden)
+    assert isinstance(production_adapter_factory(config, "test"), Pop3MutationAdapter)
+
+
+def test_gmail_factory_unsafe_delete_credential_fails_before_production_run(
+    config_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gmail_engine_config(config_file, tmp_path)
+    config, _ = eligible_remote(
+        config_file,
+        provider_kind="gmail",
+        remote_id="gmail-preflight",
+        provider_message_id="target",
+    )
+    delete_token = Path(config.accounts[0].gmail.remote_delete_token_file)  # type: ignore[union-attr]
+    readonly = Path(config.accounts[0].config_ref.removeprefix("file:"))
+    readonly_before = readonly.read_bytes()
+    delete_token.chmod(0o644)
+    source_id = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
+
+    import mailarchive.gmail_mutation as gmail_mutation
+
+    def forbidden_session() -> object:
+        raise AssertionError("preflight must not use HTTP")
+
+    monkeypatch.setattr(gmail_mutation.requests, "Session", forbidden_session)
+
+    with pytest.raises(ProductionPlanError, match="local preflight"):
+        execute_production_plan(config, source_id, "test")
+    with connect(config.database.path) as db:
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM remote_mutation_runs WHERE mode='production-execute'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM audit_events WHERE event_type='remote_delete.production.started'"
+            ).fetchone()[0]
+            == 0
+        )
+    assert readonly.read_bytes() == readonly_before
 
 
 def test_dry_run_anchors_fresh_evaluation_and_exact_imap_target(config_file: Path) -> None:

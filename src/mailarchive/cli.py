@@ -217,14 +217,17 @@ def build_parser() -> argparse.ArgumentParser:
     candidates.add_argument("--account")
     candidates.add_argument("--json", action="store_true")
     remote_delete = subcommands.add_parser(
-        "remote-delete", help="plan local-only remote deletion dry-run"
+        "remote-delete", help="create a local plan or destructively execute one authorized plan"
     )
     mode = remote_delete.add_mutually_exclusive_group(required=True)
     mode.add_argument(
         "--dry-run", action="store_true", help="local-only plan; no provider connection"
     )
     mode.add_argument(
-        "--execute-plan", type=int, metavar="RUN_ID", help="execute one existing account plan"
+        "--execute-plan",
+        type=int,
+        metavar="RUN_ID",
+        help="DESTRUCTIVE execution of exactly one authorized account plan",
     )
     remote_delete.add_argument("--account")
     remote_delete.add_argument("--limit", type=int)
@@ -542,7 +545,7 @@ def main(argv: list[str] | None = None) -> int:
                     "attachment_blob_count": attachment_blob_count,
                     "attachment_reference_count": attachment_reference_count,
                     "attachment_extraction_counts": attachment_extraction_counts,
-                    "remote_mutation_supported": False,
+                    "remote_mutation_supported": True,
                     "remote_reconciliation_supported": True,
                     "remote_deletion_accounts": [
                         {

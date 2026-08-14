@@ -35,11 +35,7 @@ from mailarchive.notmuch import (
     SearchResult,
     search_canonical_messages,
 )
-from mailarchive.remote_mutation import (
-    ImapDeletionTarget,
-    execute_production_plan,
-    plan_dry_run,
-)
+from mailarchive.remote_mutation import ImapDeletionTarget
 
 
 def _free_port() -> int:
@@ -765,9 +761,12 @@ def test_dovecot_idle_fast_path_acquires_and_indexes_without_poll(
 
 
 def test_dovecot_uidplus_exact_production_delete_preserves_unrelated_deleted(
-    config_file: Path, dovecot_loopback: tuple[int, Path, Path], monkeypatch: pytest.MonkeyPatch
+    config_file: Path,
+    dovecot_loopback: tuple[int, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """M12-B accepts only disposable loopback Dovecot through injected wiring."""
+    """E2b CLI reaches the closed default IMAP production factory on Dovecot."""
     port, mail, _ = dovecot_loopback
     target_raw = _raw("<target@test>", "target")
     normal_raw = _raw("<normal@test>", "normal")
@@ -834,10 +833,39 @@ def test_dovecot_uidplus_exact_production_delete_preserves_unrelated_deleted(
         assert b"UIDPLUS" in b" ".join(cast(list[bytes], client.capability()[1])).upper()
     finally:
         client.logout()
-    source = int(cast(int, plan_dry_run(config, account="test", limit=1)["run_id"]))
-    run = execute_production_plan(
-        config, source, "test", adapter_factory=lambda cfg, name: ImapMutationAdapter(cfg, name)
+    assert (
+        main(
+            [
+                "remote-delete",
+                "--dry-run",
+                "--account",
+                "test",
+                "--limit",
+                "1",
+                "--config",
+                str(config_file),
+                "--json",
+            ]
+        )
+        == 0
     )
+    source = int(json.loads(capsys.readouterr().out)["run_id"])
+    assert (
+        main(
+            [
+                "remote-delete",
+                "--execute-plan",
+                str(source),
+                "--account",
+                "test",
+                "--config",
+                str(config_file),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    run = int(json.loads(capsys.readouterr().out)["production_run_id"])
     _validity, after = _snapshot(port)
     raws = [raw for _flags, raw in after.values()]
     assert target_raw not in raws and normal_raw in raws and deleted_raw in raws
