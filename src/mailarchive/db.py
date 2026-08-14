@@ -527,6 +527,78 @@ def _migration_12(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migration_13(connection: sqlite3.Connection) -> None:
+    """M12 explicit production-plan traceability and account-local opt-in."""
+    # Keep child FK declarations pointing to the final ``accounts`` name.  The
+    # migration runner has disabled FK enforcement for this replacement.
+    connection.execute("""CREATE TABLE accounts_v13_replacement (
+        id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+        kind TEXT NOT NULL CHECK(kind IN ('imap','gmail','pop3')),
+        enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+        remote_retention_days INTEGER CHECK(remote_retention_days IS NULL OR remote_retention_days >= 0),
+        remote_deletion_enabled INTEGER NOT NULL DEFAULT 0 CHECK(remote_deletion_enabled IN (0,1)),
+        required_verified_backups INTEGER NOT NULL CHECK(required_verified_backups >= 0),
+        config_ref TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+    connection.execute("INSERT INTO accounts_v13_replacement SELECT * FROM accounts")
+    connection.execute("DROP TABLE accounts")
+    connection.execute("ALTER TABLE accounts_v13_replacement RENAME TO accounts")
+    # SQLite cannot add these constraints/foreign keys in place.  Renaming the
+    # originals preserves every M11 row while replacement tables add v13 facts.
+    connection.execute("ALTER TABLE remote_mutations RENAME TO remote_mutations_v12")
+    connection.execute("ALTER TABLE remote_mutation_runs RENAME TO remote_mutation_runs_v12")
+    connection.execute("""CREATE TABLE remote_mutation_runs (
+        id INTEGER PRIMARY KEY, requested_at TEXT NOT NULL, completed_at TEXT,
+        mode TEXT NOT NULL CHECK(mode IN ('dry-run','fake-execute','production-execute')),
+        status TEXT NOT NULL CHECK(status IN ('planned','completed','halted')),
+        account_filter TEXT, requested_limit INTEGER,
+        effective_max_per_run INTEGER NOT NULL CHECK(effective_max_per_run>=1),
+        effective_max_per_account INTEGER NOT NULL CHECK(effective_max_per_account>=1),
+        eligible_count INTEGER NOT NULL CHECK(eligible_count>=0), selected_count INTEGER NOT NULL CHECK(selected_count>=0),
+        skipped_limit_count INTEGER NOT NULL CHECK(skipped_limit_count>=0), policy_version TEXT NOT NULL,
+        source_plan_run_id INTEGER REFERENCES remote_mutation_runs(id), authorization_method TEXT,
+        CHECK((mode='production-execute' AND source_plan_run_id IS NOT NULL AND authorization_method='account-opt-in+explicit-plan-v1')
+           OR (mode!='production-execute' AND source_plan_run_id IS NULL AND authorization_method IS NULL))
+    )""")
+    connection.execute("""INSERT INTO remote_mutation_runs(
+        id,requested_at,completed_at,mode,status,account_filter,requested_limit,effective_max_per_run,
+        effective_max_per_account,eligible_count,selected_count,skipped_limit_count,policy_version)
+        SELECT id,requested_at,completed_at,mode,status,account_filter,requested_limit,effective_max_per_run,
+        effective_max_per_account,eligible_count,selected_count,skipped_limit_count,policy_version
+        FROM remote_mutation_runs_v12""")
+    connection.execute("""CREATE TABLE remote_mutations (
+        id INTEGER PRIMARY KEY, mutation_run_id INTEGER NOT NULL REFERENCES remote_mutation_runs(id),
+        deletion_evaluation_id INTEGER NOT NULL REFERENCES deletion_evaluations(id),
+        account_id INTEGER NOT NULL REFERENCES accounts(id), remote_message_id TEXT NOT NULL REFERENCES remote_messages(id),
+        canonical_message_id TEXT NOT NULL REFERENCES canonical_messages(id), provider_kind TEXT NOT NULL CHECK(provider_kind IN ('imap','gmail','pop3')),
+        operation TEXT NOT NULL CHECK(operation='delete'), remote_folder TEXT, uidvalidity INTEGER, remote_uid INTEGER,
+        provider_message_id TEXT, canonical_sha256 TEXT NOT NULL CHECK(length(canonical_sha256)=64),
+        target_fingerprint_sha256 TEXT NOT NULL CHECK(length(target_fingerprint_sha256)=64), dry_run INTEGER NOT NULL CHECK(dry_run IN (0,1)),
+        requested_at TEXT NOT NULL, started_at TEXT, completed_at TEXT,
+        status TEXT NOT NULL CHECK(status IN ('planned','dry-run','started','succeeded','failed','unknown')),
+        provider_response_summary TEXT CHECK(provider_response_summary IN ('confirmed-absent','confirmed-no-mutation','outcome-uncertain')),
+        error_code TEXT CHECK(error_code IN ('NONE','TARGET_NOT_FOUND','IDENTITY_MISMATCH','PROVIDER_REJECTED','TRANSPORT_UNKNOWN','ADAPTER_EXCEPTION','STALE_PLAN','INVALID_ADAPTER_RESULT','AUTHORIZATION_FAILED','PLAN_EXPIRED','REMOTE_STATE_CONFLICT','SAFE_DELETE_UNSUPPORTED','RECONCILED_PRESENT')),
+        source_plan_mutation_id INTEGER REFERENCES remote_mutations(id), reconciled_at TEXT,
+        UNIQUE(mutation_run_id,remote_message_id),
+        CHECK((provider_kind='imap' AND remote_folder IS NOT NULL AND uidvalidity IS NOT NULL AND remote_uid IS NOT NULL AND provider_message_id IS NULL)
+           OR (provider_kind IN ('gmail','pop3') AND provider_message_id IS NOT NULL AND remote_folder IS NULL AND uidvalidity IS NULL AND remote_uid IS NULL))
+    )""")
+    connection.execute("""INSERT INTO remote_mutations(
+        id,mutation_run_id,deletion_evaluation_id,account_id,remote_message_id,canonical_message_id,provider_kind,operation,
+        remote_folder,uidvalidity,remote_uid,provider_message_id,canonical_sha256,target_fingerprint_sha256,dry_run,
+        requested_at,started_at,completed_at,status,provider_response_summary,error_code)
+        SELECT id,mutation_run_id,deletion_evaluation_id,account_id,remote_message_id,canonical_message_id,provider_kind,operation,
+        remote_folder,uidvalidity,remote_uid,provider_message_id,canonical_sha256,target_fingerprint_sha256,dry_run,
+        requested_at,started_at,completed_at,status,provider_response_summary,error_code FROM remote_mutations_v12""")
+    connection.execute("DROP TABLE remote_mutations_v12")
+    connection.execute("DROP TABLE remote_mutation_runs_v12")
+    connection.execute("CREATE UNIQUE INDEX one_production_execution_per_plan ON remote_mutation_runs(source_plan_run_id) WHERE mode='production-execute'")
+    connection.execute("CREATE INDEX remote_mutations_run_status ON remote_mutations(mutation_run_id,status)")
+
+
+def _migration_13_all(connection: sqlite3.Connection) -> None:
+    _migration_13(connection)
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _migration_1),
     (2, _migration_2),
@@ -540,6 +612,7 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (10, _migration_10),
     (11, _migration_11),
     (12, _migration_12),
+    (13, _migration_13_all),
 )
 
 
@@ -561,7 +634,7 @@ def _apply_migration(connection: sqlite3.Connection, version: int, migration: Mi
     """Apply one migration and its version record as one SQLite transaction."""
     # M7 rebuilds canonical_messages to make archived_at nullable.  SQLite cannot
     # drop a referenced table with FK enforcement enabled, even inside a transaction.
-    rebuilds_canonical = version == 8
+    rebuilds_canonical = version in {8, 13}
     try:
         if rebuilds_canonical:
             connection.execute("PRAGMA foreign_keys = OFF")
@@ -622,12 +695,12 @@ def initialize(
                 INSERT INTO accounts (
                     name, kind, enabled, remote_retention_days, remote_deletion_enabled,
                     required_verified_backups, config_ref, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     kind = excluded.kind,
                     enabled = excluded.enabled,
                     remote_retention_days = excluded.remote_retention_days,
-                    remote_deletion_enabled = 0,
+                    remote_deletion_enabled = excluded.remote_deletion_enabled,
                     required_verified_backups = excluded.required_verified_backups,
                     config_ref = excluded.config_ref,
                     updated_at = excluded.updated_at
@@ -637,6 +710,7 @@ def initialize(
                     account.kind,
                     account.enabled,
                     account.remote_retention_days,
+                    account.remote_deletion_enabled,
                     account.required_verified_backups,
                     account.config_ref,
                     now,

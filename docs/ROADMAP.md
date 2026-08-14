@@ -208,7 +208,7 @@ Implemented as schema v12 local-only dry-run planning with versioned target fing
 deterministic global/per-account limits and append-only mutation history. Fake in-process
 adapters exercise the state machine; no production mutation adapter or execute CLI exists.
 
-## M12 — Controlled production enablement
+## M12 — Controlled production enablement (implemented)
 
 Deliver:
 
@@ -218,7 +218,22 @@ Deliver:
 - first test-account procedure;
 - failure recovery.
 
-## M13 — Operations
+M12 is complete on the controlled-production-delete branch. It implements explicit account opt-in,
+a 60-minute source-plan TTL, immutable dry-run and production runs, fresh M10/current-identity
+revalidation, serial started-before-call execution, bounded audit, and a closed IMAP/Gmail/POP3
+production factory. IMAP uses exact UIDPLUS deletion, Gmail uses a separate full-scope mutation
+credential and exact Message.id, and POP3 uses UIDL with explicit QUIT and shared account
+serialization. Unknown outcomes halt without retry or resume and are resolved only by explicit
+read-only reconciliation of the historical target. The operator procedure is
+`docs/REMOTE_DELETION_RUNBOOK.md`.
+
+Implementation record: the frozen recovery plane is
+`ed5ba6b8044ff6317cc122102ec709a4a2da77a0`; production execution/audit hardening is
+`16aea31803585a53129e10a1f11e5cfdbb6b3f4b`; and closed provider wiring is
+`b6fda8e574074d8acf154daf09941fa05e45be33`. These are historical checkpoint records, not
+separate operator modes.
+
+## M13 — Operations (future)
 
 Deliver:
 
@@ -228,3 +243,6 @@ Deliver:
 - maintenance commands;
 - upgrade/migration runbook;
 - backup/restore runbook.
+
+M13 is not implemented by M12. In particular, unattended or scheduled remote-deletion execution,
+automatic execution workers, and automatic retry/resume remain out of scope.

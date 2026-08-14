@@ -21,12 +21,20 @@ from mailarchive.config import ConfigError, display_config, load_config
 from mailarchive.db import account_id, connect, initialize
 from mailarchive.fastpath import FAST_PATH_STALE_SECONDS, FastPathWatcher, fast_path_status
 from mailarchive.gmail import GmailAdapter, GmailError, GmailWatcher, authorize
+from mailarchive.gmail_mutation import authorize_delete
 from mailarchive.imap import ImapAdapter, ImapError
 from mailarchive.ingest import IngestError, ingest_file
 from mailarchive.notmuch import NotmuchAdapter, NotmuchError, search_canonical_messages
 from mailarchive.pop3 import Pop3Adapter, Pop3Error
 from mailarchive.recoll import RecollAdapter, RecollError, search_attachments
-from mailarchive.remote_mutation import plan_dry_run
+from mailarchive.remote_mutation import (
+    ProductionPlanError,
+    ReconciliationError,
+    execute_production_plan,
+    plan_dry_run,
+    reconcile_production_run,
+    remote_mutation_status,
+)
 from mailarchive.retention import evaluate_all, set_control
 
 
@@ -114,6 +122,12 @@ def build_parser() -> argparse.ArgumentParser:
     gmail_auth.add_argument("--account", required=True)
     gmail_auth.add_argument("--config", required=True)
     gmail_auth.add_argument("--json", action="store_true")
+    gmail_delete_auth = gmail_subcommands.add_parser(
+        "auth-delete", help="authorize the separate Gmail permanent-deletion credential"
+    )
+    gmail_delete_auth.add_argument("--account", required=True)
+    gmail_delete_auth.add_argument("--config", required=True)
+    gmail_delete_auth.add_argument("--json", action="store_true")
     gmail_sync = gmail_subcommands.add_parser(
         "sync", help="synchronize Gmail through read-only REST"
     )
@@ -203,15 +217,41 @@ def build_parser() -> argparse.ArgumentParser:
     candidates.add_argument("--account")
     candidates.add_argument("--json", action="store_true")
     remote_delete = subcommands.add_parser(
-        "remote-delete", help="plan local-only remote deletion dry-run"
+        "remote-delete", help="create a local plan or destructively execute one authorized plan"
     )
-    remote_delete.add_argument(
-        "--dry-run", action="store_true", help="required; creates no provider connection"
+    mode = remote_delete.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
+        "--dry-run", action="store_true", help="local-only plan; no provider connection"
+    )
+    mode.add_argument(
+        "--execute-plan",
+        type=int,
+        metavar="RUN_ID",
+        help="DESTRUCTIVE execution of exactly one authorized account plan",
     )
     remote_delete.add_argument("--account")
     remote_delete.add_argument("--limit", type=int)
     remote_delete.add_argument("--config", required=True)
     remote_delete.add_argument("--json", action="store_true")
+    remote_mutations = subcommands.add_parser(
+        "remote-mutations", help="local status and read-only recovery of remote mutation runs"
+    )
+    remote_mutations_subcommands = remote_mutations.add_subparsers(
+        dest="remote_mutations_command", required=True
+    )
+    mutation_status = remote_mutations_subcommands.add_parser(
+        "status", help="show bounded local remote-mutation history"
+    )
+    mutation_status.add_argument("--config", required=True)
+    mutation_status.add_argument("--run-id", type=int)
+    mutation_status.add_argument("--account")
+    mutation_status.add_argument("--json", action="store_true")
+    mutation_reconcile = remote_mutations_subcommands.add_parser(
+        "reconcile", help="read-only reconciliation of one halted production run"
+    )
+    mutation_reconcile.add_argument("--run-id", type=int, required=True)
+    mutation_reconcile.add_argument("--config", required=True)
+    mutation_reconcile.add_argument("--json", action="store_true")
     retention = subcommands.add_parser(
         "retention", help="local-only retention policy controls and reports"
     )
@@ -260,12 +300,33 @@ def main(argv: list[str] | None = None) -> int:
             _emit(results, args.json)
             return 0
         if args.command == "remote-delete":
-            if not args.dry_run:
-                _error(
-                    "--dry-run is required; production remote deletion is unavailable before M12"
-                )
+            if args.execute_plan is not None and (args.account is None or args.limit is not None):
+                _error("--execute-plan requires --account and cannot be combined with --limit")
             initialize(config.database.path, config.accounts, config.backup_repositories)
-            _emit(plan_dry_run(config, account=args.account, limit=args.limit), args.json)
+            if args.dry_run:
+                _emit(plan_dry_run(config, account=args.account, limit=args.limit), args.json)
+                return 0
+            assert args.execute_plan is not None and args.account is not None
+            _emit(
+                {
+                    "production_run_id": execute_production_plan(
+                        config, args.execute_plan, args.account
+                    )
+                },
+                args.json,
+            )
+            return 0
+        if args.command == "remote-mutations":
+            initialize(config.database.path, config.accounts, config.backup_repositories)
+            if args.remote_mutations_command == "status":
+                _emit(
+                    remote_mutation_status(
+                        config, run_id=args.run_id, account_name=args.account
+                    ),
+                    args.json,
+                )
+                return 0
+            _emit(reconcile_production_run(config, args.run_id), args.json)
             return 0
         if args.command == "retention":
             initialize(config.database.path, config.accounts, config.backup_repositories)
@@ -484,7 +545,15 @@ def main(argv: list[str] | None = None) -> int:
                     "attachment_blob_count": attachment_blob_count,
                     "attachment_reference_count": attachment_reference_count,
                     "attachment_extraction_counts": attachment_extraction_counts,
-                    "remote_mutation_supported": False,
+                    "remote_mutation_supported": True,
+                    "remote_reconciliation_supported": True,
+                    "remote_deletion_accounts": [
+                        {
+                            "account": account.name,
+                            "enabled": account.remote_deletion_enabled,
+                        }
+                        for account in config.accounts
+                    ],
                     "fast_path": health,
                     "gmail": gmail_status,
                 },
@@ -642,6 +711,13 @@ def main(argv: list[str] | None = None) -> int:
                     {"authorized": True, "account": account.name, "profile_email": email}, args.json
                 )
                 return 0
+            if args.gmail_command == "auth-delete":
+                email = authorize_delete(account)
+                _emit(
+                    {"authorized_delete": True, "account": account.name, "profile_email": email},
+                    args.json,
+                )
+                return 0
             if args.gmail_command == "sync":
                 result = GmailAdapter(config).sync(args.account)
                 _emit(result.__dict__, args.json)
@@ -678,6 +754,8 @@ def main(argv: list[str] | None = None) -> int:
         AttachmentError,
         RecollError,
         BorgError,
+        ProductionPlanError,
+        ReconciliationError,
         OSError,
         sqlite3.DatabaseError,
     ) as error:

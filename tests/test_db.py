@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -17,8 +18,71 @@ def test_database_initializes_idempotently(config_file: Path) -> None:
     initialize(config.database.path, config.accounts)
     initialize(config.database.path, config.accounts)
     with connect(config.database.path) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 12
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 13
         assert connection.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 1
+
+
+def test_m12_account_opt_in_is_persisted_and_reconciled(config_file: Path) -> None:
+    config = load_config(config_file)
+    initialize(config.database.path, config.accounts)
+    with connect(config.database.path) as db:
+        original_id = db.execute("SELECT id FROM accounts WHERE name='test'").fetchone()[0]
+        assert db.execute("SELECT remote_deletion_enabled FROM accounts WHERE id=?", (original_id,)).fetchone()[0] == 0
+    enabled = replace(config.accounts[0], remote_deletion_enabled=True)
+    initialize(config.database.path, (enabled,))
+    with connect(config.database.path) as db:
+        assert db.execute("SELECT id,remote_deletion_enabled FROM accounts WHERE name='test'").fetchone()[:] == (original_id, 1)
+    initialize(config.database.path, config.accounts)
+    with connect(config.database.path) as db:
+        assert db.execute("SELECT remote_deletion_enabled FROM accounts WHERE id=?", (original_id,)).fetchone()[0] == 0
+
+
+def test_real_populated_v12_upgrades_to_v13_preserving_m11_history(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(config_file)
+    original = database.MIGRATIONS
+    monkeypatch.setattr(database, "MIGRATIONS", original[:12])
+    initialize(config.database.path, config.accounts)
+    now = utc_now()
+    with connect(config.database.path) as db:
+        account = account_id(db, "test")
+        assert account is not None
+        digest = "c" * 64
+        db.execute("""INSERT INTO canonical_messages(id,account_id,sha256,local_path,size_bytes,downloaded_at,archived_at,storage_state,quarantined_at,integrity_status,integrity_verified_at,created_at) VALUES('v12-canonical',?,?,?,1,? ,?,'archived',NULL,'verified',?,?)""", (account, digest, "/tmp/v12.eml", now, now, now, now))
+        db.execute("""INSERT INTO remote_messages(id,account_id,provider_kind,remote_folder,uidvalidity,remote_uid,first_seen_at,last_seen_at,remote_present,identity_confidence) VALUES('v12-remote',?,'imap','INBOX',7,9,?,?,1,'proven')""", (account, now, now))
+        db.execute("INSERT INTO remote_canonical_links VALUES('v12-remote','v12-canonical','fixture',?)", (now,))
+        db.execute("INSERT INTO attachments VALUES(?, ?,1,'/tmp/v12-attachment',?)", ("d" * 64, "d" * 64, now))
+        db.execute("INSERT INTO message_attachments VALUES('v12-canonical',?,0,'x','attachment','text/plain')", ("d" * 64,))
+        db.execute("INSERT INTO attachment_extractions VALUES('v12-canonical',?,'success',1,?,NULL,?)", (digest, now, now))
+        db.execute("""INSERT INTO backup_repositories(name,kind,repository_ref,repository_identity,enabled,encryption_mode,verification_policy,created_at,updated_at) VALUES('v12-repo','borg','/tmp/v12-borg','identity',1,'none','borg-archive-data-v1',?,?)""", (now, now))
+        repository = db.execute("SELECT id FROM backup_repositories WHERE name='v12-repo'").fetchone()[0]
+        db.execute(
+            """INSERT INTO backup_runs(id,repository_id,started_at,completed_at,status,archive_name,
+            verification_status,verified_at) VALUES('v12-run',?,?,?,'succeeded','v12','verified',?)""",
+            (repository, now, now, now),
+        )
+        db.execute("INSERT INTO message_backup_evidence VALUES('v12-canonical','v12-run',1,1,?)", (now,))
+        evaluation_run = db.execute("INSERT INTO deletion_evaluation_runs(evaluated_at,policy_version) VALUES(?,'retention-v1')", (now,)).lastrowid
+        evaluation = db.execute("""INSERT INTO deletion_evaluations(evaluation_run_id,remote_message_id,canonical_message_id,evaluated_at,eligible,reason_codes_json,policy_version,remote_retention_days,required_verified_backups,verified_repository_count,retention_deadline) VALUES(?, 'v12-remote','v12-canonical',?,1,'[]','retention-v1',365,2,2,?)""", (evaluation_run, now, now)).lastrowid
+        plan = db.execute("""INSERT INTO remote_mutation_runs(requested_at,completed_at,mode,status,account_filter,requested_limit,effective_max_per_run,effective_max_per_account,eligible_count,selected_count,skipped_limit_count,policy_version) VALUES(?,?,'dry-run','completed','test',1,10,10,1,1,0,'retention-v1')""", (now, now)).lastrowid
+        db.execute("""INSERT INTO remote_mutations(mutation_run_id,deletion_evaluation_id,account_id,remote_message_id,canonical_message_id,provider_kind,operation,remote_folder,uidvalidity,remote_uid,canonical_sha256,target_fingerprint_sha256,dry_run,requested_at,status) VALUES(?,?,?,'v12-remote','v12-canonical','imap','delete','INBOX',7,9,?,?,1,?,'dry-run')""", (plan, evaluation, account, digest, "e" * 64, now))
+        db.commit()
+        original_account_id = account
+    monkeypatch.setattr(database, "MIGRATIONS", original)
+    initialize(config.database.path, config.accounts)
+    initialize(config.database.path, config.accounts)
+    with connect(config.database.path) as db:
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 13
+        assert db.execute("SELECT id FROM accounts WHERE name='test'").fetchone()[0] == original_account_id
+        row = db.execute("SELECT r.mode,m.status,m.dry_run,m.remote_uid,m.canonical_sha256,m.target_fingerprint_sha256,m.source_plan_mutation_id FROM remote_mutation_runs r JOIN remote_mutations m ON m.mutation_run_id=r.id WHERE r.id=?", (plan,)).fetchone()
+        assert tuple(row) == ("dry-run", "dry-run", 1, 9, digest, "e" * 64, None)
+        assert db.execute("SELECT COUNT(*) FROM message_attachments").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM message_backup_evidence").fetchone()[0] == 1
+        assert db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute("""INSERT INTO remote_mutation_runs(requested_at,mode,status,effective_max_per_run,effective_max_per_account,eligible_count,selected_count,skipped_limit_count,policy_version) VALUES(?,'production-execute','planned',1,1,0,0,0,'x')""", (now,))
 
 
 def test_real_populated_v11_upgrades_to_v12_without_rewriting_history(
@@ -103,7 +167,7 @@ def test_real_populated_v11_upgrades_to_v12_without_rewriting_history(
     initialize(config.database.path, config.accounts)
     initialize(config.database.path, config.accounts)
     with connect(config.database.path) as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 12
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 13
         assert (
             db.execute("SELECT sha256 FROM canonical_messages WHERE id='v11-canonical'").fetchone()[
                 0
@@ -195,7 +259,7 @@ def test_real_v9_to_v10_preserves_m8_attachment_graph(
     initialize(config.database.path, config.accounts)
     initialize(config.database.path, config.accounts)
     with connect(config.database.path) as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 12
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 13
         assert db.execute("SELECT COUNT(*) FROM attachments").fetchone()[0] == 1
         assert db.execute("SELECT COUNT(*) FROM message_attachments").fetchone()[0] == 1
         assert db.execute("SELECT status FROM attachment_extractions").fetchone()[0] == "success"
@@ -274,7 +338,7 @@ def test_real_v10_to_v11_preserves_m9_evidence_and_identity_graph(
     initialize(config.database.path, config.accounts)
     initialize(config.database.path, config.accounts)
     with connect(config.database.path) as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 12
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 13
         assert (
             db.execute(
                 "SELECT repository_identity FROM backup_repositories WHERE name='v10'"
@@ -335,7 +399,7 @@ def test_m3_schema_v4_upgrades_to_v5_without_changing_remote_links(
     initialize(config.database.path, config.accounts)
     initialize(config.database.path, config.accounts)
     with connect(config.database.path) as connection:
-        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 12
+        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 13
         assert connection.execute(
             "SELECT name FROM sqlite_master WHERE name='fast_path_health'"
         ).fetchone()
@@ -378,7 +442,7 @@ def test_real_v5_to_v6_preserves_imap_identity_links_and_health(
     initialize(config.database.path, config.accounts)
     initialize(config.database.path, config.accounts)
     with connect(config.database.path) as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 12
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 13
         assert tuple(
             db.execute(
                 "SELECT id,provider_kind,remote_folder,uidvalidity,remote_uid FROM remote_messages"
@@ -446,7 +510,7 @@ def test_v7_rebuild_preserves_gmail_label_foreign_key_graph(
     monkeypatch.setattr(database, "MIGRATIONS", original)
     initialize(config.database.path, config.accounts)
     with connect(config.database.path) as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 12
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 13
         assert tuple(
             db.execute(
                 "SELECT remote_message_id,account_id,label_id FROM gmail_message_labels"
@@ -553,7 +617,7 @@ def test_v8_to_v9_preserves_state_and_adds_attachment_constraints(
     initialize(config.database.path, config.accounts)
     initialize(config.database.path, config.accounts)
     with connect(config.database.path) as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 12
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 13
         assert db.execute("SELECT id FROM canonical_messages").fetchone()[0] == "v8-message"
         assert db.execute("SELECT classification FROM classifications").fetchone()[0] == "ham"
         assert db.execute("SELECT name FROM sqlite_master WHERE name='attachments'").fetchone()

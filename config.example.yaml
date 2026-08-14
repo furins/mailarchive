@@ -10,7 +10,7 @@ retention:
   required_verified_backups_default: 2
 
 remote_deletion:
-  # M11 dry-run selection limits only. Production remote execution is unavailable before M12.
+  # Conservative M12 planning and production safety limits.
   max_per_run: 10
   max_per_account: 10
 
@@ -20,6 +20,10 @@ accounts:
     enabled: true
     remote_retention_days: 365
     remote_deletion_enabled: false
+    # DANGEROUS: true only permits this account to participate in an explicit
+    # remote-delete --execute-plan after every other M12 gate passes.
+    # Start with a dedicated non-production account.
+    # remote_deletion_enabled: true
     required_verified_backups: 2
     config_ref: env:MAILARCHIVE_PERSONAL_IMAP_PASSWORD
     imap:
@@ -61,6 +65,8 @@ accounts:
     gmail:
       account_email: user@example.com
       oauth_client_secret_file: /etc/mailarchive/secrets/google-oauth-client.json
+      # Separate high-privilege mutation credential; never use config_ref here.
+      remote_delete_token_file: /etc/mailarchive/secrets/personal-gmail-delete-token.json
       poll_interval_seconds: 90
 
   legacy-pop3:

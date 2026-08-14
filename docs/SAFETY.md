@@ -79,31 +79,51 @@ Example:
 ```text
 mailarchive deletion-candidates
 mailarchive remote-delete --dry-run
-mailarchive remote-delete --execute
+mailarchive remote-delete --execute-plan RUN_ID --account ACCOUNT
 ```
 
-`--execute` MAY be replaced by another explicit opt-in mechanism.
+M12 uses the exact `--execute-plan RUN_ID --account ACCOUNT` mechanism; there is no generic
+`--execute`, force, retry, or resume option.
 
 A default invocation MUST NOT delete.
 
 ### M10 candidate policy is not deletion authorization
 
 M10 computes local candidate-policy eligibility only. Its `deletion-candidates` and retention
-reports never contact a provider or Borg and always expose `execution_authorized=false`. Actual
-remote deletion remains a future M11/M12 operation requiring a separate explicit execution switch,
-dry-run behavior, provider-specific safeguards, and auditability.
+reports never contact a provider or Borg and always expose `execution_authorized=false`. Eligibility
+is necessary but never by itself authorizes a provider mutation.
 
 ### M11 planning is not production execution authorization
 
-M11 requires `remote-delete --dry-run`, freshly reruns M10 from current local state, and records
-only a local target snapshot. Production execution is unavailable before M12. Before a future
-destructive call begins, a committed `started` row must exist. If completion cannot be proven,
-the row is `unknown`, later work stops, automatic retry is forbidden, and operator reconciliation
-is required.
+M11/M12 dry-run requires `remote-delete --dry-run`, freshly reruns M10 from current local state,
+and records an immutable local target snapshot. It makes no provider connection. A production
+execution may consume exactly one completed, account-filtered source plan only once. It requires
+per-account `remote_deletion_enabled: true`, expires after 60 minutes, repeats M10 safety and
+target-fingerprint validation before setup and each call, and creates a separate production run.
+
+The closed production factory selects only the configured IMAP, Gmail, or POP3 mutation capability.
+Before every destructive call, the run has a committed `started` mutation and bounded audit event.
+Execution is serial and halts on the first stale, failed, or unknown result; later planned rows
+remain planned. There is no automatic retry or resume.
+
+IMAP requires exact folder, UIDVALIDITY, UID, `BODY.PEEK[]` SHA-256, and UIDPLUS, then may use only
+exact UID STORE `\\Deleted` and exact UID EXPUNGE. Global EXPUNGE and CLOSE are forbidden. Gmail
+acquisition remains `gmail.readonly`; mutation uses a separate 0600 non-symlink credential outside
+`archive.root` with only `https://mail.google.com/`, validates profile and exact Message.id RAW
+SHA-256, sends at most one DELETE, and confirms with GET. POP3 treats UIDL as durable identity,
+resolves the session-local message number freshly, RETRs and hashes it, sends at most one DELE, and
+commits only with deliberate QUIT. POP3 acquisition, mutation, and observation share an account
+lock.
+
+If completion cannot be proven, the mutation is `unknown`, local remote presence is not cleared,
+the run is halted, and the operator must use `remote-mutations reconcile --run-id RUN_ID`.
+Reconciliation is read-only, observes the historical target, never resumes planned work, and can
+resolve only confirmed absence or exact current presence. See `REMOTE_DELETION_RUNBOOK.md` for the
+operator procedure.
 
 ## 7. Rate limiting and blast-radius control
 
-When remote deletion is eventually enabled:
+For controlled remote deletion:
 
 - per-run deletion limits SHALL exist;
 - per-account limits SHOULD exist;
@@ -116,10 +136,8 @@ Suggested rollout:
 1. reports only;
 2. dry-run;
 3. test account;
-4. 10 messages;
-5. 100 messages;
-6. 1,000 messages;
-7. normal policy only after review.
+4. one message;
+5. a very small batch only after review.
 
 ## 8. Spam safety
 

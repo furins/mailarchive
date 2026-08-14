@@ -174,7 +174,27 @@ def _gmail_config(account: Mapping[object, object], label: str, archive_root: Pa
     poll = values.get("poll_interval_seconds", 90)
     if isinstance(poll, bool) or not isinstance(poll, int) or not 60 <= poll <= 120:
         raise ConfigError(f"{label}.gmail.poll_interval_seconds must be 60..120")
-    return GmailConfig(email, client_file, poll)
+    delete_token = values.get("remote_delete_token_file")
+    if delete_token is not None and not isinstance(delete_token, str):
+        raise ConfigError(f"{label}.gmail.remote_delete_token_file must be a path string")
+    delete_path = (
+        None
+        if delete_token is None
+        else _absolute_secret_path(
+            delete_token, f"{label}.gmail.remote_delete_token_file", archive_root
+        )
+    )
+    config_ref = account.get("config_ref")
+    if delete_path is not None and isinstance(config_ref, str) and config_ref.startswith("file:"):
+        readonly_path = Path(config_ref[5:]).resolve(strict=False)
+        if readonly_path == delete_path:
+            raise ConfigError(f"{label}.gmail.remote_delete_token_file must differ from config_ref")
+    return GmailConfig(
+        email,
+        client_file,
+        poll,
+        delete_path,
+    )
 
 
 def _pop3_config(account: Mapping[object, object], label: str) -> Pop3Config:
@@ -324,11 +344,6 @@ def load_config(path: Path) -> AppConfig:
         remote_deletion_enabled = _required_bool(
             account, "remote_deletion_enabled", label, REMOTE_DELETION_DEFAULT
         )
-        if remote_deletion_enabled:
-            raise ConfigError(
-                f"{label}.remote_deletion_enabled: production remote deletion is unavailable "
-                "before M12"
-            )
         config_ref = _required_string(account, "config_ref", label)
         gmail = None
         pop3 = None

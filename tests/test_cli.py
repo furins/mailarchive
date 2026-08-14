@@ -1,6 +1,9 @@
+# ruff: noqa: E501
+
 from __future__ import annotations
 
 import json
+import socket
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -9,11 +12,14 @@ import yaml
 
 import mailarchive.cli as cli_module
 import mailarchive.gmail as gmail_module
+import mailarchive.gmail_mutation as gmail_mutation_module
+import mailarchive.remote_mutation as remote_mutation_module
 from mailarchive.classification import ClassificationResult, apply_classification
 from mailarchive.cli import build_parser, main
 from mailarchive.config import load_config
 from mailarchive.db import account_id, connect, initialize
 from mailarchive.ingest import ingest_bytes
+from mailarchive.models import AccountConfig
 
 
 def test_cli_help_works(capsys: pytest.CaptureFixture[str]) -> None:
@@ -37,10 +43,154 @@ def test_remote_delete_is_explicit_dry_run_only() -> None:
     assert "remote-delete" in help_text.lower()
 
 
+def test_gmail_auth_and_auth_delete_use_separate_authorizers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "gmail.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "archive": {"root": str(tmp_path / "archive"), "timezone": "UTC"},
+                "database": {"path": str(tmp_path / "state.db")},
+                "accounts": {
+                    "gmail": {
+                        "kind": "gmail",
+                        "enabled": True,
+                        "remote_retention_days": 365,
+                        "required_verified_backups": 2,
+                        "config_ref": f"file:{tmp_path / 'readonly.json'}",
+                        "gmail": {
+                            "account_email": "user@example.test",
+                            "oauth_client_secret_file": "/tmp/client.json",
+                            "remote_delete_token_file": str(tmp_path / "delete.json"),
+                        },
+                    }
+                },
+            }
+        )
+    )
+    calls: list[str] = []
+
+    def readonly_authorize(_account: AccountConfig) -> str:
+        calls.append("readonly")
+        return "user@example.test"
+
+    def delete_authorize(_account: AccountConfig) -> str:
+        calls.append("delete")
+        return "user@example.test"
+
+    monkeypatch.setattr(
+        cli_module, "authorize", readonly_authorize
+    )
+    monkeypatch.setattr(cli_module, "authorize_delete", delete_authorize)
+    assert main(["gmail", "auth", "--account", "gmail", "--config", str(config_path)]) == 0
+    assert calls == ["readonly"]
+    assert main(["gmail", "auth-delete", "--account", "gmail", "--config", str(config_path)]) == 0
+    assert calls == ["readonly", "delete"]
+
+
 def test_db_init_and_status(config_file: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["db", "init", "--config", str(config_file)]) == 0
     assert main(["status", "--config", str(config_file), "--json"]) == 0
     assert '"database_initialized": true' in capsys.readouterr().out
+
+
+def test_remote_mutations_status_is_local_and_global_status_is_truthful(
+    config_file: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(config_file)
+    initialize(config.database.path, config.accounts)
+    with connect(config.database.path) as db:
+        now = datetime.now(UTC).isoformat()
+        run = db.execute(
+            """INSERT INTO remote_mutation_runs(requested_at,completed_at,mode,status,account_filter,
+            requested_limit,effective_max_per_run,effective_max_per_account,eligible_count,selected_count,
+            skipped_limit_count,policy_version) VALUES(?,?,'dry-run','completed','test',NULL,1,1,0,0,0,'retention-v1')""",
+            (now, now),
+        )
+        assert run.lastrowid is not None
+        run_id = int(run.lastrowid)
+        db.commit()
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("local mutation status must not access a provider boundary")
+
+    monkeypatch.setattr(remote_mutation_module, "observation_adapter_factory", forbidden)
+    monkeypatch.setattr(remote_mutation_module, "production_adapter_factory", forbidden)
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    monkeypatch.setattr(gmail_mutation_module.requests, "Session", forbidden)
+    assert main(["remote-mutations", "status", "--config", str(config_file), "--json"]) == 0
+    assert [run["run_id"] for run in json.loads(capsys.readouterr().out)["runs"]] == [run_id]
+    assert main(["status", "--config", str(config_file), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["remote_reconciliation_supported"] is True
+    assert payload["remote_mutation_supported"] is True
+    assert payload["remote_deletion_accounts"] == [{"account": "test", "enabled": False}]
+
+
+def test_remote_mutations_reconcile_uses_one_exact_run_and_emits_bounded_summary(
+    config_file: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[int] = []
+
+    def reconcile(_config: object, run_id: int) -> dict[str, object]:
+        seen.append(run_id)
+        return {
+            "run_id": run_id,
+            "status": "halted",
+            "observed": 1,
+            "resolved_absent": 0,
+            "resolved_present": 0,
+            "unresolved": 1,
+            "resumed": False,
+        }
+
+    monkeypatch.setattr(cli_module, "reconcile_production_run", reconcile)
+    assert (
+        main(
+            [
+                "remote-mutations",
+                "reconcile",
+                "--run-id",
+                "42",
+                "--config",
+                str(config_file),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    assert seen == [42]
+    assert json.loads(capsys.readouterr().out)["resumed"] is False
+
+
+def test_remote_mutations_status_filters_exact_account_locally(
+    config_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    values = yaml.safe_load(config_file.read_text())
+    values["accounts"]["account-a"] = values["accounts"].pop("test")
+    values["accounts"]["account-b"] = dict(values["accounts"]["account-a"])
+    config_file.write_text(yaml.safe_dump(values))
+    config = load_config(config_file)
+    initialize(config.database.path, config.accounts)
+    with connect(config.database.path) as db:
+        now = datetime.now(UTC).isoformat()
+        ids: dict[str, int] = {}
+        for account in ("account-a", "account-b"):
+            row = db.execute(
+                """INSERT INTO remote_mutation_runs(requested_at,completed_at,mode,status,account_filter,
+                requested_limit,effective_max_per_run,effective_max_per_account,eligible_count,selected_count,
+                skipped_limit_count,policy_version) VALUES(?,?,'dry-run','completed',?,NULL,1,1,0,0,0,'retention-v1')""",
+                (now, now, account),
+            )
+            assert row.lastrowid is not None
+            ids[account] = int(row.lastrowid)
+        db.commit()
+    assert main(["remote-mutations", "status", "--account", "account-a", "--config", str(config_file), "--json"]) == 0
+    assert [run["account_filter"] for run in json.loads(capsys.readouterr().out)["runs"]] == ["account-a"]
+    with pytest.raises(SystemExit) as error:
+        main(["remote-mutations", "status", "--run-id", str(ids["account-b"]), "--account", "account-a", "--config", str(config_file)])
+    assert error.value.code == 2
 
 
 def test_search_scope_is_forwarded_without_lifecycle_query_parsing(
@@ -225,7 +375,59 @@ def test_ingest_json_output(
     assert '"canonical_message_id"' in output
 
 
-def test_cli_has_no_execute_remote_command() -> None:
-    help_text = build_parser().format_help().lower()
-    assert "--execute" not in help_text
-    assert "network" not in help_text
+def test_remote_delete_cli_requires_one_explicit_mode(config_file: Path) -> None:
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["remote-delete", "--config", str(config_file)])
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["remote-delete", "--dry-run", "--execute-plan", "1", "--config", str(config_file)]
+        )
+    with pytest.raises(SystemExit):
+        main(["remote-delete", "--execute-plan", "1", "--config", str(config_file)])
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "remote-delete", "--execute-plan", "1", "--account", "test", "--limit", "1",
+                "--config", str(config_file),
+            ]
+        )
+    assert main(["remote-delete", "--dry-run", "--limit", "1", "--config", str(config_file)]) == 0
+
+
+def test_remote_delete_dry_run_remains_provider_isolated_after_default_factory_wiring(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("dry-run must not construct a provider adapter or access a provider")
+
+    monkeypatch.setattr(remote_mutation_module, "production_adapter_factory", forbidden)
+    monkeypatch.setattr(remote_mutation_module, "observation_adapter_factory", forbidden)
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    monkeypatch.setattr(gmail_mutation_module.requests, "Session", forbidden)
+    assert (
+        main(["remote-delete", "--dry-run", "--account", "test", "--config", str(config_file)])
+        == 0
+    )
+
+
+def test_execute_plan_default_m12_a_factory_leaves_no_production_run(
+    config_file: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mailarchive.remote_mutation import plan_dry_run
+
+    config = load_config(config_file)
+    initialize(config.database.path, config.accounts)
+    # An empty source plan is enough to prove parser gate behavior, while provider
+    # construction is separately covered by the production-engine test.
+    source = plan_dry_run(config, account="test")
+    with pytest.raises(SystemExit) as result:
+        main(
+            [
+                "remote-delete", "--execute-plan", str(source["run_id"]), "--account", "test",
+                "--config", str(config_file),
+            ]
+        )
+    assert result.value.code == 2
+    error = capsys.readouterr().err.lower()
+    assert "production" in error or "source" in error

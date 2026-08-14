@@ -48,6 +48,7 @@ class GmailConfig:
     account_email: str
     oauth_client_secret_file: Path
     poll_interval_seconds: int = 90
+    remote_delete_token_file: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -98,7 +99,7 @@ class RetentionConfig:
 
 @dataclass(frozen=True)
 class RemoteDeletionConfig:
-    """M11 planning-only blast-radius limits; production mutation is unavailable."""
+    """M12-A production-execution limits; provider wiring remains unavailable."""
 
     max_per_run: int = 10
     max_per_account: int = 10

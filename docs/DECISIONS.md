@@ -287,3 +287,41 @@ The fake state machine commits `started` before calling a fake adapter. Confirme
 failure and unknown outcomes are distinct; unknown is never retried and halts the run. A local
 fresh-policy and fingerprint revalidation rejects stale targets before a fake call. M12 exclusively
 owns any discussion or implementation of real provider writes.
+
+# ADR-022: Dedicated M12 IMAP mutation capability
+
+M12 isolates the production-capable IMAP operation in `imap_mutation.py`; M3/M4 acquisition
+remains read-only. The closed production factory selects it only for a configured IMAP account.
+Construction performs local configuration and credential-reference validation only. The adapter
+takes the existing account/folder lock across connection through confirmation, requires UIDPLUS,
+validates UIDVALIDITY and exact BODY.PEEK[] SHA-256, and refuses a preexisting `\\Deleted` target.
+It may only issue UID STORE for the one planned UID followed by UID EXPUNGE for that UID. Global
+EXPUNGE and CLOSE are prohibited. Read-only observation uses the same lock and historical identity.
+
+# ADR-023: Separate M12 Gmail mutation credential
+
+M12 never broadens M5's `gmail.readonly` token. A distinct 0600 non-symlink token outside the
+archive uses only `https://mail.google.com/` as Gmail mailbox scope. Its adapter verifies the
+profile at authorization and execution, addresses only exact Message.id, compares decoded RAW with
+the canonical SHA-256, issues at most one DELETE, and confirms absence with GET. The production
+factory uses this adapter only for configured Gmail accounts with explicit deletion opt-in.
+
+# ADR-024: Dedicated M12 POP3 mutation session and serialization
+
+M12 must not reuse M6's acquisition wire after DELE because its normal close sends QUIT. The
+dedicated mutation wire offers only explicit `quit_and_commit()` and
+`abort_without_quit()` lifecycle operations. It treats UIDL, not POP3 message number, as durable
+identity; each session resolves UIDL freshly, RETRs exact bytes, and hashes them before one DELE.
+Fresh UIDL observation is required after QUIT or any uncertainty, and no attempt retries DELE.
+The production factory selects this adapter only for configured POP3 accounts with explicit opt-in.
+POP3 acquisition, deletion, and read-only reconciliation serialize per account. Otherwise an M6
+sync holding an older UIDL snapshot could restore `remote_present=1` after deletion is confirmed.
+
+# ADR-025: Historical read-only reconciliation
+
+Production attempts are never retried or resumed automatically. A started or unknown mutation is
+reconciled only by a read-only provider observation of the immutable historical mutation target.
+Confirmed absence resolves the historical mutation as succeeded; exact present bytes resolve it as
+failed; conflict or unprovable state remains unknown. A current `remote_messages` row is updated
+only when its identity still coheres with the historical target, preventing old evidence from being
+applied to a drifted provider identity.

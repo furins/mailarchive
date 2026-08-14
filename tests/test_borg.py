@@ -184,7 +184,8 @@ def test_restore_identity_mismatch_is_recorded(
     with connect(config.database.path) as db:
         db.execute(
             "UPDATE backup_repositories "
-            "SET repository_identity='0' || substr(repository_identity,2)"
+            "SET repository_identity=CASE WHEN substr(repository_identity,1,1)='x' "
+            "THEN 'y' ELSE 'x' END || substr(repository_identity,2)"
         )
         db.commit()
     with pytest.raises(BorgError, match="Borg operation failed"):

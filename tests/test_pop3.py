@@ -3,14 +3,24 @@ from __future__ import annotations
 # pyright: reportUnknownMemberType=false, reportUnknownArgumentType=false, reportUnknownLambdaType=false, reportArgumentType=false
 import socketserver
 import threading
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from mailarchive.config import load_config
-from mailarchive.db import connect
+from mailarchive.db import account_id, connect, initialize
 from mailarchive.ingest import ingest_bytes
-from mailarchive.pop3 import Pop3Adapter, Pop3Error, Pop3Wire, register_pop3_link
+from mailarchive.pop3 import (
+    Pop3Adapter,
+    Pop3Error,
+    Pop3SyncBusyError,
+    Pop3Wire,
+    pop3_lock,
+    register_pop3_link,
+)
+from mailarchive.pop3_mutation import Pop3MutationAdapter
+from mailarchive.remote_mutation import ProviderDeletionTarget
 
 
 def _config(tmp_path: Path) -> Path:
@@ -293,6 +303,102 @@ def test_pop3_password_is_not_in_error_or_audit(
     monkeypatch.setattr("mailarchive.pop3._Pop3Wire", FakeWire)
     Pop3Adapter(config).sync("pop")
     assert secret not in str(config.database.path.read_bytes())
+
+
+def test_shared_pop3_lock_blocks_acquisition_before_wire_or_local_updates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(_config(tmp_path))
+    initialize(config.database.path, config.accounts)
+    monkeypatch.setenv("POP_TEST_PASSWORD", "safe")
+    constructed = 0
+
+    def unexpected_wire(_settings: object) -> object:
+        nonlocal constructed
+        constructed += 1
+        raise AssertionError("POP3 wire must not be constructed while account is busy")
+
+    monkeypatch.setattr("mailarchive.pop3._Pop3Wire", unexpected_wire)
+    with connect(config.database.path) as db:
+        before = db.execute(
+            "SELECT id,provider_message_id,remote_present FROM remote_messages ORDER BY id"
+        ).fetchall()
+    with pop3_lock(config, config.accounts[0]):
+        with pytest.raises(Pop3SyncBusyError):
+            Pop3Adapter(config).sync("pop")
+    with connect(config.database.path) as db:
+        after = db.execute(
+            "SELECT id,provider_message_id,remote_present FROM remote_messages ORDER BY id"
+        ).fetchall()
+    assert constructed == 0 and after == before
+
+
+def test_pop3_acquisition_snapshot_holds_lock_against_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(_config(tmp_path))
+    initialize(config.database.path, config.accounts)
+    monkeypatch.setenv("POP_TEST_PASSWORD", "safe")
+    entered, release = threading.Event(), threading.Event()
+
+    class BlockingWire(FakeWire):
+        messages = {1: ("U1", b"Message-ID: <same>\r\n\r\nA")}
+
+        def uidls(self) -> dict[int, str]:
+            entered.set()
+            assert release.wait(timeout=5)
+            return super().uidls()
+
+    monkeypatch.setattr("mailarchive.pop3._Pop3Wire", BlockingWire)
+    with connect(config.database.path) as db:
+        aid = account_id(db, "pop")
+    assert aid is not None
+    mutation_wires = 0
+
+    def unexpected_mutation_wire(_settings: object) -> object:
+        nonlocal mutation_wires
+        mutation_wires += 1
+        raise AssertionError("mutation wire must not be constructed while sync owns lock")
+
+    target = ProviderDeletionTarget(
+        "historical",
+        "canonical",
+        aid,
+        "pop",
+        "pop3",
+        "0" * 64,
+        "U1",
+    )
+    mutation = Pop3MutationAdapter(
+        config,
+        "pop",
+        wire_factory=unexpected_mutation_wire,
+    )
+    result: list[object] = []
+    thread = threading.Thread(target=lambda: result.append(Pop3Adapter(config).sync("pop")))
+    thread.start()
+    assert entered.wait(timeout=5)
+    blocked = mutation.delete(target)
+    assert blocked.error_code == "REMOTE_STATE_CONFLICT"
+    assert mutation_wires == 0
+    release.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive() and result
+
+
+def test_pop3_locks_are_account_scoped_and_release_after_failure(tmp_path: Path) -> None:
+    config = load_config(_config(tmp_path))
+    first = config.accounts[0]
+    second = replace(first, name="pop-b")
+    second_config = replace(config, accounts=(first, second))
+    with pop3_lock(config, first):
+        with pop3_lock(second_config, second):
+            pass
+    with pytest.raises(Pop3Error):
+        with pop3_lock(config, first):
+            raise Pop3Error("fixture failure")
+    with pop3_lock(config, first):
+        pass
 
 
 def test_pop3_config_requires_uidl_capable_explicit_configuration(tmp_path: Path) -> None:

@@ -4,7 +4,9 @@ Local-first, searchable and verifiable email archiving for multiple Gmail, IMAP 
 
 ## Status
 
-M5 adds read-only Gmail REST acquisition. Gmail `Message.id` is global provider identity, while
+M12 completes controlled, explicit remote deletion for opted-in IMAP, Gmail, and POP3 accounts;
+the full operating procedure is [the remote deletion runbook](docs/REMOTE_DELETION_RUNBOOK.md).
+M5 Gmail acquisition remains read-only. Gmail `Message.id` is global provider identity, while
 labels and thread IDs are metadata only; `messages.get(format=RAW)` bytes are canonically ingested
 unchanged. Gmail history is polled every 90 seconds by default, includes SPAM/TRASH inventory, and
 never uses Gmail IMAP, Pub/Sub, or mailbox mutation. See `docs/GMAIL_SETUP.md`.
@@ -72,8 +74,8 @@ uv run mailarchive search 'date:2020-01-01..2022-12-31 AND fattura' --config ./y
 uv run mailarchive status --config ./your-config.yaml --json
 ```
 
-`remote_deletion_enabled` defaults to `false`; M0 has no remote-mutation command or
-provider implementation. `remote_retention_days: never` is the explicit never-delete
+`remote_deletion_enabled` defaults to `false`; remote deletion is an explicit, separately
+authorized M12 operation. `remote_retention_days: never` is the explicit never-delete
 configuration. Configuration summaries redact `config_ref` values.
 
 ## M10 retention reports
@@ -87,12 +89,27 @@ canonical file SHA-256. Local holds use
 `mailarchive retention hold|release --canonical-id ID --kind keep-online|legal-hold --reason TEXT`.
 No report, control, or status command contacts a provider or Borg.
 
-## M11 remote-delete dry run
+## M12 controlled remote deletion
 
-`mailarchive remote-delete --dry-run --config CONFIG` performs a fresh local M10
-evaluation and appends an exact, rate-limited target snapshot. It cannot execute a
-provider mutation: M11 has no `--execute` command, write-capable adapter, or Gmail
-write scope. `remote_deletion.max_per_run` and `max_per_account` both default to 10.
+M12 is an explicit, operator-driven remote deletion workflow. A local-only
+`mailarchive remote-delete --dry-run --account ACCOUNT --limit N --config CONFIG` freshly evaluates
+M10 and records an immutable, account-filtered exact target plan. It performs zero provider I/O;
+the plan expires after 60 minutes and `--limit` applies only to planning.
+
+Destructive execution requires the exact source run and account:
+`mailarchive remote-delete --execute-plan RUN_ID --account ACCOUNT --config CONFIG`. The account
+must be enabled and explicitly opted in with `remote_deletion_enabled: true`. Execution revalidates
+current eligibility and identity, creates a separate production run, commits `started` evidence
+before each provider call, and stops on the first non-success. There is no automatic retry or
+resume. Unknown outcomes require explicit read-only reconciliation with
+`mailarchive remote-mutations reconcile --run-id PRODUCTION_RUN_ID --config CONFIG`.
+
+The closed production factory uses dedicated IMAP, Gmail, and POP3 mutation adapters. IMAP deletes
+only an exact UID after UIDVALIDITY and byte-hash verification using UIDPLUS; Gmail uses a separate
+full-scope mutation credential and exact `Message.id`; POP3 uses fresh UIDL, RETR hash validation,
+one DELE, and an explicit QUIT. The canonical archive and verified backup evidence are never
+deleted as a consequence of provider deletion. See the cautious operator procedure in
+[the remote deletion runbook](docs/REMOTE_DELETION_RUNBOOK.md).
 
 M1 stores each account's byte-unique message at
 `<archive.root>/mail/<account>/cur/<sha256>.eml`. The source is read in binary mode and

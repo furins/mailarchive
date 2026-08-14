@@ -26,12 +26,11 @@ def test_deletion_defaults_to_false(config_file: Path) -> None:
     assert config.accounts[0].remote_deletion_enabled is False
 
 
-def test_deletion_enablement_is_rejected_in_m0(config_file: Path) -> None:
+def test_deletion_enablement_is_accepted_for_explicit_m12_execution(config_file: Path) -> None:
     values = yaml.safe_load(config_file.read_text(encoding="utf-8"))
     values["accounts"]["test"]["remote_deletion_enabled"] = True
     config_file.write_text(yaml.safe_dump(values), encoding="utf-8")
-    with pytest.raises(ConfigError, match="unavailable before M12"):
-        load_config(config_file)
+    assert load_config(config_file).accounts[0].remote_deletion_enabled is True
 
 
 def test_negative_retention_rejected(config_file: Path) -> None:

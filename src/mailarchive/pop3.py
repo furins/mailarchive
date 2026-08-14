@@ -13,16 +13,41 @@ import os
 import socket
 import sqlite3
 import ssl
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 from mailarchive.db import account_id, connect, initialize, insert_audit_event, utc_now
 from mailarchive.imap import credential_variable
 from mailarchive.ingest import ingest_bytes
-from mailarchive.models import AppConfig, CanonicalMessage, Pop3Config
+from mailarchive.models import AccountConfig, AppConfig, CanonicalMessage, Pop3Config
 
 
 class Pop3Error(RuntimeError):
     """A POP3 operation was rejected or could not prove a safe local state."""
+
+
+class Pop3SyncBusyError(Pop3Error):
+    """The account's shared acquisition/mutation POP3 lock is already held."""
+
+
+@contextmanager
+def pop3_lock(config: AppConfig, account: AccountConfig) -> Generator[None]:
+    """Serialize every POP3 provider snapshot for one account, non-blockingly."""
+    import fcntl
+
+    digest = hashlib.sha256(account.name.encode()).hexdigest()[:16]
+    path = config.archive.root.resolve() / "state" / "locks" / f"pop3-{digest}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise Pop3SyncBusyError("POP3 account synchronization is already running") from error
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 @dataclass(frozen=True)
@@ -237,13 +262,29 @@ class Pop3Adapter:
             raise Pop3Error("account is not configured for POP3 synchronization")
         if not account.enabled:
             raise Pop3Error("account is disabled")
-        password = os.environ.get(credential_variable(account.config_ref))
-        if not password:
-            raise Pop3Error("missing POP3 credential environment variable")
         initialize(self.config.database.path, self.config.accounts)
         from mailarchive.classification import reconcile_pending
 
         reconcile_pending(self.config, account_name=account_name)
+        try:
+            with pop3_lock(self.config, account):
+                return self._sync_locked(account_name, account)
+        except Exception as error:
+            _audit(
+                self.config,
+                account_name,
+                "pop3.sync.failed",
+                "failed",
+                {"reason": type(error).__name__},
+            )
+            raise
+
+    def _sync_locked(self, account_name: str, account: AccountConfig) -> Pop3SyncResult:
+        """Keep one provider UIDL snapshot and every derived local write under pop3_lock."""
+        assert account.pop3 is not None
+        password = os.environ.get(credential_variable(account.config_ref))
+        if not password:
+            raise Pop3Error("missing POP3 credential environment variable")
         client = _Pop3Wire(account.pop3)
         imported = reused = 0
         try:
@@ -289,14 +330,5 @@ class Pop3Adapter:
                 {"seen": len(uidls), "imported": imported, "reused": reused},
             )
             return Pop3SyncResult(len(uidls), imported, reused, len(uidls))
-        except Exception as error:
-            _audit(
-                self.config,
-                account_name,
-                "pop3.sync.failed",
-                "failed",
-                {"reason": type(error).__name__},
-            )
-            raise
         finally:
             client.close()
