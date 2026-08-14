@@ -153,6 +153,45 @@ class ProductionAdapter:
         return self.result
 
 
+class StartedAuditAdapter:
+    """Proves the destructive call sees the committed production evidence."""
+
+    def __init__(self, database_path: Path) -> None:
+        self.database_path = database_path
+        self.started_state_visible = False
+        self.started_audit_visible = False
+        self.calls: list[DeletionTarget] = []
+
+    def delete(self, target: DeletionTarget) -> MutationResult:
+        self.calls.append(target)
+        with connect(self.database_path) as db:
+            self.started_state_visible = (
+                db.execute(
+                    "SELECT status FROM remote_mutations WHERE remote_message_id=? AND dry_run=0",
+                    (target.remote_message_id,),
+                ).fetchone()[0]
+                == "started"
+            )
+            self.started_audit_visible = (
+                db.execute(
+                    "SELECT COUNT(*) FROM audit_events WHERE event_type='remote_mutation.started' "
+                    "AND result='started'"
+                ).fetchone()[0]
+                == 1
+            )
+        return MutationResult("success-confirmed", confirmed_absent=True)
+
+
+class SequenceAdapter:
+    def __init__(self, results: list[MutationResult]) -> None:
+        self.results = results
+        self.calls: list[DeletionTarget] = []
+
+    def delete(self, target: DeletionTarget) -> MutationResult:
+        self.calls.append(target)
+        return self.results[len(self.calls) - 1]
+
+
 class ProductionFactory:
     def __init__(self, adapter: RemoteMutationAdapter) -> None:
         self.adapter = adapter
@@ -687,6 +726,187 @@ def test_production_executes_only_filtered_source_plan_and_preserves_history(
         )
 
 
+def _production_audit_types(config: AppConfig) -> list[str]:
+    with connect(config.database.path) as db:
+        return [
+            str(row[0])
+            for row in db.execute(
+                "SELECT event_type FROM audit_events "
+                "WHERE event_type LIKE 'remote_delete.production.%' "
+                "OR event_type LIKE 'remote_mutation.%' ORDER BY id"
+            )
+        ]
+
+
+def test_production_started_state_and_audit_are_committed_before_provider_call(
+    config_file: Path,
+) -> None:
+    config, _ = eligible_remote(config_file)
+    config = production_enabled(config)
+    source_id = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
+    adapter = StartedAuditAdapter(config.database.path)
+
+    production_id = execute_production_plan(
+        config, source_id, "test", adapter_factory=ProductionFactory(adapter)
+    )
+
+    assert adapter.started_state_visible is True
+    assert adapter.started_audit_visible is True
+    with connect(config.database.path) as db:
+        assert (
+            db.execute("SELECT status FROM remote_mutation_runs WHERE id=?", (production_id,)).fetchone()[
+                0
+            ]
+            == "completed"
+        )
+    assert _production_audit_types(config) == [
+        "remote_delete.production.started",
+        "remote_mutation.started",
+        "remote_mutation.succeeded",
+        "remote_delete.production.completed",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("result", "mutation_event"),
+    [
+        (
+            MutationResult("failure-confirmed-no-mutation", error_code="PROVIDER_REJECTED"),
+            "remote_mutation.failed",
+        ),
+        (
+            MutationResult("outcome-unknown", error_code="TRANSPORT_UNKNOWN"),
+            "remote_mutation.unknown",
+        ),
+    ],
+)
+def test_production_halt_audit_is_atomic_and_stops_later_rows(
+    config_file: Path, result: MutationResult, mutation_event: str
+) -> None:
+    config, _ = eligible_remote(config_file, remote_id="first", body=b"first")
+    eligible_remote(config_file, remote_id="second", body=b"second", remote_uid=10)
+    config = production_enabled(config)
+    source_id = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
+    adapter = SequenceAdapter([result])
+
+    production_id = execute_production_plan(
+        config, source_id, "test", adapter_factory=ProductionFactory(adapter)
+    )
+
+    assert [target.remote_message_id for target in adapter.calls] == ["first"]
+    with connect(config.database.path) as db:
+        assert (
+            db.execute("SELECT status FROM remote_mutation_runs WHERE id=?", (production_id,)).fetchone()[
+                0
+            ]
+            == "halted"
+        )
+        assert (
+            db.execute(
+                "SELECT status FROM remote_mutations WHERE mutation_run_id=? "
+                "AND remote_message_id='second'",
+                (production_id,),
+            ).fetchone()[0]
+            == "planned"
+        )
+    assert _production_audit_types(config) == [
+        "remote_delete.production.started",
+        "remote_mutation.started",
+        mutation_event,
+        "remote_delete.production.halted",
+    ]
+
+
+def test_production_adapter_exception_is_bounded_and_halted_once(config_file: Path) -> None:
+    config, _ = eligible_remote(config_file)
+    config = production_enabled(config)
+    source_id = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
+
+    production_id = execute_production_plan(
+        config, source_id, "test", adapter_factory=ProductionFactory(RawExceptionAdapter())
+    )
+
+    with connect(config.database.path) as db:
+        row = db.execute(
+            "SELECT status,error_code FROM remote_mutations WHERE mutation_run_id=?", (production_id,)
+        ).fetchone()
+        assert tuple(row) == ("unknown", "ADAPTER_EXCEPTION")
+        details = "\n".join(
+            str(item[0]) for item in db.execute("SELECT details_json FROM audit_events")
+        )
+        assert "super-secret" not in details and "private@example.test" not in details
+    assert _production_audit_types(config) == [
+        "remote_delete.production.started",
+        "remote_mutation.started",
+        "remote_mutation.unknown",
+        "remote_delete.production.halted",
+    ]
+
+
+def test_production_stale_target_halts_with_one_atomic_audit_transition(
+    config_file: Path,
+) -> None:
+    config, canonical_id = eligible_remote(config_file)
+    config = production_enabled(config)
+    source_id = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
+    adapter = SequenceAdapter([MutationResult("success-confirmed", confirmed_absent=True)])
+
+    def stale_factory(app_config: AppConfig, _account_name: str) -> RemoteMutationAdapter:
+        with connect(app_config.database.path) as db:
+            db.execute(
+                "INSERT INTO retention_controls VALUES(?,1,0,'test hold',?)",
+                (canonical_id, utc_now()),
+            )
+            db.commit()
+        return adapter
+
+    production_id = execute_production_plan(
+        config, source_id, "test", adapter_factory=stale_factory
+    )
+
+    assert adapter.calls == []
+    with connect(config.database.path) as db:
+        mutation = db.execute(
+            "SELECT status,error_code,completed_at FROM remote_mutations WHERE mutation_run_id=?",
+            (production_id,),
+        ).fetchone()
+        run = db.execute(
+            "SELECT status,completed_at FROM remote_mutation_runs WHERE id=?", (production_id,)
+        ).fetchone()
+        assert tuple(mutation[:2]) == ("failed", "STALE_PLAN") and mutation[2] is not None
+        assert tuple(run[:1]) == ("halted",) and run[1] is not None
+    assert _production_audit_types(config) == [
+        "remote_delete.production.started",
+        "remote_mutation.stale_plan",
+        "remote_delete.production.halted",
+    ]
+
+
+def test_production_multi_target_success_emits_one_run_lifecycle(config_file: Path) -> None:
+    config, _ = eligible_remote(config_file, remote_id="first", body=b"first")
+    eligible_remote(config_file, remote_id="second", body=b"second", remote_uid=10)
+    config = production_enabled(config)
+    source_id = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
+    adapter = SequenceAdapter(
+        [
+            MutationResult("success-confirmed", confirmed_absent=True),
+            MutationResult("success-confirmed", confirmed_absent=True),
+        ]
+    )
+
+    execute_production_plan(config, source_id, "test", adapter_factory=ProductionFactory(adapter))
+
+    assert [target.remote_message_id for target in adapter.calls] == ["first", "second"]
+    assert _production_audit_types(config) == [
+        "remote_delete.production.started",
+        "remote_mutation.started",
+        "remote_mutation.succeeded",
+        "remote_mutation.started",
+        "remote_mutation.succeeded",
+        "remote_delete.production.completed",
+    ]
+
+
 @pytest.mark.parametrize("change", ("legal_hold", "keep_online", "remote_present"))
 def test_production_stale_or_disabled_gate_never_calls_adapter(
     config_file: Path, change: str
@@ -871,6 +1091,12 @@ def test_fake_success_persists_result_and_only_changes_remote_observation(
     with connect(config.database.path) as db:
         assert db.execute("SELECT status FROM remote_mutations").fetchone()[0] == "succeeded"
         assert db.execute("SELECT remote_present FROM remote_messages").fetchone()[0] == 0
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM audit_events WHERE event_type LIKE 'remote_delete.production.%'"
+            ).fetchone()[0]
+            == 0
+        )
         assert (
             db.execute(
                 "SELECT sha256 FROM canonical_messages WHERE id=?", (canonical_id,)

@@ -831,6 +831,7 @@ def execute_production_plan(
 
 
 def _execute_serial(config: AppConfig, run_id: int, adapter: RemoteMutationAdapter) -> None:
+    """Run one production plan serially; every provider call has committed audit state."""
     while True:
         with connect(config.database.path) as db:
             row = db.execute(
@@ -838,24 +839,51 @@ def _execute_serial(config: AppConfig, run_id: int, adapter: RemoteMutationAdapt
                 (run_id,),
             ).fetchone()
             if row is None:
+                now = utc_now()
                 db.execute(
                     "UPDATE remote_mutation_runs SET status='completed',completed_at=? WHERE id=?",
-                    (utc_now(), run_id),
+                    (now, run_id),
+                )
+                insert_audit_event(
+                    db,
+                    actor="mailarchive.remote_mutation",
+                    event_type="remote_delete.production.completed",
+                    result="success",
+                    details_json=json.dumps({"run_id": run_id}, sort_keys=True),
                 )
                 db.commit()
                 return
             target = _planned_target(db, int(row["id"]))
         if not _still_current(config, target, str(row["target_fingerprint_sha256"])):
-            _halt_stale(config, run_id, int(row["id"]))
+            _halt_stale(config, run_id, int(row["id"]), target, production=True)
             return
         with connect(config.database.path) as db:
+            now = utc_now()
             db.execute(
                 "UPDATE remote_mutations SET status='started',started_at=? WHERE id=?",
-                (utc_now(), row["id"]),
+                (now, row["id"]),
+            )
+            insert_audit_event(
+                db,
+                actor="mailarchive.remote_mutation",
+                event_type="remote_mutation.started",
+                result="started",
+                account_id=target.account_id,
+                details_json=json.dumps(
+                    {
+                        "account_id": target.account_id,
+                        "mutation_id": int(row["id"]),
+                        "provider_kind": target.provider_kind,
+                        "run_id": run_id,
+                    },
+                    sort_keys=True,
+                ),
             )
             db.commit()
         try:
-            status = _record_outcome(config, run_id, int(row["id"]), target, adapter.delete(target))
+            status = _record_outcome(
+                config, run_id, int(row["id"]), target, adapter.delete(target), production=True
+            )
         except Exception:
             status = _record_outcome(
                 config,
@@ -864,12 +892,20 @@ def _execute_serial(config: AppConfig, run_id: int, adapter: RemoteMutationAdapt
                 target,
                 MutationResult("outcome-unknown"),
                 internal_error_code="ADAPTER_EXCEPTION",
+                production=True,
             )
         if status != "succeeded":
             return
 
 
-def _halt_stale(config: AppConfig, run_id: int, mutation_id: int) -> None:
+def _halt_stale(
+    config: AppConfig,
+    run_id: int,
+    mutation_id: int,
+    target: DeletionTarget | None = None,
+    *,
+    production: bool = False,
+) -> None:
     with connect(config.database.path) as db:
         now = utc_now()
         db.execute(
@@ -886,8 +922,29 @@ def _halt_stale(config: AppConfig, run_id: int, mutation_id: int) -> None:
             actor="mailarchive.remote_mutation",
             event_type="remote_mutation.stale_plan",
             result="failed",
-            details_json="{}",
+            account_id=target.account_id if target is not None else None,
+            details_json=(
+                json.dumps({"mutation_id": mutation_id, "run_id": run_id}, sort_keys=True)
+                if production
+                else "{}"
+            ),
         )
+        if production:
+            insert_audit_event(
+                db,
+                actor="mailarchive.remote_mutation",
+                event_type="remote_delete.production.halted",
+                result="halted",
+                account_id=target.account_id if target is not None else None,
+                details_json=json.dumps(
+                    {
+                        "mutation_id": mutation_id,
+                        "reason": "stale-plan",
+                        "run_id": run_id,
+                    },
+                    sort_keys=True,
+                ),
+            )
         db.commit()
 
 
@@ -899,6 +956,7 @@ def _record_outcome(
     result: MutationResult,
     *,
     internal_error_code: str | None = None,
+    production: bool = False,
 ) -> str:
     status, summary, error_code = _normalize_result(result, internal_error_code=internal_error_code)
     with connect(config.database.path) as db:
@@ -925,5 +983,23 @@ def _record_outcome(
                 "UPDATE remote_mutation_runs SET status='halted',completed_at=? WHERE id=?",
                 (now, run_id),
             )
+            if production:
+                insert_audit_event(
+                    db,
+                    actor="mailarchive.remote_mutation",
+                    event_type="remote_delete.production.halted",
+                    result="halted",
+                    account_id=target.account_id,
+                    details_json=json.dumps(
+                        {
+                            "mutation_id": mutation_id,
+                            "reason": "mutation-failed"
+                            if status == "failed"
+                            else "mutation-unknown",
+                            "run_id": run_id,
+                        },
+                        sort_keys=True,
+                    ),
+                )
         db.commit()
     return status
