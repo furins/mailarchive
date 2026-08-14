@@ -1,3 +1,5 @@
+# ruff: noqa: E501
+
 from __future__ import annotations
 
 import json
@@ -140,6 +142,35 @@ def test_remote_mutations_reconcile_uses_one_exact_run_and_emits_bounded_summary
     )
     assert seen == [42]
     assert json.loads(capsys.readouterr().out)["resumed"] is False
+
+
+def test_remote_mutations_status_filters_exact_account_locally(
+    config_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    values = yaml.safe_load(config_file.read_text())
+    values["accounts"]["account-a"] = values["accounts"].pop("test")
+    values["accounts"]["account-b"] = dict(values["accounts"]["account-a"])
+    config_file.write_text(yaml.safe_dump(values))
+    config = load_config(config_file)
+    initialize(config.database.path, config.accounts)
+    with connect(config.database.path) as db:
+        now = datetime.now(UTC).isoformat()
+        ids: dict[str, int] = {}
+        for account in ("account-a", "account-b"):
+            row = db.execute(
+                """INSERT INTO remote_mutation_runs(requested_at,completed_at,mode,status,account_filter,
+                requested_limit,effective_max_per_run,effective_max_per_account,eligible_count,selected_count,
+                skipped_limit_count,policy_version) VALUES(?,?,'dry-run','completed',?,NULL,1,1,0,0,0,'retention-v1')""",
+                (now, now, account),
+            )
+            assert row.lastrowid is not None
+            ids[account] = int(row.lastrowid)
+        db.commit()
+    assert main(["remote-mutations", "status", "--account", "account-a", "--config", str(config_file), "--json"]) == 0
+    assert [run["account_filter"] for run in json.loads(capsys.readouterr().out)["runs"]] == ["account-a"]
+    with pytest.raises(SystemExit) as error:
+        main(["remote-mutations", "status", "--run-id", str(ids["account-b"]), "--account", "account-a", "--config", str(config_file)])
+    assert error.value.code == 2
 
 
 def test_search_scope_is_forwarded_without_lifecycle_query_parsing(

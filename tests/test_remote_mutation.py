@@ -1505,6 +1505,27 @@ def test_remote_mutation_status_is_local_and_marks_only_unresolved_production(
     assert cast(dict[str, int], run_status["counts"])[mutation_status] == 1
 
 
+def test_remote_mutation_status_limits_history_but_not_exact_run(config_file: Path) -> None:
+    config = load_config(config_file)
+    initialize(config.database.path, config.accounts)
+    with connect(config.database.path) as db:
+        now = utc_now()
+        for _ in range(103):
+            db.execute(
+                """INSERT INTO remote_mutation_runs(requested_at,completed_at,mode,status,account_filter,
+                requested_limit,effective_max_per_run,effective_max_per_account,eligible_count,selected_count,
+                skipped_limit_count,policy_version) VALUES(?,?,'dry-run','completed','test',NULL,1,1,0,0,0,?)""",
+                (now, now, POLICY_VERSION),
+            )
+        db.commit()
+    runs = cast(list[dict[str, object]], remote_mutation_status(config)["runs"])
+    assert len(runs) == 100
+    ids = [cast(int, run["run_id"]) for run in runs]
+    assert ids == list(range(103, 3, -1))
+    old = cast(list[dict[str, object]], remote_mutation_status(config, run_id=1)["runs"])
+    assert [run["run_id"] for run in old] == [1]
+
+
 def test_observation_adapter_factory_constructs_imap_without_network(
     config_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
