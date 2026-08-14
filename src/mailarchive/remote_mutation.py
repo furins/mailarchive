@@ -377,6 +377,8 @@ def _update_current_presence_if_historical_identity_matches(
 class ReconciliationError(RuntimeError):
     """A local production-run reconciliation precondition failed."""
 
+REMOTE_MUTATION_STATUS_RUN_LIMIT = 100
+
 
 def remote_mutation_status(
     config: AppConfig, *, run_id: int | None = None, account_name: str | None = None
@@ -400,9 +402,11 @@ def remote_mutation_status(
             clauses.append("account_filter=?")
             values.append(account_name)
         where = "" if not clauses else " WHERE " + " AND ".join(clauses)
-        rows = db.execute(
-            "SELECT * FROM remote_mutation_runs" + where + " ORDER BY id DESC", values
-        ).fetchall()
+        query = "SELECT * FROM remote_mutation_runs" + where + " ORDER BY id DESC"
+        if run_id is None:
+            query += " LIMIT ?"
+            values.append(REMOTE_MUTATION_STATUS_RUN_LIMIT)
+        rows = db.execute(query, values).fetchall()
         if run_id is not None and not rows:
             raise ReconciliationError("remote mutation run does not exist or does not match account")
         runs: list[dict[str, object]] = []

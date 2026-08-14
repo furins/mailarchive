@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import socket
 import socketserver
 import threading
@@ -15,6 +16,7 @@ import pytest
 from google.oauth2.credentials import Credentials
 
 from mailarchive.classification import ClassificationResult, apply_classification
+from mailarchive.cli import main
 from mailarchive.config import load_config
 from mailarchive.db import account_id, connect, initialize, utc_now
 from mailarchive.gmail_mutation import GmailMutationAdapter
@@ -1538,7 +1540,7 @@ def test_observation_adapter_factory_constructs_imap_without_network(
     ("unknown", "unknown", 1),
 ])
 def test_default_reconciliation_uses_real_gmail_observer(
-    config_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    config_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
     state: str, expected: str, presence: int,
 ) -> None:
     """The default factory reaches the frozen Gmail observer, never delete()."""
@@ -1575,7 +1577,8 @@ def test_default_reconciliation_uses_real_gmail_observer(
 
     monkeypatch.setattr(GmailMutationAdapter, "delete", forbidden_delete)
     readonly = Path(config.accounts[0].config_ref.removeprefix("file:")).read_bytes()
-    reconcile_production_run(config, run)
+    assert main(["remote-mutations", "reconcile", "--run-id", str(run), "--config", str(config_file), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["resumed"] is False
     assert fake.deletes == []
     assert Path(config.accounts[0].config_ref.removeprefix("file:")).read_bytes() == readonly
     with connect(config.database.path) as db:
@@ -1593,7 +1596,7 @@ def test_default_reconciliation_uses_real_gmail_observer(
     ("unknown", "unknown", 1),
 ])
 def test_default_reconciliation_uses_real_pop3_observer(
-    config_file: Path, monkeypatch: pytest.MonkeyPatch, state: str, expected: str, presence: int
+    config_file: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], state: str, expected: str, presence: int
 ) -> None:
     """The default factory uses the real POP3 wire read path and no DELE/QUIT."""
     database = config_file.parent / "state" / "mailarchive.sqlite3"
@@ -1627,7 +1630,8 @@ def test_default_reconciliation_uses_real_pop3_observer(
             raise AssertionError("reconciliation must not call delete")
 
         monkeypatch.setattr(Pop3MutationAdapter, "delete", forbidden_delete)
-        reconcile_production_run(config, run)
+        assert main(["remote-mutations", "reconcile", "--run-id", str(run), "--config", str(config_file), "--json"]) == 0
+        assert json.loads(capsys.readouterr().out)["resumed"] is False
         assert "DELE" not in server.commands and "QUIT" not in server.commands
         with connect(config.database.path) as db:
             row = db.execute(
