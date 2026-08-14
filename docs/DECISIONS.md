@@ -288,34 +288,40 @@ failure and unknown outcomes are distinct; unknown is never retried and halts th
 fresh-policy and fingerprint revalidation rejects stale targets before a fake call. M12 exclusively
 owns any discussion or implementation of real provider writes.
 
-# ADR-022: Dedicated M12-B IMAP mutation capability
+# ADR-022: Dedicated M12 IMAP mutation capability
 
-M12-A remains frozen at `94acb8e02caf0f3336206025d0901ce9985504e4`. M12-B isolates the
-production-capable IMAP operation in `imap_mutation.py`; M3/M4 acquisition remains read-only.
-Construction performs local configuration and credential-reference validation only. The injected
-adapter takes the existing account/folder lock across connection through confirmation, requires
-UIDPLUS, validates UIDVALIDITY and exact BODY.PEEK[] SHA-256, and refuses a preexisting
-`\\Deleted` target. It may only issue UID STORE for the one planned UID followed by UID EXPUNGE
-for that UID. Global EXPUNGE and CLOSE are prohibited. The M12-A default production factory stays
-fail-closed until M12-E adds wiring and reconciliation.
+M12 isolates the production-capable IMAP operation in `imap_mutation.py`; M3/M4 acquisition
+remains read-only. The closed production factory selects it only for a configured IMAP account.
+Construction performs local configuration and credential-reference validation only. The adapter
+takes the existing account/folder lock across connection through confirmation, requires UIDPLUS,
+validates UIDVALIDITY and exact BODY.PEEK[] SHA-256, and refuses a preexisting `\\Deleted` target.
+It may only issue UID STORE for the one planned UID followed by UID EXPUNGE for that UID. Global
+EXPUNGE and CLOSE are prohibited. Read-only observation uses the same lock and historical identity.
 
-# ADR-023: Separate M12-C Gmail mutation credential
+# ADR-023: Separate M12 Gmail mutation credential
 
-M12-C never broadens M5's `gmail.readonly` token. A distinct optional 0600 token outside the
+M12 never broadens M5's `gmail.readonly` token. A distinct 0600 non-symlink token outside the
 archive uses only `https://mail.google.com/` as Gmail mailbox scope. Its adapter verifies the
 profile at authorization and execution, addresses only exact Message.id, compares decoded RAW with
-the canonical SHA-256, issues at most one DELETE, and confirms absence with GET. Default CLI
-wiring remains deferred to M12-E.
+the canonical SHA-256, issues at most one DELETE, and confirms absence with GET. The production
+factory uses this adapter only for configured Gmail accounts with explicit deletion opt-in.
 
-# ADR-024: Dedicated M12-D POP3 mutation session
+# ADR-024: Dedicated M12 POP3 mutation session and serialization
 
-M12-D must not reuse M6's acquisition wire after DELE because its normal close sends QUIT. The
-dedicated injected mutation wire offers only explicit `quit_and_commit()` and
+M12 must not reuse M6's acquisition wire after DELE because its normal close sends QUIT. The
+dedicated mutation wire offers only explicit `quit_and_commit()` and
 `abort_without_quit()` lifecycle operations. It treats UIDL, not POP3 message number, as durable
 identity; each session resolves UIDL freshly, RETRs exact bytes, and hashes them before one DELE.
 Fresh UIDL observation is required after QUIT or any uncertainty, and no attempt retries DELE.
-Default production wiring and reconciliation remain M12-E work.
+The production factory selects this adapter only for configured POP3 accounts with explicit opt-in.
+POP3 acquisition, deletion, and read-only reconciliation serialize per account. Otherwise an M6
+sync holding an older UIDL snapshot could restore `remote_present=1` after deletion is confirmed.
 
-Before M12-E makes the POP3 production factory reachable, POP3 acquisition and
-deletion must be serialized per account. Otherwise an M6 sync holding an older
-UIDL snapshot could restore `remote_present=1` after a deletion is confirmed.
+# ADR-025: Historical read-only reconciliation
+
+Production attempts are never retried or resumed automatically. A started or unknown mutation is
+reconciled only by a read-only provider observation of the immutable historical mutation target.
+Confirmed absence resolves the historical mutation as succeeded; exact present bytes resolve it as
+failed; conflict or unprovable state remains unknown. A current `remote_messages` row is updated
+only when its identity still coheres with the historical target, preventing old evidence from being
+applied to a drifted provider identity.

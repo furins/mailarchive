@@ -204,7 +204,7 @@ Per-account configuration SHALL permit values such as:
 
 Messages MAY be protected with `keep_online`.
 
-A future `legal_hold` protection SHALL be represented from the initial schema even if no UI exists initially.
+`legal_hold` is a canonical-level retention control and SHALL block ordinary remote deletion.
 
 ## 12. Remote deletion
 
@@ -219,7 +219,7 @@ Deletion SHALL be:
 - dry-run capable;
 - rate limited;
 - auditable;
-- resumable/idempotent where provider semantics permit;
+- no automatic retry or resume after a destructive attempt;
 - conservative on ambiguity.
 
 The operator SHALL be able to produce deletion-candidate reports without performing any remote mutation.
@@ -274,6 +274,8 @@ mailarchive backup verify
 mailarchive integrity verify
 mailarchive deletion-candidates
 mailarchive remote-delete --dry-run
+mailarchive remote-delete --execute-plan RUN_ID --account ACCOUNT
+mailarchive remote-mutations reconcile --run-id PRODUCTION_RUN_ID
 ```
 
 Names may evolve, but destructive and reporting commands MUST remain distinct.

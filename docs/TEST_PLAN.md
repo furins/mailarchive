@@ -231,13 +231,20 @@ must touch only configuration, SQLite and canonical local files. Injected in-mem
 success, confirmed no-mutation failure, unknown-after-call halt, and stale plan rejection before
 an adapter call. No production provider is a test fixture.
 
-### M12-B IMAP injected adapter
+### M12 controlled production deletion
 
-Scripted IMAP transports cover UIDPLUS refusal, exact UIDVALIDITY and remote hash checks,
-preexisting `\\Deleted`, exact UID STORE/UID EXPUNGE, already absent confirmation, and uncertain
-STORE/EXPUNGE observations. Disposable loopback Dovecot proves that an exact target disappears
-while unrelated normal and already-deleted messages survive, and local canonical/backup facts do
-not change. Default CLI wiring remains unavailable.
+M12 tests exercise the actual CLI authorization path from local dry-run through explicit
+`--execute-plan`. IMAP uses disposable Dovecot to prove exact UID deletion, unrelated normal and
+pre-`\\Deleted` survival, and no global EXPUNGE/CLOSE. Gmail uses a fake HTTP/OAuth boundary to
+prove exact Message.id, RAW hash verification, one DELETE maximum, and readonly-token preservation.
+POP3 uses a loopback server to prove exact UIDL resolution, one DELE, one deliberate QUIT, and
+unrelated survival.
+
+Cross-cutting tests prove factory construction is zero-network; dry-run is zero-network; unsafe
+Gmail mutation credentials fail before a production row; started state and audit are committed
+before provider calls; serial execution stops on first non-success; unknown outcomes require
+read-only reconciliation and never resume; and canonical bytes, attachments, and verified backup
+evidence remain unchanged. CI uses no production provider account.
 
 ## 9. Recovery tests
 

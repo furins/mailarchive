@@ -45,7 +45,9 @@ MailArchive is split into a low-latency fast path and an independent slow path.
          +--> integrity checks
          +--> retention evaluation
          +--> candidate reports
-         +--> eventual remote deletion
+         +--> local dry-run target snapshot
+         +--> explicit remote execute-plan
+         +--> exact provider confirmation or read-only reconciliation
 ```
 
 ## 2. Components
@@ -259,7 +261,23 @@ Initial scheduling proposal:
 - Borg: multiple times daily or daily, configurable;
 - integrity: daily incremental + periodic deeper run;
 - retention evaluation: daily;
-- remote deletion: separately scheduled and disabled by default.
+- remote deletion: explicit manual M12 execution only; account opt-in is disabled by default.
+
+## 5.1 Controlled remote deletion (M12)
+
+M12 keeps retention evaluation, local planning, destructive execution, and recovery as separate
+steps. M10 evaluates local eligibility; M11/M12 dry-run snapshots exact current provider identity
+without provider I/O; an operator explicitly executes one recent, account-filtered plan; the closed
+factory selects the dedicated IMAP, Gmail, or POP3 mutation adapter by configured account kind.
+Each adapter confirms the exact historical target, while a production run is distinct from its
+immutable source plan. Unknown outcomes halt execution and require a separate read-only
+reconciliation against the historical target; reconciliation never resumes planned rows.
+
+Acquisition adapters remain separate from mutation adapters. Gmail acquisition remains
+`gmail.readonly` and mutation uses a separate full-scope credential. POP3 acquisition, mutation,
+and observation share a per-account process lock so a stale UIDL snapshot cannot restore presence
+after a deletion. Only confirmed absence changes local `remote_present`, and only if the current
+remote row still represents the historical identity.
 
 ## 6. Concurrency
 
