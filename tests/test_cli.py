@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import socket
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -11,6 +12,8 @@ import yaml
 
 import mailarchive.cli as cli_module
 import mailarchive.gmail as gmail_module
+import mailarchive.gmail_mutation as gmail_mutation_module
+import mailarchive.remote_mutation as remote_mutation_module
 from mailarchive.classification import ClassificationResult, apply_classification
 from mailarchive.cli import build_parser, main
 from mailarchive.config import load_config
@@ -95,12 +98,29 @@ def test_db_init_and_status(config_file: Path, capsys: pytest.CaptureFixture[str
 def test_remote_mutations_status_is_local_and_global_status_is_truthful(
     config_file: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def forbidden(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError("local mutation status must not construct provider observers")
+    config = load_config(config_file)
+    initialize(config.database.path, config.accounts)
+    with connect(config.database.path) as db:
+        now = datetime.now(UTC).isoformat()
+        run = db.execute(
+            """INSERT INTO remote_mutation_runs(requested_at,completed_at,mode,status,account_filter,
+            requested_limit,effective_max_per_run,effective_max_per_account,eligible_count,selected_count,
+            skipped_limit_count,policy_version) VALUES(?,?,'dry-run','completed','test',NULL,1,1,0,0,0,'retention-v1')""",
+            (now, now),
+        )
+        assert run.lastrowid is not None
+        run_id = int(run.lastrowid)
+        db.commit()
 
-    monkeypatch.setattr(cli_module, "reconcile_production_run", forbidden)
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("local mutation status must not access a provider boundary")
+
+    monkeypatch.setattr(remote_mutation_module, "observation_adapter_factory", forbidden)
+    monkeypatch.setattr(remote_mutation_module, "production_adapter_factory", forbidden)
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    monkeypatch.setattr(gmail_mutation_module.requests, "Session", forbidden)
     assert main(["remote-mutations", "status", "--config", str(config_file), "--json"]) == 0
-    assert json.loads(capsys.readouterr().out) == {"runs": []}
+    assert [run["run_id"] for run in json.loads(capsys.readouterr().out)["runs"]] == [run_id]
     assert main(["status", "--config", str(config_file), "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["remote_reconciliation_supported"] is True
