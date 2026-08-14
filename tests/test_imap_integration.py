@@ -21,17 +21,24 @@ import yaml
 
 from mailarchive.classification import ClassificationResult, apply_classification
 from mailarchive.config import load_config
-from mailarchive.db import account_id, connect, initialize
+from mailarchive.db import account_id, connect, initialize, utc_now
 from mailarchive.fastpath import FastPathWatcher, fast_path_status
 from mailarchive.imap import ImapAdapter, encode_mailbox_name
 from mailarchive.imap_mutation import ImapClient, ImapMutationAdapter
+from mailarchive.ingest import ingest_bytes
+from mailarchive.models import AppConfig
 from mailarchive.notmuch import (
     NotmuchAdapter,
     NotmuchError,
     SearchResult,
     search_canonical_messages,
 )
-from mailarchive.remote_mutation import ImapDeletionTarget, execute_production_plan, plan_dry_run
+from mailarchive.remote_mutation import (
+    ImapDeletionTarget,
+    execute_production_plan,
+    plan_dry_run,
+    reconcile_production_run,
+)
 
 
 def _free_port() -> int:
@@ -278,6 +285,27 @@ def _imap_observer(
     )
 
 
+def _imap_reconciliation_config(
+    config_file: Path, port: int, monkeypatch: pytest.MonkeyPatch
+) -> tuple[AppConfig, int]:
+    values = yaml.safe_load(config_file.read_text())
+    values["accounts"]["test"]["imap"] = {
+        "host": "127.0.0.1",
+        "port": port,
+        "username": "fixture",
+        "tls_mode": "INSECURE_LOOPBACK",
+        "folders": ["INBOX"],
+    }
+    config_file.write_text(yaml.safe_dump(values))
+    monkeypatch.setenv("MAILARCHIVE_TEST_SECRET", "fixture-password")
+    config = load_config(config_file)
+    initialize(config.database.path, config.accounts)
+    with connect(config.database.path) as db:
+        local_account_id = account_id(db, "test")
+    assert local_account_id is not None
+    return config, local_account_id
+
+
 def _observe_target(
     account_id_value: int, uidvalidity: int, uid: int, raw: bytes
 ) -> ImapDeletionTarget:
@@ -302,6 +330,118 @@ def _assert_observe_trace_is_read_only(recordings: list[_RecordingImapClient]) -
         for recording in recordings
         for command, arguments in recording.commands
     )
+
+
+def _seed_halted_imap_reconciliation(
+    config: AppConfig,
+    *,
+    account_id_value: int,
+    uidvalidity: int,
+    uid: int,
+    raw: bytes,
+    historical_uidvalidity: int | None = None,
+    include_later_planned: bool = False,
+) -> tuple[int, int]:
+    """Create only the local historical rows needed by the read-only recovery path."""
+    canonical = apply_classification(
+        config,
+        ingest_bytes(config, raw, "test").canonical_message,
+        ClassificationResult("ham", None, "fixture", "pytest"),
+    )
+    now = utc_now()
+    namespace = uidvalidity if historical_uidvalidity is None else historical_uidvalidity
+    with connect(config.database.path) as db:
+        db.execute(
+            """INSERT INTO remote_messages(
+            id,account_id,provider_kind,remote_folder,uidvalidity,remote_uid,first_seen_at,
+            last_seen_at,remote_present,identity_confidence)
+            VALUES('historical',?,'imap','INBOX',?,?,?, ?,1,'proven')""",
+            (account_id_value, namespace, uid, now, now),
+        )
+        db.execute(
+            "INSERT INTO remote_canonical_links VALUES('historical',?,'fixture',?)",
+            (canonical.id, now),
+        )
+        evaluation_run = db.execute(
+            """INSERT INTO deletion_evaluation_runs(evaluated_at,policy_version)
+            VALUES(?,'retention-v1')""",
+            (now,),
+        )
+        evaluation = db.execute(
+            """INSERT INTO deletion_evaluations(
+            evaluation_run_id,remote_message_id,canonical_message_id,
+            evaluated_at,eligible,reason_codes_json,policy_version,remote_retention_days,
+            required_verified_backups,verified_repository_count,retention_deadline)
+            VALUES(?, 'historical', ?, ?, 1, '[]', 'retention-v1', 365, 2, 2, ?)""",
+            (evaluation_run.lastrowid, canonical.id, now, now),
+        )
+        source = db.execute(
+            """INSERT INTO remote_mutation_runs(
+            requested_at,completed_at,mode,status,account_filter,
+            requested_limit,effective_max_per_run,effective_max_per_account,eligible_count,selected_count,
+            skipped_limit_count,policy_version)
+            VALUES(?,?,'dry-run','completed','test',NULL,10,10,1,1,0,'retention-v1')""",
+            (now, now),
+        )
+        run = db.execute(
+            """INSERT INTO remote_mutation_runs(
+            requested_at,mode,status,account_filter,requested_limit,
+            effective_max_per_run,effective_max_per_account,eligible_count,selected_count,skipped_limit_count,
+            policy_version,source_plan_run_id,authorization_method)
+            VALUES(?,'production-execute','halted','test',NULL,10,10,1,1,0,'retention-v1',?,
+            'account-opt-in+explicit-plan-v1')""",
+            (now, source.lastrowid),
+        )
+        mutation = db.execute(
+            """INSERT INTO remote_mutations(mutation_run_id,deletion_evaluation_id,account_id,
+            remote_message_id,canonical_message_id,provider_kind,operation,remote_folder,uidvalidity,
+            remote_uid,provider_message_id,canonical_sha256,target_fingerprint_sha256,dry_run,requested_at,
+            started_at,status,provider_response_summary,error_code)
+            VALUES(?,?,?,?,?,'imap','delete','INBOX',?,?,NULL,?,?,0,?,?,'unknown',
+            'outcome-uncertain','TRANSPORT_UNKNOWN')""",
+            (
+                run.lastrowid,
+                evaluation.lastrowid,
+                account_id_value,
+                "historical",
+                canonical.id,
+                namespace,
+                uid,
+                canonical.sha256,
+                "0" * 64,
+                now,
+                now,
+            ),
+        )
+        if include_later_planned:
+            db.execute(
+                """INSERT INTO remote_messages(
+                id,account_id,provider_kind,remote_folder,uidvalidity,remote_uid,first_seen_at,
+                last_seen_at,remote_present,identity_confidence)
+                VALUES('later',?,'imap','INBOX',?,?,?, ?,1,'proven')""",
+                (account_id_value, namespace, uid + 1, now, now),
+            )
+            db.execute(
+                """INSERT INTO remote_mutations(mutation_run_id,deletion_evaluation_id,account_id,
+                remote_message_id,canonical_message_id,provider_kind,operation,remote_folder,uidvalidity,
+                remote_uid,provider_message_id,canonical_sha256,target_fingerprint_sha256,dry_run,requested_at,status)
+                VALUES(?,?,?,?,?,'imap','delete','INBOX',?,?,NULL,?,?,0,?,'planned')""",
+                (
+                    run.lastrowid,
+                    evaluation.lastrowid,
+                    account_id_value,
+                    "later",
+                    canonical.id,
+                    namespace,
+                    uid + 1,
+                    canonical.sha256,
+                    "1" * 64,
+                    now,
+                ),
+            )
+        db.commit()
+    assert run.lastrowid is not None and mutation.lastrowid is not None
+    return int(run.lastrowid), int(mutation.lastrowid)
 
 
 @pytest.mark.parametrize(
@@ -349,6 +489,89 @@ def test_dovecot_imap_observe_is_read_only_and_exact(
     assert _snapshot(port)[1][unrelated_uid] == snapshot[unrelated_uid]
     if case == "deleted":
         assert _snapshot(port)[1][target_uid] == snapshot[target_uid]
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_status", "expected_error", "reconciled"),
+    [
+        ("absent", "succeeded", "NONE", True),
+        ("present", "failed", "RECONCILED_PRESENT", True),
+        ("uidvalidity", "unknown", "TRANSPORT_UNKNOWN", False),
+    ],
+)
+def test_default_reconciliation_uses_real_dovecot_imap_observer(
+    config_file: Path,
+    dovecot_loopback: tuple[int, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    expected_status: str,
+    expected_error: str,
+    reconciled: bool,
+) -> None:
+    """E1e1: default reconciliation factory reaches the real read-only IMAP adapter."""
+    port, mail, _ = dovecot_loopback
+    target_raw = _raw("<reconcile-target@test>", "reconcile target")
+    unrelated_raw = _raw("<reconcile-unrelated@test>", "reconcile unrelated")
+    (mail / "new" / "target").write_bytes(target_raw)
+    (mail / "new" / "unrelated").write_bytes(unrelated_raw)
+    uidvalidity, snapshot = _snapshot(port)
+    target_uid = next(uid for uid, (_flags, raw) in snapshot.items() if raw == target_raw)
+    unrelated_uid = next(uid for uid, (_flags, raw) in snapshot.items() if raw == unrelated_raw)
+    config, local_account_id = _imap_reconciliation_config(config_file, port, monkeypatch)
+    historical_uid = target_uid if case != "absent" else max(snapshot) + 100
+    historical_uidvalidity = uidvalidity if case != "uidvalidity" else uidvalidity + 1
+    run_id, mutation_id = _seed_halted_imap_reconciliation(
+        config,
+        account_id_value=local_account_id,
+        uidvalidity=uidvalidity,
+        uid=historical_uid,
+        raw=target_raw,
+        historical_uidvalidity=historical_uidvalidity,
+        include_later_planned=case == "absent",
+    )
+    recordings: list[_RecordingImapClient] = []
+    real_imap4 = imaplib.IMAP4
+
+    def recording_imap4(
+        host: str = "", port: int = 143, timeout: float | None = None
+    ) -> _RecordingImapClient:
+        client = _RecordingImapClient(real_imap4(host, port, timeout=timeout))
+        recordings.append(client)
+        return client
+
+    import mailarchive.imap_mutation as imap_mutation
+
+    monkeypatch.setattr(imap_mutation.imaplib, "IMAP4", recording_imap4)
+
+    def forbidden_delete(self: ImapMutationAdapter, target: object) -> object:
+        del self, target
+        raise AssertionError("reconciliation must not call delete")
+
+    monkeypatch.setattr(ImapMutationAdapter, "delete", forbidden_delete)
+    reconcile_production_run(config, run_id)
+    _assert_observe_trace_is_read_only(recordings)
+    assert _snapshot(port)[1][unrelated_uid] == snapshot[unrelated_uid]
+    with connect(config.database.path) as db:
+        row = db.execute(
+            "SELECT status,error_code,reconciled_at FROM remote_mutations WHERE id=?",
+            (mutation_id,),
+        ).fetchone()
+        assert tuple(row[:2]) == (expected_status, expected_error)
+        assert (row["reconciled_at"] is not None) is reconciled
+        run = db.execute(
+            "SELECT status FROM remote_mutation_runs WHERE id=?", (run_id,)
+        ).fetchone()
+        assert run[0] == "halted"
+        remote_present = db.execute(
+            "SELECT remote_present FROM remote_messages WHERE id='historical'"
+        ).fetchone()[0]
+        assert remote_present == (0 if case == "absent" else 1)
+        if case == "absent":
+            assert db.execute(
+                """SELECT status FROM remote_mutations
+                WHERE mutation_run_id=? AND remote_message_id='later'""",
+                (run_id,),
+            ).fetchone()[0] == "planned"
 
 
 def test_direct_loopback_acquisition_preserves_server_bytes(
