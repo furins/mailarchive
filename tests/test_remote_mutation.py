@@ -37,7 +37,9 @@ from mailarchive.remote_mutation import (
     observation_adapter_factory,
     plan_dry_run,
     reconcile_production_run,
+    remote_mutation_status,
 )
+from mailarchive.retention import POLICY_VERSION
 
 
 class FakeAdapter:
@@ -1448,6 +1450,57 @@ def test_reconciliation_preserves_local_graph_on_conclusive_absence(config_file:
         assert [tuple(row) for row in db.execute("SELECT * FROM message_attachments")] == links
         assert [tuple(row) for row in db.execute("SELECT * FROM message_backup_evidence")] == evidence
     assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("mode", "mutation_status", "required"),
+    [
+        ("production-execute", "started", True),
+        ("production-execute", "unknown", True),
+        ("production-execute", "failed", False),
+        ("production-execute", "succeeded", False),
+        ("production-execute", "planned", False),
+        ("dry-run", "dry-run", False),
+        ("fake-execute", "unknown", False),
+    ],
+)
+def test_remote_mutation_status_is_local_and_marks_only_unresolved_production(
+    config_file: Path, mode: str, mutation_status: str, required: bool
+) -> None:
+    config, _ = eligible_remote(config_file)
+    source_id = int(cast(int, plan_dry_run(config, account="test")["run_id"]))
+    with connect(config.database.path) as db:
+        now = utc_now()
+        if mode == "production-execute":
+            run = db.execute(
+                """INSERT INTO remote_mutation_runs(requested_at,mode,status,account_filter,requested_limit,
+                effective_max_per_run,effective_max_per_account,eligible_count,selected_count,skipped_limit_count,
+                policy_version,source_plan_run_id,authorization_method)
+                VALUES(?,'production-execute','halted','test',NULL,1,1,1,1,0,?,?,?)""",
+                (now, POLICY_VERSION, source_id, "account-opt-in+explicit-plan-v1"),
+            )
+        else:
+            run = db.execute(
+                """INSERT INTO remote_mutation_runs(requested_at,completed_at,mode,status,account_filter,
+                requested_limit,effective_max_per_run,effective_max_per_account,eligible_count,selected_count,
+                skipped_limit_count,policy_version) VALUES(?,?,?,'halted','test',NULL,1,1,1,1,0,?)""",
+                (now, now, mode, POLICY_VERSION),
+            )
+        remote = db.execute("SELECT id,account_id FROM remote_messages").fetchone()
+        canonical = db.execute("SELECT canonical_message_id FROM remote_canonical_links").fetchone()
+        evaluation = db.execute("SELECT id FROM deletion_evaluations").fetchone()
+        db.execute(
+            """INSERT INTO remote_mutations(mutation_run_id,deletion_evaluation_id,account_id,remote_message_id,
+            canonical_message_id,provider_kind,operation,remote_folder,uidvalidity,remote_uid,canonical_sha256,
+            target_fingerprint_sha256,dry_run,requested_at,status)
+            VALUES(?,?,?,?,?,'imap','delete','INBOX',7,9,?, ?,0,?,?)""",
+            (run.lastrowid, evaluation[0], remote[1], remote[0], canonical[0], "0" * 64, "1" * 64, now, mutation_status),
+        )
+        db.commit()
+    status = remote_mutation_status(config)
+    run_status = cast(list[dict[str, object]], status["runs"])[0]
+    assert run_status["reconciliation_required"] is required
+    assert cast(dict[str, int], run_status["counts"])[mutation_status] == 1
 
 
 def test_observation_adapter_factory_constructs_imap_without_network(

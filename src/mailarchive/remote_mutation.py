@@ -378,6 +378,92 @@ class ReconciliationError(RuntimeError):
     """A local production-run reconciliation precondition failed."""
 
 
+def remote_mutation_status(
+    config: AppConfig, *, run_id: int | None = None, account_name: str | None = None
+) -> dict[str, object]:
+    """Return bounded, entirely local mutation-run history in deterministic order."""
+    if account_name is not None and not any(
+        account.name == account_name for account in config.accounts
+    ):
+        raise ReconciliationError("status account is not configured")
+    if not config.database.path.exists():
+        if run_id is not None:
+            raise ReconciliationError("remote mutation run does not exist")
+        return {"runs": []}
+    with connect(config.database.path) as db:
+        clauses: list[str] = []
+        values: list[object] = []
+        if run_id is not None:
+            clauses.append("id=?")
+            values.append(run_id)
+        if account_name is not None:
+            clauses.append("account_filter=?")
+            values.append(account_name)
+        where = "" if not clauses else " WHERE " + " AND ".join(clauses)
+        rows = db.execute(
+            "SELECT * FROM remote_mutation_runs" + where + " ORDER BY id DESC", values
+        ).fetchall()
+        if run_id is not None and not rows:
+            raise ReconciliationError("remote mutation run does not exist or does not match account")
+        runs: list[dict[str, object]] = []
+        statuses = ("planned", "dry-run", "started", "succeeded", "failed", "unknown")
+        for run in rows:
+            mutations = db.execute(
+                "SELECT * FROM remote_mutations WHERE mutation_run_id=? ORDER BY id",
+                (run["id"],),
+            ).fetchall()
+            counts = {status: 0 for status in statuses}
+            details: list[dict[str, object]] = []
+            for mutation in mutations:
+                status = str(mutation["status"])
+                if status in counts:
+                    counts[status] += 1
+                detail: dict[str, object] = {
+                    "mutation_id": int(mutation["id"]),
+                    "account_id": int(mutation["account_id"]),
+                    "remote_message_id": str(mutation["remote_message_id"]),
+                    "canonical_message_id": str(mutation["canonical_message_id"]),
+                    "provider_kind": str(mutation["provider_kind"]),
+                    "operation": str(mutation["operation"]),
+                    "status": status,
+                    "requested_at": mutation["requested_at"],
+                    "started_at": mutation["started_at"],
+                    "completed_at": mutation["completed_at"],
+                    "reconciled_at": mutation["reconciled_at"],
+                    "provider_response_summary": mutation["provider_response_summary"],
+                    "error_code": mutation["error_code"],
+                    "source_plan_mutation_id": mutation["source_plan_mutation_id"],
+                }
+                if str(mutation["provider_kind"]) == "imap":
+                    detail.update(
+                        remote_folder=mutation["remote_folder"],
+                        uidvalidity=mutation["uidvalidity"],
+                        remote_uid=mutation["remote_uid"],
+                    )
+                else:
+                    detail["provider_message_id"] = mutation["provider_message_id"]
+                details.append(detail)
+            runs.append(
+                {
+                    "run_id": int(run["id"]),
+                    "mode": str(run["mode"]),
+                    "status": str(run["status"]),
+                    "requested_at": run["requested_at"],
+                    "completed_at": run["completed_at"],
+                    "account_filter": run["account_filter"],
+                    "source_plan_run_id": run["source_plan_run_id"],
+                    "selected_count": int(run["selected_count"]),
+                    "counts": counts,
+                    "reconciliation_required": (
+                        run["mode"] == "production-execute"
+                        and (counts["started"] > 0 or counts["unknown"] > 0)
+                    ),
+                    "mutations": details,
+                }
+            )
+    return {"runs": runs}
+
+
 def observation_adapter_factory(
     config: AppConfig, account_name: str
 ) -> RemoteObservationAdapter:

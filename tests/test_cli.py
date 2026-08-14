@@ -90,6 +90,58 @@ def test_db_init_and_status(config_file: Path, capsys: pytest.CaptureFixture[str
     assert '"database_initialized": true' in capsys.readouterr().out
 
 
+def test_remote_mutations_status_is_local_and_global_status_is_truthful(
+    config_file: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("local mutation status must not construct provider observers")
+
+    monkeypatch.setattr(cli_module, "reconcile_production_run", forbidden)
+    assert main(["remote-mutations", "status", "--config", str(config_file), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"runs": []}
+    assert main(["status", "--config", str(config_file), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["remote_reconciliation_supported"] is True
+    assert payload["remote_mutation_supported"] is False
+    assert payload["remote_deletion_accounts"] == [{"account": "test", "enabled": False}]
+
+
+def test_remote_mutations_reconcile_uses_one_exact_run_and_emits_bounded_summary(
+    config_file: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[int] = []
+
+    def reconcile(_config: object, run_id: int) -> dict[str, object]:
+        seen.append(run_id)
+        return {
+            "run_id": run_id,
+            "status": "halted",
+            "observed": 1,
+            "resolved_absent": 0,
+            "resolved_present": 0,
+            "unresolved": 1,
+            "resumed": False,
+        }
+
+    monkeypatch.setattr(cli_module, "reconcile_production_run", reconcile)
+    assert (
+        main(
+            [
+                "remote-mutations",
+                "reconcile",
+                "--run-id",
+                "42",
+                "--config",
+                str(config_file),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    assert seen == [42]
+    assert json.loads(capsys.readouterr().out)["resumed"] is False
+
+
 def test_search_scope_is_forwarded_without_lifecycle_query_parsing(
     config_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

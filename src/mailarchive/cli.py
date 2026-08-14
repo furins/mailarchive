@@ -27,7 +27,14 @@ from mailarchive.ingest import IngestError, ingest_file
 from mailarchive.notmuch import NotmuchAdapter, NotmuchError, search_canonical_messages
 from mailarchive.pop3 import Pop3Adapter, Pop3Error
 from mailarchive.recoll import RecollAdapter, RecollError, search_attachments
-from mailarchive.remote_mutation import ProductionPlanError, execute_production_plan, plan_dry_run
+from mailarchive.remote_mutation import (
+    ProductionPlanError,
+    ReconciliationError,
+    execute_production_plan,
+    plan_dry_run,
+    reconcile_production_run,
+    remote_mutation_status,
+)
 from mailarchive.retention import evaluate_all, set_control
 
 
@@ -223,6 +230,25 @@ def build_parser() -> argparse.ArgumentParser:
     remote_delete.add_argument("--limit", type=int)
     remote_delete.add_argument("--config", required=True)
     remote_delete.add_argument("--json", action="store_true")
+    remote_mutations = subcommands.add_parser(
+        "remote-mutations", help="local status and read-only recovery of remote mutation runs"
+    )
+    remote_mutations_subcommands = remote_mutations.add_subparsers(
+        dest="remote_mutations_command", required=True
+    )
+    mutation_status = remote_mutations_subcommands.add_parser(
+        "status", help="show bounded local remote-mutation history"
+    )
+    mutation_status.add_argument("--config", required=True)
+    mutation_status.add_argument("--run-id", type=int)
+    mutation_status.add_argument("--account")
+    mutation_status.add_argument("--json", action="store_true")
+    mutation_reconcile = remote_mutations_subcommands.add_parser(
+        "reconcile", help="read-only reconciliation of one halted production run"
+    )
+    mutation_reconcile.add_argument("--run-id", type=int, required=True)
+    mutation_reconcile.add_argument("--config", required=True)
+    mutation_reconcile.add_argument("--json", action="store_true")
     retention = subcommands.add_parser(
         "retention", help="local-only retention policy controls and reports"
     )
@@ -286,6 +312,18 @@ def main(argv: list[str] | None = None) -> int:
                 },
                 args.json,
             )
+            return 0
+        if args.command == "remote-mutations":
+            initialize(config.database.path, config.accounts, config.backup_repositories)
+            if args.remote_mutations_command == "status":
+                _emit(
+                    remote_mutation_status(
+                        config, run_id=args.run_id, account_name=args.account
+                    ),
+                    args.json,
+                )
+                return 0
+            _emit(reconcile_production_run(config, args.run_id), args.json)
             return 0
         if args.command == "retention":
             initialize(config.database.path, config.accounts, config.backup_repositories)
@@ -505,6 +543,14 @@ def main(argv: list[str] | None = None) -> int:
                     "attachment_reference_count": attachment_reference_count,
                     "attachment_extraction_counts": attachment_extraction_counts,
                     "remote_mutation_supported": False,
+                    "remote_reconciliation_supported": True,
+                    "remote_deletion_accounts": [
+                        {
+                            "account": account.name,
+                            "enabled": account.remote_deletion_enabled,
+                        }
+                        for account in config.accounts
+                    ],
                     "fast_path": health,
                     "gmail": gmail_status,
                 },
@@ -706,6 +752,7 @@ def main(argv: list[str] | None = None) -> int:
         RecollError,
         BorgError,
         ProductionPlanError,
+        ReconciliationError,
         OSError,
         sqlite3.DatabaseError,
     ) as error:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import imaplib
+import json
 import os
 import pwd
 import socket
@@ -20,6 +21,7 @@ import pytest
 import yaml
 
 from mailarchive.classification import ClassificationResult, apply_classification
+from mailarchive.cli import main
 from mailarchive.config import load_config
 from mailarchive.db import account_id, connect, initialize, utc_now
 from mailarchive.fastpath import FastPathWatcher, fast_path_status
@@ -37,7 +39,6 @@ from mailarchive.remote_mutation import (
     ImapDeletionTarget,
     execute_production_plan,
     plan_dry_run,
-    reconcile_production_run,
 )
 
 
@@ -503,6 +504,7 @@ def test_default_reconciliation_uses_real_dovecot_imap_observer(
     config_file: Path,
     dovecot_loopback: tuple[int, Path, Path],
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
     case: str,
     expected_status: str,
     expected_error: str,
@@ -548,7 +550,22 @@ def test_default_reconciliation_uses_real_dovecot_imap_observer(
         raise AssertionError("reconciliation must not call delete")
 
     monkeypatch.setattr(ImapMutationAdapter, "delete", forbidden_delete)
-    reconcile_production_run(config, run_id)
+    assert (
+        main(
+            [
+                "remote-mutations",
+                "reconcile",
+                "--run-id",
+                str(run_id),
+                "--config",
+                str(config_file),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["status"] == "halted" and summary["resumed"] is False
     _assert_observe_trace_is_read_only(recordings)
     assert _snapshot(port)[1][unrelated_uid] == snapshot[unrelated_uid]
     with connect(config.database.path) as db:
